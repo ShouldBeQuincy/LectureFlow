@@ -290,11 +290,57 @@ test('the packaged app refuses to start with ELECTRON_DISABLE_SANDBOX, whatever 
   assert.equal(off({ electron_disable_sandbox: '1' }, 'win32'), true);
   assert.equal(off({ Electron_Disable_Sandbox: '0' }, 'win32'), true);
   assert.equal(off({ ELECTRON_DISABLE_SANDBOX: '' }, 'win32'), false);
-  // elsewhere: exact names, and an empty value is set (getenv finds it)
-  assert.equal(off({ electron_disable_sandbox: '1' }, 'linux'), false);
+  // elsewhere: an empty value is set (getenv finds it); the names are the next test's
   assert.equal(off({ ELECTRON_DISABLE_SANDBOX: '' }, 'linux'), true);
   assert.equal(off({ ELECTRON_DISABLE_SANDBOX: '' }, 'darwin'), true);
   assert.equal(sandboxDisabledByEnv({ isPackaged: true, env: undefined, platform: 'win32' }), false);
+});
+
+// v3.3.0 CI on macos-15: with electron_disable_sandbox=1 the real Electron
+// added --no-sandbox, while the app read exact names only off Windows
+// (switchprobe.test.js: "the app and Electron agree", false !== true).
+// Chromium's Environment::GetVar looks the name up as written, then once in
+// the reverse case (all lower case for this name); Windows ignores case.
+test('ELECTRON_DISABLE_SANDBOX names: any case on Windows; elsewhere exact or all lower case', () => {
+  const { sandboxDisabledByEnv } = require('../../src/main/lib/debugflags');
+  const off = (env, platform) => sandboxDisabledByEnv({ isPackaged: true, env, platform });
+  const cases = [
+    // [name, value, win32, darwin and linux]
+    ['ELECTRON_DISABLE_SANDBOX', '1', true, true],
+    ['electron_disable_sandbox', '1', true, true],
+    ['electron_disable_sandbox', '0', true, true],
+    ['Electron_Disable_Sandbox', '1', true, false],
+    ['ELECTRON_disable_SANDBOX', '1', true, false],
+    ['eLECTRON_DISABLE_SANDBOX', '1', true, false],
+    // an empty value: unset on Windows whatever the case, set elsewhere for the names getenv is asked about
+    ['ELECTRON_DISABLE_SANDBOX', '', false, true],
+    ['electron_disable_sandbox', '', false, true],
+    ['Electron_Disable_Sandbox', '', false, false],
+    // not the variable on any platform
+    ['ELECTRON_DISABLE_SANDBOXX', '1', false, false],
+    ['electron_disable_sandbox_', '1', false, false],
+    [' ELECTRON_DISABLE_SANDBOX', '1', false, false],
+    ['ELECTRON_DISABLE_SANDBOX ', '1', false, false],
+  ];
+  for (const [name, value, win, posix] of cases) {
+    const env = { PATH: 'x', [name]: value };
+    assert.equal(off(env, 'win32'), win, `win32 ${JSON.stringify(name)}=${JSON.stringify(value)}`);
+    for (const platform of ['darwin', 'linux']) {
+      assert.equal(off(env, platform), posix, `${platform} ${JSON.stringify(name)}=${JSON.stringify(value)}`);
+    }
+  }
+  // a deleted variable is no variable, whatever the name
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    assert.equal(off({ electron_disable_sandbox: undefined }, platform), false, `${platform} deleted`);
+    assert.equal(off({ electron_disable_sandbox: null }, platform), false, `${platform} null`);
+  }
+  // both spellings off Windows (Linux keeps them apart): either one is enough
+  assert.equal(off({ ELECTRON_DISABLE_SANDBOX: '1', electron_disable_sandbox: '' }, 'linux'), true);
+  assert.equal(off({ ELECTRON_DISABLE_SANDBOX: undefined, electron_disable_sandbox: '1' }, 'linux'), true);
+  // development is left alone, whatever the name
+  for (const platform of ['win32', 'darwin', 'linux']) {
+    assert.equal(sandboxDisabledByEnv({ isPackaged: false, env: { electron_disable_sandbox: '1' }, platform }), false, `${platform} development`);
+  }
 });
 
 test('--no-sandbox on the command line is refused as an unsupported option', () => {
@@ -353,6 +399,13 @@ test('startRefusal: options, no sandbox, both, neither; development and the e2e 
   // the Windows rule of the variable (an empty value is unset there; Electron agrees, no switch)
   assert.equal(run({ env: { ELECTRON_DISABLE_SANDBOX: '' } }), null);
   assert.deepEqual(run({ env: { electron_disable_sandbox: '0' } }), SANDBOX);
+  // elsewhere (v3.3.0 CI on macOS): the all-lower-case name counts by itself, a mixed-case
+  // one only when Electron says it turned the sandbox off
+  for (const platform of ['darwin', 'linux']) {
+    assert.deepEqual(run({ platform, env: { electron_disable_sandbox: '1' } }), SANDBOX, platform);
+    assert.equal(run({ platform, env: { Electron_Disable_Sandbox: '1' } }), null, platform);
+    assert.deepEqual(run({ platform, env: { Electron_Disable_Sandbox: '1' }, noSandbox: true }), SANDBOX, platform);
+  }
   assert.equal(startRefusal(undefined), null);
   // a hasSwitch that throws is no switch
   assert.equal(startRefusal({ isPackaged: true, argv: [], env: {}, hasSwitch: () => { throw new Error('x'); }, platform: 'win32' }), null);

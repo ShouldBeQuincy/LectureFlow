@@ -254,11 +254,19 @@ function joinRefusedArgs(list) {
 // and "false" all count. On Windows a variable with an empty value counts
 // as unset (HasVar asks GetEnvironmentVariable, which reports no length;
 // measured: no --no-sandbox, the window opens); elsewhere getenv() finds it.
-// Variable names are case-insensitive on Windows only. (The non-Windows
-// half is Chromium's code, not measured here; switchprobe.test.js compares
-// it with the real binary on every CI platform, and startRefusal also asks
-// Electron itself, so a wrong guess cannot let a start through.)
+// Names: on Windows any case (GetEnvironmentVariable ignores it). Elsewhere
+// the exact name or the all-lower-case one: when the name is missing,
+// Chromium's Environment::GetVar tries it once more in the reverse case
+// (base/environment.cc, "HTTP_PROXY may be http_proxy"); a mixed-case name
+// is not found. Measured on macOS 15 with Electron 44 (v3.3.0 CI,
+// switchprobe.test.js): electron_disable_sandbox=1 adds --no-sandbox; up to
+// then this read exact names only and disagreed. Linux runs the same
+// Chromium code and is not measured. startRefusal also asks Electron itself
+// (electronAddedNoSandbox), so a wrong guess here cannot let a start
+// through; switchprobe.test.js compares this reading with the real binary
+// on every CI platform.
 const SANDBOX_ENV = 'ELECTRON_DISABLE_SANDBOX';
+const SANDBOX_ENV_LOWER = SANDBOX_ENV.toLowerCase();
 
 /**
  * sandboxDisabledByEnv({ isPackaged, env, platform }) → true when the
@@ -271,7 +279,7 @@ const SANDBOX_ENV = 'ELECTRON_DISABLE_SANDBOX';
 function sandboxDisabledByEnv({ isPackaged, env, platform = process.platform }) {
   if (!isPackaged || !env) return false;
   for (const k of Object.keys(env)) {
-    const same = platform === 'win32' ? k.toUpperCase() === SANDBOX_ENV : k === SANDBOX_ENV;
+    const same = platform === 'win32' ? k.toUpperCase() === SANDBOX_ENV : k === SANDBOX_ENV || k === SANDBOX_ENV_LOWER;
     if (!same) continue;
     const v = env[k];
     if (v === undefined || v === null) continue;

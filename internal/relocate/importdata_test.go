@@ -235,6 +235,18 @@ func TestStageImportChecksStagedRecords(t *testing.T) {
 func TestImportRefusesStoredPathsOutside(t *testing.T) {
 	outsideRoot := t.TempDir() // a directory of this computer outside the import
 	outside := filepath.Join(outsideRoot, "Documents", "sec44-marker.pdf")
+	// The long-path prefix in front of the data directory: on Windows that
+	// is \\?\C:\…, a path on a local drive (media.UnsafeStoredPath is
+	// false), so the record's own place decides: outside. On macOS and
+	// Linux the data directory has no drive letter and the path is \\?\/…,
+	// another device path (media.UnsafeStoredPath true, media.UnderRoot
+	// false: rootedPath trusts \\?\ only before UNC\ or a drive), refused
+	// as a path on another computer, which is reported before the paths
+	// outside. Refused on both; each pins its own code.
+	longPathCode := codeImportNetworkPath
+	if runtime.GOOS == "windows" {
+		longPathCode = CodeOutsidePath
+	}
 	for _, tc := range []struct {
 		name string
 		stmt func(src string) string
@@ -263,7 +275,7 @@ func TestImportRefusesStoredPathsOutside(t *testing.T) {
 		}, CodeOutsidePath},
 		{"media long-path prefix, not its own place", func(src string) string {
 			return "UPDATE lecture SET media_path = " + sqlQuote(`\\?\`+filepath.Join(src, "courses", "C1", "lectures", "L1", "media.mp4")) + " WHERE id = 'L2'"
-		}, CodeOutsidePath},
+		}, longPathCode},
 		{"media device path", func(string) string { // a device path is what import_paths.go calls a network path
 			return `UPDATE lecture SET media_path = '\\.\C:\sec44-marker.mp4' WHERE id = 'L1'`
 		}, codeImportNetworkPath},

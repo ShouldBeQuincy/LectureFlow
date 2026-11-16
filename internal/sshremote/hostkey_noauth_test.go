@@ -25,7 +25,7 @@ import (
 func TestNoAuthenticationWithoutTheConfirmedHostKey(t *testing.T) {
 	ctx := context.Background()
 	f := newFakeRemote(t, "Linux x86_64")
-	e := newTestEnv(t, nil)
+	e := newTestEnv(t, fakeEncodeFLAC) // no ffmpeg needed to reach the host key check
 	host, port := f.addr()
 	v, err := e.m.Add(ctx, AddRequest{Name: "Fresh", Host: host, Port: port, Username: "alice"})
 	if err != nil {

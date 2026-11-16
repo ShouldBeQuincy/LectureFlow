@@ -213,7 +213,10 @@ for ($i = 0; $i -lt $args.Count; $i++) {
     "-p" { $i++ }
   }
 }
-function Fake-Sha256([string]$f) { (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLowerInvariant() }
+function Fake-Sha256([string]$f) {
+  $s = [System.Security.Cryptography.SHA256]::Create()
+  try { [System.BitConverter]::ToString($s.ComputeHash([System.IO.File]::ReadAllBytes($f))).Replace("-", "").ToLowerInvariant() } finally { $s.Dispose() }
+}
 if ($mode -eq "V") {
   if ($P -ne $env:FAKE_MINISIGN_KEY) { [Console]::Error.WriteLine("stand-in: wrong public key $P"); exit 1 }
   $l = [System.IO.File]::ReadAllLines($x)
@@ -270,6 +273,44 @@ exit 0
 }
 
 const noKeyMsg = "the secret key file does not exist"
+
+// pwsh7ModulePath returns the PSModulePath (and a private module analysis
+// cache) of a process that inherited PowerShell 7's environment, as go test
+// does under pwsh on GitHub's Windows runners: 7's module directories come
+// before Windows PowerShell's. The stand-in for 7's Microsoft.PowerShell.Utility
+// has the shape of 7's manifest (Core edition, cmdlets in an assembly built
+// for .NET), which Windows PowerShell 5.1 cannot load; 5.1 then has no
+// Get-FileHash, the one Utility command it imports from PSModulePath.
+func pwsh7ModulePath(t *testing.T) []string {
+	t.Helper()
+	root := t.TempDir()
+	mods := filepath.Join(root, "PowerShell", "7", "Modules")
+	util := filepath.Join(mods, "Microsoft.PowerShell.Utility")
+	if err := os.MkdirAll(util, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `@{
+GUID = "1DA87E53-152B-403E-98DC-74D7B4D63D59"
+ModuleVersion = "7.0.0.0"
+CompatiblePSEditions = @("Core")
+PowerShellVersion = "3.0"
+NestedModules = "Microsoft.PowerShell.Commands.Utility.dll"
+CmdletsToExport = @("Get-FileHash", "ConvertFrom-Json", "ConvertTo-Json", "Write-Host", "Write-Output", "Get-Date")
+FunctionsToExport = @()
+AliasesToExport = @()
+}
+`
+	if err := os.WriteFile(filepath.Join(util, "Microsoft.PowerShell.Utility.psd1"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sys := os.Getenv("SystemRoot")
+	if sys == "" {
+		sys = `C:\Windows`
+	}
+	path := strings.Join([]string{mods, os.Getenv("ProgramFiles") + `\WindowsPowerShell\Modules`,
+		sys + `\system32\WindowsPowerShell\v1.0\Modules`}, ";")
+	return []string{"PSModulePath=" + path, "PSModuleAnalysisCachePath=" + filepath.Join(root, "analysis-cache")}
+}
 
 func TestSignScriptsCheckBeforeSigning(t *testing.T) {
 	shells := scriptShells(t)
@@ -354,6 +395,59 @@ func TestSignScriptsCheckBeforeSigning(t *testing.T) {
 					}
 				}
 			})
+			if sh.name == "ps1" && runtime.GOOS == "windows" {
+				// Windows PowerShell 5.1 started with PowerShell 7's
+				// PSModulePath (v3.3.0's CI: "The term 'Get-FileHash' is not
+				// recognized" right after the check passed).
+				t.Run("signing under PowerShell 7's PSModulePath", func(t *testing.T) {
+					t.Parallel()
+					modEnv := pwsh7ModulePath(t)
+					// The stand-in reproduces the failure: there, 5.1 has no Get-FileHash.
+					probe := `try { $null = Get-FileHash -LiteralPath $PSHOME\powershell.exe -Algorithm SHA256 -ErrorAction Stop; exit 0 } ` +
+						`catch [System.Management.Automation.CommandNotFoundException] { exit 3 }`
+					ps, err := exec.LookPath("powershell.exe")
+					if err != nil {
+						t.Fatal(err)
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), scriptTimeout)
+					defer cancel()
+					pc := exec.CommandContext(ctx, ps, "-NoProfile", "-NonInteractive", "-Command", probe)
+					pc.Env = append(os.Environ(), modEnv...)
+					pc.Stdin = strings.NewReader("")
+					pc.WaitDelay = 10 * time.Second
+					pout, perr := pc.CombinedOutput()
+					if ctx.Err() != nil || pc.ProcessState == nil || pc.ProcessState.ExitCode() != 3 {
+						t.Fatalf("the stand-in PSModulePath does not hide Get-FileHash from Windows PowerShell (%v): %s", perr, pout)
+					}
+
+					tools := t.TempDir()
+					fake := fakeMinisign(t, tools, true)
+					secret := filepath.Join(tools, "dummy.key")
+					if err := os.WriteFile(secret, []byte("not a key\n"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					key := "FAKE_MINISIGN_KEY=" + selfupdate.PublicKey
+					dir, mf := signFixture(t)
+					code, out, errOut := runSignScript(t, sh, signArgs{tag: "v3.2.0", dir: dir, manifest: mf, secret: secret, minisign: fake},
+						append([]string{key}, modEnv...)...)
+					if code != 0 || !strings.Contains(out, "Wrote ") || !strings.Contains(out, "signature verified") {
+						t.Fatalf("unchanged update.json: exit %d\nstdout: %s\nstderr: %s", code, out, errOut)
+					}
+					if b, err := os.ReadFile(mf + ".minisig"); err != nil || !strings.Contains(string(b), "trusted comment: lectureflow update version:3.2.0") {
+						t.Fatalf("signature file: %v %q", err, b)
+					}
+					// both hash comparisons still run there
+					dir, mf = signFixture(t)
+					code, out, errOut = runSignScript(t, sh, signArgs{tag: "v3.2.0", dir: dir, manifest: mf, secret: secret, minisign: fake},
+						append([]string{key, "FAKE_MINISIGN_TAMPER=1"}, modEnv...)...)
+					if code != 1 || !strings.Contains(errOut, "changed while minisign signed it") || !strings.Contains(errOut, "the signature was deleted") {
+						t.Fatalf("changed: exit %d\nstdout: %s\nstderr: %s", code, out, errOut)
+					}
+					if _, err := os.Stat(mf + ".minisig"); err == nil {
+						t.Fatal("changed: the signature was kept")
+					}
+				})
+			}
 			for _, c := range signCases() {
 				c := c
 				t.Run(c.name, func(t *testing.T) {

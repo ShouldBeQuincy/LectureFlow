@@ -170,18 +170,37 @@ func (e *env) claudeClient() *llm.HTTPClient {
 // delayed), and without waiting for the rest of it (the fake holds item 0's
 // stream after message_start until all of them started; if they waited for
 // its answer, they would start only after that hold timed out).
+//
+// The order is taken from a sequence of events, not from timestamps: Go's
+// monotonic clock on Windows moves in steps of the timer resolution (15.6 ms
+// by default, as on the CI runners), so an item that started a moment before
+// item 0 ended could read the same time as that end (v3.3.0 CI: "item 1
+// waited for item 0's answer" in a run of 0.09 s, far below the 5 s hold).
 func TestParallelWarmAfterFirstEvent(t *testing.T) {
 	e := newEnv(t)
 	c := e.claudeClient()
 	const delay = 60 * time.Millisecond
 	e.fake.SetDelay(delay)
-	others := make(chan struct{})
-	var started atomic.Int32
-	var holds atomic.Int32
+	var (
+		seq       atomic.Int64 // the order of the events below
+		began     atomic.Int64 // the fake began item 0's answer (after the delay, before message_start)
+		end0      atomic.Int64 // item 0's answer was read to its end
+		starts    [4]atomic.Int64
+		released  atomic.Bool // the hold ended because the others started, not at its timeout
+		started   atomic.Int32
+		holds     atomic.Int32
+		others    = make(chan struct{})
+		beginOnce sync.Once
+	)
+	e.fake.Handle(llmtest.RoleSummary, func(_, _ string) string {
+		beginOnce.Do(func() { began.Store(seq.Add(1)) })
+		return "summary"
+	})
 	e.fake.SetStreamHook(func(role, event string) {
 		if event == "message_start" && holds.Add(1) == 1 {
 			select {
 			case <-others:
+				released.Store(true)
 			case <-time.After(5 * time.Second):
 			}
 		}
@@ -190,8 +209,10 @@ func TestParallelWarmAfterFirstEvent(t *testing.T) {
 	err := parallelWarm(context.Background(), 4, 4, repairAnthropicWarmup, func(ctx context.Context, i int) (bool, error) {
 		var err error
 		r.run(i, func() {
+			starts[i].Store(seq.Add(1))
 			if i == 0 {
 				_, err = c.Complete(ctx, model.RoleSummary, ctxbuild.SummarySystemTemplate, "u", false)
+				end0.Store(seq.Add(1))
 				return
 			}
 			if started.Add(1) == 3 {
@@ -206,12 +227,16 @@ func TestParallelWarmAfterFirstEvent(t *testing.T) {
 	if len(r.s) != 4 || e.fake.Count(llmtest.RoleSummary) != 1 {
 		t.Fatalf("%d items ran, %d requests", len(r.s), e.fake.Count(llmtest.RoleSummary))
 	}
+	if began.Load() == 0 || end0.Load() == 0 || !released.Load() {
+		t.Errorf("answer began at %d, ended at %d; the others started while it was held: %v",
+			began.Load(), end0.Load(), released.Load())
+	}
 	for i := 1; i < 4; i++ {
-		if !r.s[i].start.Before(r.s[0].end) {
-			t.Errorf("item %d waited for item 0's answer", i)
+		if s := starts[i].Load(); s == 0 || s > end0.Load() {
+			t.Errorf("item %d waited for item 0's answer (started at %d, item 0 ended at %d)", i, s, end0.Load())
 		}
-		if d := r.s[i].start.Sub(r.s[0].start); d < delay-5*time.Millisecond {
-			t.Errorf("item %d started %v after item 0, before its answer began (%v)", i, d, delay)
+		if s := starts[i].Load(); s < began.Load() {
+			t.Errorf("item %d started at %d, before item 0's answer began (%d)", i, s, began.Load())
 		}
 	}
 }

@@ -25,6 +25,26 @@ func limitHeaders(w http.ResponseWriter, kv ...string) {
 	}
 }
 
+// answerTakesTime returns once the monotonic clock has moved on since it
+// was called. A test server's handler calls it before it answers, so that
+// the answer takes a measurable time on the client's clock: the client
+// counts an answer as a sample only when its measured duration is above
+// zero. Go's monotonic clock on Windows is the interrupt time, which moves
+// in steps of the timer resolution (15.6 ms by default, as on the CI
+// runners); a local answer often took less, was measured as 0 and not
+// counted (v3.3.0 CI: Samples 0 where 1 was wanted). Bounded: it gives up
+// after 2000 sleeps.
+func answerTakesTime(t *testing.T) {
+	t0 := time.Now()
+	for i := 0; time.Since(t0) <= 0; i++ {
+		if i == 2000 {
+			t.Error("the monotonic clock did not move")
+			return
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
+}
+
 // limitsClient is a settings-mode client whose Anthropic provider is at
 // api.anthropic.com (the only host whose limits are read); its requests
 // go to the test server srvURL. Every role on claude-test-model.
@@ -147,6 +167,7 @@ func TestAdviseLimits(t *testing.T) {
 // measured answer (uncached input = 450 prompt - 300 cache reads).
 func TestRateLimitsObservedWholeMessage(t *testing.T) {
 	srv, got := captureServer(t, func(n int, w http.ResponseWriter) {
+		answerTakesTime(t)
 		limitHeaders(w, fullLimits...)
 		io.WriteString(w, anthropicOK(`{"ok": true}`))
 	})
@@ -175,6 +196,7 @@ func TestRateLimitsObservedWholeMessage(t *testing.T) {
 // the event stream.
 func TestRateLimitsObservedStream(t *testing.T) {
 	s := newSEC4Server(t, func(n int, w http.ResponseWriter, r *http.Request) {
+		answerTakesTime(t)
 		limitHeaders(w, "anthropic-ratelimit-requests-limit", "1000", "anthropic-ratelimit-output-tokens-limit", "80000")
 		writeSSE(w, sec4OK(t, "streamed answer"))
 	})
@@ -227,6 +249,7 @@ func TestRateLimitsFrom429(t *testing.T) {
 func TestRateLimitsPerModelAndKey(t *testing.T) {
 	var limit string
 	srv, _ := captureServer(t, func(n int, w http.ResponseWriter) {
+		answerTakesTime(t)
 		limitHeaders(w, "anthropic-ratelimit-requests-limit", limit)
 		io.WriteString(w, anthropicOK(`{"ok": true}`))
 	})

@@ -44,6 +44,20 @@ func changedKey(t *testing.T, e *testEnv, f *fakeRemote) (ServerView, string) {
 	return v, fp
 }
 
+// fakeEncodeFLAC stands in for the ffmpeg encoding of the FLAC upload (as
+// in TestEndToEndFasterWhisperUsesFLAC), so a faster-whisper lecture
+// reaches the connection and its host key check on a machine without
+// ffmpeg instead of stopping at audio_unreadable.
+func fakeEncodeFLAC(o *Options) {
+	o.EncodeFLAC = func(ctx context.Context, in, out string) error {
+		b, err := os.ReadFile(in)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(out, append([]byte("fLaC"), b...), 0o600)
+	}
+}
+
 func hasSession(s *Server) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -55,7 +69,7 @@ func hasSession(s *Server) bool {
 // card's error names the presented key.
 func TestConnectShowsAChangedHostKey(t *testing.T) {
 	f := newFakeRemote(t, "Linux x86_64")
-	e := newTestEnv(t, nil)
+	e := newTestEnv(t, fakeEncodeFLAC)
 	v, newFP := changedKey(t, e, f)
 	before := len(f.sentCommands())
 	res, err := e.m.Connect(context.Background(), v.ID)

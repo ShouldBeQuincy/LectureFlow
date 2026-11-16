@@ -75,7 +75,24 @@ $packageDirAbs = (Resolve-Path -LiteralPath $PackageDir).Path
 $verify = @("run", "./scripts/release/make-update-json", "-verify", $manifestAbs, "-dir", $packageDirAbs, "-tag", $Tag)
 if ($Channel) { $verify += @("-channel", $Channel) }
 if ($AllowMirrors) { $verify += @("-allow-mirrors") }
-function Sha256Of([string]$path) { (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
+# SHA-256 in lowercase hex, computed with .NET rather than Get-FileHash:
+# Windows PowerShell 5.1 defines Get-FileHash in the Microsoft.PowerShell.Utility
+# module's script part, which it imports on first use from PSModulePath. Started
+# from a process that inherited PowerShell 7's PSModulePath (go test under pwsh
+# on GitHub's runners, or any tool that pwsh started), 5.1 finds 7's Utility
+# module first, cannot load it, and Get-FileHash does not exist. The compiled
+# cmdlets this script uses are loaded without PSModulePath, in 5.1 and 7 alike.
+function Sha256Of([string]$path) {
+  $full = (Resolve-Path -LiteralPath $path).ProviderPath
+  $stream = [System.IO.File]::OpenRead($full)
+  try {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $sum = $sha.ComputeHash($stream) } finally { $sha.Dispose() }
+  } finally {
+    $stream.Dispose()
+  }
+  [System.BitConverter]::ToString($sum).Replace("-", "").ToLowerInvariant()
+}
 $goEnv = @{ GOTOOLCHAIN = "local"; GOPROXY = "off"; GOFLAGS = "-mod=readonly" }
 $savedEnv = @{}
 foreach ($k in $goEnv.Keys) {
