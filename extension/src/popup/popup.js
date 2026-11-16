@@ -9,7 +9,7 @@
 import '../vendor/browser-polyfill.js';
 import { el, icon, t, localize } from '../ui/dom.js';
 import { applyChosenLanguage } from '../ui/language.js';
-import { createSendCard } from '../ui/sendcard.js';
+import { createSendCard, fitSend } from '../ui/sendcard.js';
 
 const browser = globalThis.browser;
 const $ = (id) => document.getElementById(id);
@@ -81,6 +81,12 @@ function onView(v, S) {
   $('export').disabled = !(d && d.status === 'ok');
   const ok = d && d.status === 'ok';
   $('grant').hidden = !(ok && ((!d.authorized && S.origins.length > 0) || (S.origins.length > 0 && (S.cookieHosts || []).length > 0)));
+  fitPopup();
+}
+
+/** The send block keeps in sight in a popup tall enough for it (the viewport scrolls; SEC42 中-1). */
+function fitPopup() {
+  fitSend(document.documentElement, window.innerHeight, document);
 }
 
 function grantSite(origins) {
@@ -159,6 +165,8 @@ async function main() {
   $('grant').addEventListener('click', onGrantClick);
   $('grant-allow').addEventListener('click', onGrantAllow);
   $('options').addEventListener('click', () => browser.runtime.openOptionsPage());
+  // Chrome grows the popup with its content, up to 600 px
+  window.addEventListener('resize', fitPopup);
   tabId = await currentTabId();
   card = createSendCard({
     mount: $('main'),

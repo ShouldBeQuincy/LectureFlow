@@ -27,7 +27,7 @@
 //                            (unset: 404, like a service without the in-app update)
 //
 // -selfupdate-verify DIR [-app-version V] [-selfupdate-previous]
-// [-selfupdate-copy TMP] (internal/selfupdate/README.md): prints one line
+// [-selfupdate-copy TMP] [-selfupdate-private] (internal/selfupdate/README.md): prints one line
 // and exits, like the real program; nothing else runs. -selfupdate-previous
 // checks previous.json's package instead of pending.json's (none: exit 1
 // not_available); -selfupdate-copy copies the package into
@@ -44,8 +44,10 @@ const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 
-const VALUE_FLAGS = new Set(['listen', 'data-dir', 'resources', 'app-version', 'config', 'location-file', 'launcher', 'nm-endpoint', 'selfupdate-verify', 'selfupdate-copy']);
-const BOOL_FLAGS = new Set(['portable', 'selfupdate-previous']);
+// install-dir, selfupdate-install-dir: accepted and not checked (the installation
+// directory's permissions are the real program's business, security audit M-4)
+const VALUE_FLAGS = new Set(['listen', 'data-dir', 'resources', 'app-version', 'config', 'location-file', 'launcher', 'nm-endpoint', 'selfupdate-verify', 'selfupdate-copy', 'install-dir', 'selfupdate-install-dir']);
+const BOOL_FLAGS = new Set(['portable', 'no-self-update', 'selfupdate-previous', 'selfupdate-private']);
 
 function parseArgs(argv) {
   const out = { desktop: false };
@@ -65,16 +67,26 @@ function fatal(reason, code = 1) {
   process.exit(code);
 }
 
-function selfUpdateVerify(dir, appVersion, { previous = false, copy = '' } = {}) {
+function selfUpdateVerify(dir, appVersion, { previous = false, copy = '', priv = false } = {}) {
   const say = (line, code) => {
     process.stdout.write(`${line}\n`);
     process.exit(code);
   };
   if (process.env.FAKE_VERIFY_LOG) {
-    fs.appendFileSync(process.env.FAKE_VERIFY_LOG, `${JSON.stringify({ dir, app_version: appVersion || '', previous, copy })}\n`);
+    const entry = { dir, app_version: appVersion || '', previous, copy };
+    if (priv) entry.private = true;
+    fs.appendFileSync(process.env.FAKE_VERIFY_LOG, `${JSON.stringify(entry)}\n`);
   }
   const mode = process.env.FAKE_SELFUPDATE_VERIFY || 'ok';
   if (mode === 'untrusted') say(`untrusted_dir: selfupdate.untrusted_dir: other accounts of this computer can change ${path.dirname(dir)} (Authenticated Users)`, 3);
+  if (priv) {
+    // -selfupdate-private: no package is verified; an empty folder for the
+    // shell's copy of a backup
+    if (!copy) say('invalid selfupdate.io_failed: no directory to make the private directory in', 1);
+    const d = path.join(copy, `lectureflow-update-${process.pid}`);
+    fs.mkdirSync(d, { recursive: true });
+    say(`ok private=${d}`, 0);
+  }
   if (mode === 'invalid') say('invalid selfupdate.signature_invalid: update.json.minisig does not verify with the built-in key', 1);
   if (mode === 'not_configured') say('not_configured: this build has no update public key', 2);
   const which = previous ? 'previous.json' : 'pending.json';
@@ -99,7 +111,7 @@ function selfUpdateVerify(dir, appVersion, { previous = false, copy = '' } = {})
 
 const opts = parseArgs(process.argv.slice(2));
 if (opts['selfupdate-verify'] !== undefined) {
-  selfUpdateVerify(opts['selfupdate-verify'], opts['app-version'], { previous: !!opts['selfupdate-previous'], copy: opts['selfupdate-copy'] || '' });
+  selfUpdateVerify(opts['selfupdate-verify'], opts['app-version'], { previous: !!opts['selfupdate-previous'], copy: opts['selfupdate-copy'] || '', priv: !!opts['selfupdate-private'] });
 }
 if (!opts.desktop) fatal('the fake service only knows desktop mode');
 if (!opts.listen || !opts['data-dir']) fatal('-listen and -data-dir are required');

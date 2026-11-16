@@ -17,9 +17,16 @@
 //   unpartitioned cookies); getAll({url, partitionKey: {}}) → every
 //   partition plus the unpartitioned ones (Chrome 119+; older versions
 //   reject the property). cookies.getPartitionKey({tabId, frameId}) gives a
-//   frame's exact key (Chrome 132+), but only with host access to both the
-//   top-level site and the frame (activeTab does not count), which an LMS
-//   page usually is not.
+//   frame's exact key (Chrome 132+), but only with host access to the
+//   top-level site's own origin ("https://<registrable domain>/*", not the
+//   page's host) and, for a sub-frame, to the frame's own site's origin too
+//   (these origins as measured on Chromium 156, SEC51 低-1 and SEC51b;
+//   that activeTab does not count, from Chromium's source, NOTES
+//   ext-chips). The per-page grants this extension asks for seldom include
+//   those: on a page like lms.uni.example it throws, and partitioned() —
+//   when the tab's top-level address is known — reads every partition and
+//   keeps the tab's site's instead; without that address, only the
+//   partitions of the frames that did give a key, usually none.
 // - Firefox: the same three getAll forms (no getPartitionKey); a
 //   partitioned cookie carries partitionKey.topLevelSite ("https://site"),
 //   an unpartitioned one partitionKey null.
@@ -159,7 +166,12 @@ async function getAllOr(api, details) {
   }
 }
 
-/** Chrome 132+: the frames' own partition keys; complete when every frame answered. */
+/**
+ * Chrome 132+: the frames' own partition keys; complete when every frame
+ * answered. No time limit here, unlike actions.js topSiteFor (SEC51 信-1):
+ * without access Chrome refuses at once (measured), but a call that never
+ * settled would hold the send.
+ */
 async function frameKeys(api, { tabId, frameIds }) {
   if (typeof api.getPartitionKey !== 'function' || tabId === null) return { keys: [], complete: false };
   const keys = [];
@@ -170,7 +182,9 @@ async function frameKeys(api, { tabId, frameIds }) {
       const res = await api.getPartitionKey({ tabId, frameId });
       key = res && res.partitionKey;
     } catch {
-      key = null; // no host access to the top-level site or the frame, or the frame is gone
+      // no host access to the top-level site's or the frame's site's origin
+      // (the usual case), a frame under an opaque ancestor, or the frame is gone
+      key = null;
     }
     if (!key || typeof key.topLevelSite !== 'string' || !key.topLevelSite) {
       complete = false;
@@ -185,11 +199,24 @@ async function frameKeys(api, { tabId, frameIds }) {
 
 /**
  * The partitioned cookies of these URLs that the tab's frames would send:
- * - with every frame's exact key (Chrome 132+ with access to the top page),
- *   that key's partition;
+ * - with every frame's exact key (Chrome 132+, and only where getPartitionKey
+ *   answered for every frame: host access to the sites' own origins, see
+ *   the top of this file — seldom, so not the usual path), that key's
+ *   partition;
  * - otherwise, when the tab's top-level address is known, every partition
  *   read at once (partitionKey: {}) and only the partitions of that site
- *   kept — the other sites' cookies are dropped right here, in memory;
+ *   kept — the other sites' cookies are dropped right here, in memory. With
+ *   the address known, this is what Firefox always does and what Chrome
+ *   does on most pages. (An in-page card whose top page the extension
+ *   cannot see has the top-level origin its frame reported instead,
+ *   cookieScope; one that reported none — Firefox before 153, a "null"
+ *   origin — has no address, and then the next branch reads at most the
+ *   keys some frames gave, in Firefox none.) It is
+ *   wider than the exact key: both hasCrossSiteAncestor partitions of the
+ *   site, and the site as sameSiteAsTop tells it (no public suffix list: a
+ *   partition of a parent domain the browser makes another site, as
+ *   github.io for x.github.io, passes too; NOTES ext-chips). Where
+ *   getPartitionKey throws, which is most pages, nothing narrows it;
  * - otherwise the keys some frames gave, or none.
  */
 async function partitioned(api, urls, scope) {

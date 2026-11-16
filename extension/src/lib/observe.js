@@ -20,6 +20,8 @@
 // same cases.
 
 import { hostMatches, parseHttpUrl } from './url.js';
+import { MAX_REGEX_INPUT } from './regexcost.js';
+import { guardedRegex } from './regexguard.js';
 
 export const MAX_STRING = 2048; // one observed string (a URL) at most
 export const MAX_ARRAY = 16; // values a "*" segment yields at most
@@ -108,15 +110,15 @@ export function observeConfig(profile) {
   };
 }
 
-/** Whether an observed request URL fits a spec: platform host, pattern on the URL without query. */
-export function specMatches(spec, rawUrl) {
+/** Whether an observed request URL fits a spec: platform host, pattern on the URL without query (behind the regex guard; owner: the profile's key). */
+export function specMatches(spec, rawUrl, owner = '') {
   const u = parseHttpUrl(rawUrl);
   if (!u) return false;
   if (!spec.hosts.some((h) => hostMatches(h, u.hostname))) return false;
   const bare = `${u.protocol}//${u.host}${u.pathname}`;
-  if (bare.length > 2048) return false; // as profileRegex: never on long inputs
+  if (bare.length > MAX_REGEX_INPUT) return false; // as profileRegex: never on long inputs
   try {
-    return new RegExp(spec.urlPattern, 'i').test(bare);
+    return guardedRegex(spec.urlPattern, { owner }).test(bare);
   } catch {
     return false;
   }
@@ -132,7 +134,7 @@ export function cleanObservedRecord(profile, rec) {
   const cfg = observeConfig(profile);
   if (!cfg || !rec || typeof rec !== 'object' || rec.key !== cfg.key) return null;
   const spec = Number.isInteger(rec.index) ? cfg.specs[rec.index] : undefined;
-  if (!spec || typeof rec.url !== 'string' || !specMatches(spec, rec.url)) return null;
+  if (!spec || typeof rec.url !== 'string' || !specMatches(spec, rec.url, cfg.key)) return null;
   const values = {};
   const vals = rec.values && typeof rec.values === 'object' ? rec.values : {};
   for (const name of Object.keys(spec.pointers)) {
@@ -148,16 +150,21 @@ export function cleanObservedRecord(profile, rec) {
 /**
  * Combines the observations of all frames (top frame first) for a profile.
  * Returns { seen: Set of observe indexes answered, values: { name: value },
- * urls: { name: request URL without query } } — urls resolve relative
- * values. A name of an index that was answered but lacks the field is
- * "seen" with value undefined.
+ * urls: { name: request URL without query }, stopped: whether a frame's
+ * observer stopped the profile's regexes as too slow } — urls resolve
+ * relative values. A name of an index that was answered but lacks the
+ * field is "seen" with value undefined.
  */
 export function combineObserved(profile, frames) {
-  const out = { seen: new Set(), values: {}, urls: {} };
+  const out = { seen: new Set(), values: {}, urls: {}, stopped: false };
   const cfg = observeConfig(profile);
   if (!cfg) return out;
+  const key = profileKey(profile);
   const ordered = [...(frames || [])].sort((a, b) => (a.frameId === 0 ? -1 : b.frameId === 0 ? 1 : a.frameId - b.frameId));
   for (const f of ordered) {
+    // a frame's observer stopped this profile's regexes as too slow: what
+    // it did not see yet it never will (SEC18f 低-18)
+    if (f.observeStopped === key) out.stopped = true;
     for (const raw of f.observed || []) {
       const rec = cleanObservedRecord(profile, raw);
       if (!rec || out.seen.has(rec.index)) continue;

@@ -108,8 +108,40 @@ test('dependencies are pinned to exact versions', () => {
   assert.deepEqual(deps, {
     electron: '44.9.3',
     'electron-builder': '26.17.0',
-    'electron-updater': '6.8.10',
     '@playwright/test': '1.64.1',
   });
   assert.ok(fs.existsSync(path.join(DESKTOP, 'package-lock.json')));
+});
+
+// A runtime dependency goes into app.asar and THIRD_PARTY_NOTICES.md: whoever
+// adds one updates the notices (go run ./scripts/licaudit), the allowlist
+// if its license needs it, and these two assertions.
+const RUNTIME_DEP_HINT = 'a new runtime npm dependency ships in app.asar: regenerate THIRD_PARTY_NOTICES.md (go run ./scripts/licaudit), check packaging/licenses/allowlist.json, then update this test';
+
+test('no runtime npm dependency at all: app.asar ships no node_modules (any new one must update the notices and this test)', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(DESKTOP, 'package.json'), 'utf8'));
+  assert.equal(pkg.dependencies, undefined, `package.json has "dependencies"; ${RUNTIME_DEP_HINT}`);
+  const lock = JSON.parse(fs.readFileSync(path.join(DESKTOP, 'package-lock.json'), 'utf8'));
+  assert.equal(lock.packages[''].dependencies, undefined, `package-lock.json: the root has "dependencies"; ${RUNTIME_DEP_HINT}`);
+});
+
+test('electron-updater is no dependency: the packaged app never loads it (in-app updates go through internal/selfupdate)', () => {
+  const lock = JSON.parse(fs.readFileSync(path.join(DESKTOP, 'package-lock.json'), 'utf8'));
+  const left = Object.keys(lock.packages).filter((k) => /(^|\/)node_modules\/electron-updater$/.test(k));
+  assert.deepEqual(left, [], 'package-lock.json has no electron-updater');
+});
+
+test('splash: the text colours are the web app\'s (web/style.css), light and dark', () => {
+  const css = fs.readFileSync(path.join(DESKTOP, '..', 'web', 'style.css'), 'utf8');
+  const splash = fs.readFileSync(path.join(DESKTOP, 'src', 'splash.html'), 'utf8');
+  const darkAt = splash.indexOf('prefers-color-scheme: dark');
+  assert.ok(darkAt > 0, 'the splash has a dark scheme');
+  for (const n of [1, 2, 3]) {
+    const web = new RegExp(`--text-${n}:\\s*light-dark\\((#[0-9a-f]{6}),\\s*(#[0-9a-f]{6})\\)`, 'i').exec(css);
+    assert.ok(web, `web/style.css --text-${n}`);
+    const found = [...splash.matchAll(new RegExp(`--text-${n}:\\s*(#[0-9a-f]{6})`, 'gi'))].map((m) => ({ at: m.index, value: m[1].toLowerCase() }));
+    assert.equal(found.length, 2, `splash --text-${n}: light and dark`);
+    assert.ok(found[0].at < darkAt && found[1].at > darkAt, `splash --text-${n}: light first, then dark`);
+    assert.deepEqual(found.map((f) => f.value), [web[1].toLowerCase(), web[2].toLowerCase()], `--text-${n}`);
+  }
 });

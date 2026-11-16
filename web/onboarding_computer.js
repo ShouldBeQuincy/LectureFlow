@@ -150,7 +150,9 @@ export function computerStep(env) {
     const notes = (S.rec.notes || []).map(hwText).filter(Boolean);
     const facts = [];
     if (S.hw.ram_mb) facts.push(t('onboarding.computer.ram', { size: U.fmtMB(S.hw.ram_mb) }));
-    if (S.hw.disk_free_mb) facts.push(t('onboarding.computer.disk', { size: U.fmtMB(S.hw.disk_free_mb) }));
+    // round 9 WV-11 (R86 L3; C3): the disk in decimal units, as the
+    // "storage" step shows the same disk (fmtBytes); the memory stays fmtMB
+    if (S.hw.disk_free_mb) facts.push(t('onboarding.computer.disk', { size: U.fmtBytes(S.hw.disk_free_mb * 1048576) }));
     return h(
       'div',
       { class: 'ob-section' },
@@ -178,6 +180,17 @@ export function computerStep(env) {
     );
   }
 
+  // r7 (T22 S3): not enough room on the data folder's disk. With the guide's
+  // own "data folder" step to come (env.storageShown: desktop app, the folder
+  // can be moved), the user continues as usual and changes the folder there:
+  // nothing is downloaded before that step (startChosenInstall). Without it
+  // (web mode, a folder set by LECTUREFLOW_DATA_DIR) the main action stays
+  // off and the settings are the way out, as before.
+  function spaceTodo() {
+    if (env.storageShown) return h('p', { class: 'dim' }, t('onboarding.computer.space_todo_storage'));
+    return h('p', { class: 'dim' }, t('onboarding.computer.space_todo'), ' ', h('a', { href: '#/settings', class: 'ob-inline-link' }, t('onboarding.computer.open_settings')));
+  }
+
   function planBlock() {
     const plan = S.plan;
     const space = planSpaceText(plan);
@@ -199,7 +212,7 @@ export function computerStep(env) {
             'div',
             { class: 'ob-callout is-warn', role: 'alert' },
             icon('hard-drive', { size: 16 }),
-            h('div', null, h('p', null, space), h('p', { class: 'dim' }, t('onboarding.computer.space_todo'), ' ', h('a', { href: '#/settings', class: 'ob-inline-link' }, t('onboarding.computer.open_settings')))),
+            h('div', null, h('p', null, space), spaceTodo()),
           )
         : null,
     );
@@ -259,7 +272,8 @@ export function computerStep(env) {
     primary() {
       if (S.loading) return { label: t('onboarding.computer.install'), icon: 'download', disabled: true };
       if (nothingToDo()) return { label: t('onboarding.continue'), icon: 'arrow-right', disabled: S.busy, onclick: proceed };
-      const noSpace = !!S.plan && S.plan.enough_space === false;
+      // too little room only stops the guide here when it has no "data folder" step to change it in
+      const noSpace = !!S.plan && S.plan.enough_space === false && !env.storageShown;
       const empty = S.selected.size === 0;
       return {
         label: S.custom ? t('onboarding.computer.install_chosen') : t('onboarding.computer.install'),

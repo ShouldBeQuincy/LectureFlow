@@ -134,12 +134,22 @@ func anthropicOK(text string) string {
 	return string(b)
 }
 
+// anthropicFixtureModel is the model of every role of anthropicClient: a
+// current Claude model (adaptive thinking, streamed) that does not think
+// when the request has no thinking field (anthropicOffWithoutFieldModels),
+// so its level off holds no thinking headroom. Until R6-C it was the
+// made-up "claude-test-model", which now counts as a Claude model the lists
+// do not know and holds ThinkingHeadroomOffUnlisted at off
+// (thinking_off_unlisted_test.go); the tests on this fixture pin the bases
+// and limits of a model that stays silent, as they always did.
+const anthropicFixtureModel = "claude-opus-4-8"
+
 func anthropicClient(t *testing.T, url string) (*HTTPClient, *settings.Service, model.Provider, *fakePool, *recorder, *fakeRecorder) {
 	t.Helper()
 	set := newSettings(t)
 	p := addProvider(t, set, "Claude", model.ProviderAnthropic, url, testKey)
 	for _, role := range model.Roles {
-		setRole(t, set, role, p.ID, "claude-test-model", model.RoleParams{})
+		setRole(t, set, role, p.ID, anthropicFixtureModel, model.RoleParams{})
 	}
 	pool, rec, usage := &fakePool{}, &recorder{}, &fakeRecorder{}
 	c := NewWithSettings(set, pool, usage, "", nil)
@@ -175,13 +185,21 @@ func TestAnthropicRequestFormat(t *testing.T) {
 			t.Errorf("request %d: path %q headers %v", i, cp.path, h)
 		}
 		b := cp.body
-		if b["model"] != "claude-test-model" || b["max_tokens"] != float64(DefaultAnthropicMaxTokens) {
+		// v3.2.x D1: the fixture's model is a current Claude model, so each
+		// role has its own base (translate 2000, summary 4000).
+		if b["model"] != anthropicFixtureModel || b["max_tokens"] != float64(BaseMaxTokens([]string{model.RoleTranslate, model.RoleSummary}[i], 0)) {
 			t.Errorf("request %d: body %v", i, b)
 		}
-		for _, k := range []string{"temperature", "top_p", "top_k", "response_format", "stream"} {
+		for _, k := range []string{"temperature", "top_p", "top_k", "response_format"} {
 			if _, has := b[k]; has {
 				t.Errorf("request %d: unexpected field %q", i, k)
 			}
+		}
+		// The fixture's model is a current Claude model: streamed (v3.2.x
+		// P1-c); this server answers with a whole message, which is read
+		// as before.
+		if b["stream"] != true || h.Get("Accept") != "text/event-stream" {
+			t.Errorf("request %d: stream %v, accept %q", i, b["stream"], h.Get("Accept"))
 		}
 		sys, _ := json.Marshal(b["system"])
 		if string(sys) != `[{"cache_control":{"type":"ephemeral"},"text":"FIXED PREFIX","type":"text"}]` {

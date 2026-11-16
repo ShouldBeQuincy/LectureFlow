@@ -37,6 +37,10 @@ var (
 	setCopyDuration   = 8 * time.Second
 	setVerifyDuration = 1500 * time.Millisecond
 	setRestartGap     = 2 * time.Second
+	// setNow is the clock of the simulated move (a test steps it instead of
+	// racing the wall clock: a busy machine could otherwise poll past the
+	// short verifying / restart windows and never see them).
+	setNow = time.Now
 )
 
 const (
@@ -67,6 +71,7 @@ func init() {
 		handle("POST /api/app/data-dir/check", a(m.setCheckDir)) // 3.1.0 (v31_onboarding.go)
 		handle("GET /api/app/old-data-dir", a(m.setGetOld))
 		handle("DELETE /api/app/old-data-dir", a(m.setDeleteOld))
+		handle("DELETE /api/app/folder-pick", a(m.setForgetPick)) // r6 path-grants
 		handle("POST /api/app/open-logs", a(m.setOpenLogs))
 		handle("POST /api/app/diagnostics", a(m.setDiagnostics))
 		handle("GET /api/app/license", a(m.setLicense))
@@ -197,7 +202,7 @@ func (st *setState) status(now time.Time) (api.DataDirStatus, bool) {
 func (m *mock) setDataDirStatus(w http.ResponseWriter, r *http.Request, _ *store) {
 	st := m.appSet()
 	st.mu.Lock()
-	out, up := st.status(time.Now())
+	out, up := st.status(setNow())
 	st.mu.Unlock()
 	if !up {
 		codedError(w, http.StatusServiceUnavailable, "server.unavailable", map[string]any{"service": "restart"})
@@ -210,7 +215,7 @@ func (m *mock) setDataDirStatus(w http.ResponseWriter, r *http.Request, _ *store
 func (m *mock) setHealth(w http.ResponseWriter, r *http.Request, _ *store) {
 	st := m.appSet()
 	st.mu.Lock()
-	_, up := st.status(time.Now())
+	_, up := st.status(setNow())
 	st.mu.Unlock()
 	if !up {
 		codedError(w, http.StatusServiceUnavailable, "server.unavailable", map[string]any{"service": "restart"})
@@ -235,13 +240,13 @@ func (m *mock) setMove(w http.ResponseWriter, r *http.Request, _ *store) {
 		writeJSON(w, status, api.ErrorBody{Error: *info})
 		return
 	}
-	mv := &setMoveRun{path: p, started: time.Now(), fail: strings.Contains(strings.ToLower(p), "fail"), total: setDataSize, copyDur: setCopyDuration}
+	mv := &setMoveRun{path: p, started: setNow(), fail: strings.Contains(strings.ToLower(p), "fail"), total: setDataSize, copyDur: setCopyDuration}
 	if strings.HasPrefix(scenario(r), "ob_") {
 		// the onboarding's move: a fresh install has hardly any data
 		mv.total, mv.copyDur = setFreshSize, setFreshCopy
 	}
 	st.move = mv
-	out, _ := st.status(time.Now())
+	out, _ := st.status(setNow())
 	writeJSON(w, http.StatusAccepted, out)
 }
 
@@ -259,7 +264,7 @@ func (st *setState) checkTarget(p string) (int, *model.ErrorInfo) {
 	case strings.Contains(lp, "notempty"):
 		return http.StatusConflict, &model.ErrorInfo{Code: "data_dir.target_not_empty", Params: map[string]any{"path": p}}
 	}
-	if cur, _ := st.status(time.Now()); cur.State == "copying" || cur.State == "verifying" {
+	if cur, _ := st.status(setNow()); cur.State == "copying" || cur.State == "verifying" {
 		return http.StatusConflict, &model.ErrorInfo{Code: "data_dir.in_progress"}
 	}
 	if strings.EqualFold(p, st.dataDir) {
@@ -301,6 +306,23 @@ func (m *mock) setDeleteOld(w http.ResponseWriter, r *http.Request, _ *store) {
 	time.Sleep(600 * time.Millisecond)
 	st.oldDir, st.oldBytes = "", 0
 	writeJSON(w, http.StatusOK, api.OldDataDir{})
+}
+
+// setForgetPick is DELETE /api/app/folder-pick {"path"}: 204 with no body,
+// as the desktop server answers whether or not the path had a pick
+// (internal/api/handlers_datadir.go deleteFolderPick). The page sends it
+// when the user cancels the confirmation of a folder they picked, or the
+// check refuses it. The mock keeps no picks (its data directory endpoints
+// take any path), so there is nothing to forget.
+func (m *mock) setForgetPick(w http.ResponseWriter, r *http.Request, _ *store) {
+	var in struct {
+		Path string `json:"path"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ---------- logs, diagnostics, legal texts ----------

@@ -601,7 +601,7 @@ func (s *Scheduler) admitOn(ctx context.Context, sc *scanState, r *run, d model.
 	s.mu.Lock()
 	t := s.tests[d.ID]
 	testHolds := t != nil && t.holding
-	n, vramReserved, intelRunning, memReserved, workerMem := 0, 0, 0, 0, 0
+	n, vramReserved, legacyReserved, intelRunning, memReserved, workerMem := 0, 0, 0, 0, 0, 0
 	for _, x := range s.running {
 		if x.res != ResourceGPU {
 			continue
@@ -609,9 +609,8 @@ func (s *Scheduler) admitOn(ctx context.Context, sc *scanState, r *run, d model.
 		workerMem += x.workerMemMB
 		if x.device == d.ID {
 			n++
-			if left := x.estimateMB - x.peakMB; left > 0 {
-				vramReserved += left
-			}
+			vramReserved += max(x.estimateMB-x.peakMB, 0)
+			legacyReserved += max(x.legacyEstMB-x.peakMB, 0)
 		}
 		if systemMemBackend(model.DeviceBackend(x.device)) {
 			intelRunning++
@@ -690,11 +689,11 @@ func (s *Scheduler) admitOn(ctx context.Context, sc *scanState, r *run, d model.
 			return admit()
 		}
 		ct := config.ResolveComputeType(precision, model.FWDevice(d.ID), sc.gpu.TotalMB)
-		est := s.vramEstimate(ctx, mdl, ct)
-		if sc.gpu.FreeMB-sc.asr.VRAMReserveMB-vramReserved < est {
-			return model.WaitVRAM, miss
+		est, legacy := s.vramEstimates(ctx, mdl, ct)
+		if why := vramFits(sc.gpu.FreeMB, sc.asr.VRAMReserveMB, n, est, vramReserved, legacy, legacyReserved); why != "" {
+			return why, miss
 		}
-		r.estimateMB, r.baseUsedMB, r.sample, r.computeType, r.asrModel = est, sc.gpu.UsedMB, true, ct, mdl
+		r.estimateMB, r.legacyEstMB, r.baseUsedMB, r.admitFreeMB, r.sample, r.computeType, r.asrModel = est, legacy, sc.gpu.UsedMB, sc.gpu.FreeMB, true, ct, mdl
 	case systemMemBackend(d.Backend):
 		if !sc.memRead {
 			sc.memMB, sc.memErr = s.memAvail()
@@ -830,18 +829,6 @@ func (tb testBudget) fitsLocked(s *Scheduler, id string) bool {
 		}
 	}
 	return total <= s.workerMemBudget()
-}
-
-// vramEstimate = max(vram_per_job_mb, ceil(observed peak × 1.1)) (SPEC
-// §17.2) for a model and resolved compute type.
-func (s *Scheduler) vramEstimate(ctx context.Context, mdl, computeType string) int {
-	est := s.set.ASR().VRAMPerJobMB
-	if obs := s.observedVRAM(ctx, mdl, computeType); obs > 0 {
-		if v := (obs*11 + 9) / 10; v > est {
-			est = v
-		}
-	}
-	return est
 }
 
 func (sc *scanState) want(ds []model.ASRDevice) {

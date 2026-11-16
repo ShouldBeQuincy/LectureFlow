@@ -51,7 +51,7 @@ const (
 	CodeAudioMissing    = "colab.audio_missing"    // file
 	CodeSettingsInvalid = "colab.settings_invalid" // field
 	CodeWorkerMissing   = "colab.worker_missing"   // file: a worker script to upload is missing locally
-	CodeCancelled       = "colab.cancelled"        // the caller cancelled the lecture; the runtime was released
+	CodeCancelled       = "colab.cancelled"        // the caller cancelled the lecture; the runtime's release has begun (or the runtime stays for other lectures)
 	CodeUploadFailed    = "colab.upload_failed"    // file
 	CodeDownloadFailed  = "colab.download_failed"  // file
 	CodeLocalWrite      = "colab.local_write"      // file: the downloaded result could not be written locally

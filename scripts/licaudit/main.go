@@ -11,9 +11,10 @@
 // tables in packaging/licenses, judges every license against the
 // AGPL-3.0-compatible table (policy.go) and writes THIRD_PARTY_NOTICES.md.
 // With -check it writes nothing (CI). It also checks the SPDX header of
-// every tracked source file, and that the worker sources point to the
-// additional permission in LICENSE-EXCEPTION.md. Any violation exits with
-// status 1.
+// every tracked source file that a release publishes (the tracked files
+// that .gitignore does not exclude, as make-release.sh; gitTrackedFiles),
+// and that the worker sources point to the additional permission in
+// LICENSE-EXCEPTION.md. Any violation exits with status 1.
 package main
 
 import (

@@ -56,6 +56,68 @@ func TestClassifyHost(t *testing.T) {
 		{"fec0::1", classLocalNet, true},
 		{"::ffff:10.0.0.1", classLocalNet, true},
 		{"printer.local", classLocalNet, true},
+		// SEC16 R4 / SEC19 low-5: carrier-grade NAT (Tailscale too), the
+		// local network
+		{"100.64.0.1", classLocalNet, true},
+		{"100.127.255.254", classLocalNet, true},
+		{"100.63.255.255", classPublic, true},
+		{"100.128.0.1", classPublic, true},
+		// multicast and the limited broadcast: never connected to, no single
+		// server's address (unusual_host, SEC19 low-8)
+		{"224.0.0.1", classNotUnicast, true},
+		{"239.1.1.1", classNotUnicast, true},
+		{"233.252.0.1", classNotUnicast, true},
+		{"255.255.255.255", classNotUnicast, true},
+		{"ff02::1", classNotUnicast, true},
+		{"ff05::1", classNotUnicast, true},
+		{"ff0e::1", classNotUnicast, true},
+		// IPv6 with an IPv4 address inside: judged by that address. NAT64
+		// (64:ff9b::/96 and the local-use 64:ff9b:1::/48, the address in the
+		// last 32 bits): an IPv6-only network reaches public IPv4 servers
+		// so, and its own network or this computer so too
+		{"64:ff9b::7f00:1", classLoopback, true},
+		{"64:ff9b::127.0.0.1", classLoopback, true},
+		{"64:ff9b::a00:5", classLocalNet, true},
+		{"64:ff9b::a9fe:a9fe", classLocalNet, true},
+		{"64:ff9b::6440:1", classLocalNet, true},
+		// 0.0.0.0/8 inside an IPv6 address: no server's address, not this
+		// computer (unusual_host, SEC19 low-8); 0.0.0.0/8 IPv4-mapped is
+		// itself (this computer to most systems)
+		{"64:ff9b::0:1", classNotUnicast, true},
+		{"64:ff9b::1", classNotUnicast, true},
+		{"64:ff9b:1::1:203", classNotUnicast, true},               // 0.1.2.3
+		{"::ffff:0:0:1", classNotUnicast, true},                   // IPv4-translated 0.0.0.1
+		{"::0.1.2.3", classNotUnicast, true},                      // IPv4-compatible
+		{"2002:0:1::1", classNotUnicast, true},                    // 6to4 of 0.0.1.x
+		{"2002:a:b::1", classNotUnicast, true},                    // 6to4 of 0.10.0.11
+		{"2001:0:0:0:8000:63bf:3fff:fdd2", classNotUnicast, true}, // Teredo: server 0.0.0.0, client 192.0.2.45
+		{"2001:0:0:0:8000:63bf:80ff:fffe", classNotUnicast, true}, // Teredo: server 0.0.0.0, client 127.0.0.1
+		{"::ffff:0.0.0.0", classUnsafe, true},
+		{"::ffff:0.1.2.3", classUnsafe, true},
+		{"64:ff9b::efff:1", classNotUnicast, true},
+		{"64:ff9b::cb00:710a", classPublic, true}, // 203.0.113.10
+		{"64:ff9b::808:808", classPublic, true},
+		{"64:ff9b:1::7f00:1", classLoopback, true},
+		{"64:ff9b:1:ab::c0a8:101", classLocalNet, true},
+		{"64:ff9b:1::808:808", classPublic, true},
+		// IPv4-translated (SIIT)
+		{"::ffff:0:7f00:1", classLoopback, true},
+		{"::ffff:0:a00:1", classLocalNet, true},
+		{"::ffff:0:808:808", classPublic, true},
+		// IPv4-compatible (deprecated, never routed): refused whatever is inside
+		{"::127.0.0.1", classLoopback, true},
+		{"::7f00:1", classLoopback, true},
+		{"::10.0.0.1", classLocalNet, true},
+		{"::8.8.8.8", classNotUnicast, true},
+		// 6to4: the IPv4 address after 2002:
+		{"2002:7f00:1::", classLoopback, true},
+		{"2002:c0a8:101::1", classLocalNet, true},
+		{"2002:808:808::1", classPublic, true},
+		// Teredo: the server's address, and the client's (inverted)
+		{"2001:0:4136:e378:8000:63bf:80ff:fffe", classLoopback, true}, // client 127.0.0.1
+		{"2001:0:7f00:1:8000:63bf:3fff:fdd2", classLoopback, true},    // server 127.0.0.1
+		{"2001:0:4136:e378:8000:63bf:f5ff:fffa", classLocalNet, true}, // client 10.0.0.5
+		{"2001:0:4136:e378:8000:63bf:3fff:fdd2", classPublic, true},   // client 192.0.2.45
 		{"172.32.0.1", classPublic, true},
 		{"8.8.8.8", classPublic, true},
 		{"2606:4700::6810:84e5", classPublic, true},
@@ -309,6 +371,7 @@ func TestIntranetRecordings(t *testing.T) {
 			e := newQEnv(t, func(o *Options) { o.allowLoopback = false })
 			lookups := map[string]int{}
 			e.q.local.lookup = testPolicy(false, lookups).lookup
+			e.q.local.dial = loopbackWire // where the guard proxy finds 10.0.0.7 (aria2c connects through it)
 			e.media.put("/files/a.m4a", pattern(1, 5000))
 			e.media.mu.Lock()
 			// no cookie; no Referer either (an https page, plain http media)

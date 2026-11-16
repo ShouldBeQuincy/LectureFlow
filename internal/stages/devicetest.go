@@ -8,11 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"log/slog"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -462,22 +463,34 @@ var componentImportModules = map[string][]string{
 
 // importCheckCmd is the command of componentImportCheck: `{py} -I -c` with
 // the telemetry packages blocked before the imports (`import openvino`
-// alone used to report to Google Analytics) and pyenv's environment.
-func importCheckCmd(ctx context.Context, py string, modules []string) *exec.Cmd {
+// alone used to report to Google Analytics) and pyenv's environment, run
+// in dir: the worker directory (config worker_dir: the application's own
+// resources/worker, or the repository's worker/ in development), or with
+// dir "" the interpreter's own directory (the environment's Scripts or bin
+// folder, which the component manager or the user set up). Never the
+// service's current directory: the Windows DLL search looks there when the
+// imports load native extensions (SEC47 info-5, SEC50 info-2). -I keeps the
+// directory off sys.path either way.
+func importCheckCmd(ctx context.Context, py, dir string, modules []string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, py, "-I", "-c", pyenv.ImportCheck(modules))
+	if dir == "" {
+		dir = filepath.Dir(py)
+	}
+	cmd.Dir = dir
 	cmd.Env = pyenv.Environ("PYTHONIOENCODING=utf-8")
 	return cmd
 }
 
-// componentImportCheck runs `{python} -I -c "import …"` (tests replace it).
-var componentImportCheck = func(ctx context.Context, python string, modules []string) error {
+// componentImportCheck runs `{python} -I -c "import …"` in dir
+// (importCheckCmd; tests replace it).
+var componentImportCheck = func(ctx context.Context, python, dir string, modules []string) error {
 	py, err := executable(python)
 	if err != nil {
 		return fmt.Errorf("interpreter %s: %w", python, err)
 	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	cmd := importCheckCmd(ctx, py, modules)
+	cmd := importCheckCmd(ctx, py, dir, modules)
 	cmd.WaitDelay = 3 * time.Second
 	tail := &tailBuffer{n: stderrTailBytes}
 	cmd.Stderr = tail
@@ -549,7 +562,7 @@ func (d Deps) ComponentSelfTest(ctx context.Context, c ComponentCheck) error {
 	case c.Python == "":
 		return nil // the files were checked above
 	case c.ModelDir == "":
-		return componentImportCheck(ctx, c.Python, componentImportModules[c.Backend])
+		return componentImportCheck(ctx, c.Python, d.Cfg.WorkerDir, componentImportModules[c.Backend])
 	}
 	dir, err := d.componentTestDir(c.ID)
 	if err != nil {
@@ -611,15 +624,32 @@ func checkModelFiles(backend, dir string) error {
 }
 
 // componentTestDir creates a fresh work directory for a component
-// self-test: {data_dir}/selftest/components/{id}-{time} (the id made safe
-// as selfTestDir does).
+// self-test: {data_dir}/selftest/components/{h}-{n}, h the 8 hex digits of
+// the FNV-1a hash of the component id and n the random number os.MkdirTemp
+// picks, so two self-tests (of the same component, too) never share a
+// directory. The worker runs in it, so its depth below the data directory,
+// files included, is kept within the material folder's (internal/api
+// workDirDepth), which keeps it within both budgets of the diagnostics'
+// data directory length check, the working directory's and the deepest
+// worker file's (internal/api deepestFileDepth, R6-E): with the component
+// id in the name (model ids reach 48 characters; before 3.2.x the name was
+// {safe id}-{UnixNano base36}) it did not.
 func (d Deps) componentTestDir(id string) (string, error) {
-	name := filepath.Base(selfTestDir("", id)) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	dir, err := filepath.Abs(filepath.Join(selfTestDir(d.DataDir, "components"), name))
+	parent, err := filepath.Abs(selfTestDir(d.DataDir, "components"))
 	if err != nil {
 		return "", err
 	}
-	return dir, os.MkdirAll(dir, 0o755)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return "", err
+	}
+	h := fnv.New32a()
+	h.Write([]byte(id))
+	dir, err := os.MkdirTemp(parent, fmt.Sprintf("%08x-*", h.Sum32()))
+	if err == nil {
+		// the name has only the hash: this line ties the worker's "dir" to the component
+		slog.Info("component self-test", "component", id, "dir", dir)
+	}
+	return dir, err
 }
 
 // silenceWAV is ms milliseconds of digital silence as a 16 kHz mono 16-bit

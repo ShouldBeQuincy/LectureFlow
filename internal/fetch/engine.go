@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lectureflow/internal/procutil"
@@ -54,6 +55,21 @@ import (
 // read once per engine (ariaFeatures) and each group is passed only when
 // its feature is there; a build without the feature cannot follow a
 // torrent or a Metalink anyway, and followedBy stays the last check.
+// When --version cannot be read aria2c is not started at all
+// (errFeaturesUnknown, SEC19 low-4): BitTorrent's peers, DHT and UDP
+// trackers would not go through the guard proxy.
+// --async-dns=false likewise only for a build with Async DNS
+// (resolverArgs): names are resolved by the system, as Go resolves them.
+//
+// aria2c connects to no server itself: each aria2c process has a guard
+// proxy of LectureFlow's (guard.go), started before it and stopped with
+// it, which is its proxy for every protocol (guardArgs on the command
+// line, each download's session options over the RPC) and makes every
+// connection in its place, judged by the rules of local.go. The proxy
+// variables are taken out of its environment (launchEnv); the user's
+// proxy is the guard's to use. With the guard aria2c resolves no name of
+// a download; --async-dns=false stays for a request that would get past
+// it all the same.
 
 // Process is a started aria2c.
 type Process interface {
@@ -93,8 +109,14 @@ type engine struct {
 	pickPort func() (int, error)
 	// versionOf runs "exe --version" (default runVersion; tests).
 	versionOf func(exe string) (string, error)
-	featOnce  sync.Once
+	featMu    sync.Mutex
+	featKnown bool // feats and asyncDNS were read (once per engine)
 	feats     ariaFeatures
+	asyncDNS  bool // built with Async DNS (c-ares): resolverArgs
+	// sysResolver: aria2c resolves names as Go does, with the system's
+	// resolver (its features were read: --async-dns=false given, or no
+	// Async DNS built in); false until then (systemResolver)
+	sysResolver atomic.Bool
 
 	mu     sync.Mutex
 	inst   *instance
@@ -108,6 +130,9 @@ type instance struct {
 	proc   Process
 	exited chan struct{}
 	tr     *http.Transport // the RPC client's connections (closed once it stopped)
+	// guard is this aria2c's proxy to every server (guard.go): started
+	// before the process, closed when it has exited.
+	guard *guard
 }
 
 func (in *instance) alive() bool {
@@ -235,6 +260,7 @@ func (e *engine) stop(in *instance, force bool) {
 	if in.tr != nil {
 		defer in.tr.CloseIdleConnections()
 	}
+	defer in.guard.close() // (also when aria2c did not exit: it then reaches no server)
 	ctx, cancel := context.WithTimeout(context.Background(), rpcWait)
 	_ = in.rpc.shutdown(ctx, force)
 	cancel()
@@ -270,6 +296,10 @@ func (e *engine) start(ctx context.Context) (*instance, error) {
 	} else if _, err := os.Stat(exe); err != nil {
 		return nil, errEngineMissing
 	}
+	feats, err := e.features(exe)
+	if err != nil {
+		return nil, err
+	}
 	secret, err := randomHex(24)
 	if err != nil {
 		return nil, err
@@ -282,25 +312,36 @@ func (e *engine) start(ctx context.Context) (*instance, error) {
 	if err != nil {
 		return nil, fmt.Errorf("aria2c port: %w", err)
 	}
-	feats := e.features(exe)
 	conf, err := writeConf(secret)
 	if err != nil {
 		return nil, fmt.Errorf("aria2c conf file: %w", err)
 	}
 	removeConf := func() { _ = os.Remove(conf) }
-	args := ariaArgs(conf, port, feats)
+	// the guard listens before aria2c exists: aria2c's command line names
+	// it as the proxy of every protocol
+	g, err := newGuard(e.log)
+	if err != nil {
+		removeConf()
+		return nil, err
+	}
+	args := append(append(ariaArgs(conf, port, feats), resolverArgs(e.asyncDNS)...), guardArgs(g.addr)...)
 	watch := newBindWatch()
 	proc, err := e.launch(exe, args, watch)
 	if err != nil {
 		removeConf()
+		g.close()
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, exec.ErrNotFound) {
 			return nil, errEngineMissing
 		}
 		return nil, fmt.Errorf("start aria2c: %w", err)
 	}
-	in := &instance{proc: proc, exited: make(chan struct{})}
+	in := &instance{proc: proc, exited: make(chan struct{}), guard: g}
 	go func() {
 		_ = proc.Wait()
+		// (whatever ended aria2c: a failed start, a stop, a crash) the
+		// guard first: an instance marked exited no longer has a guard
+		// listening (SEC43 info-7)
+		g.close()
 		close(in.exited)
 	}()
 	fail := func(err error) (*instance, error) {
@@ -400,40 +441,87 @@ type ariaFeatures struct {
 // ("Async DNS, BitTorrent, GZip, HTTPS, Message Digest, Metalink, ..."); no
 // such line means none.
 func parseFeatures(version string) ariaFeatures {
-	var f ariaFeatures
+	return ariaFeatures{bitTorrent: hasFeature(version, "BitTorrent"), metalink: hasFeature(version, "Metalink")}
+}
+
+// hasFeature: the "Enabled Features:" line of aria2c --version names
+// feature.
+func hasFeature(version, feature string) bool {
 	for _, line := range strings.Split(version, "\n") {
 		list, ok := strings.CutPrefix(strings.TrimSpace(line), "Enabled Features:")
 		if !ok {
 			continue
 		}
 		for _, name := range strings.Split(list, ",") {
-			switch strings.TrimSpace(name) {
-			case "BitTorrent":
-				f.bitTorrent = true
-			case "Metalink":
-				f.metalink = true
+			if strings.TrimSpace(name) == feature {
+				return true
 			}
 		}
 	}
-	return f
+	return false
 }
 
-// features is what the aria2c exe was built with, read once per engine;
-// unreadable means none (the options of a missing feature would stop it).
-func (e *engine) features(exe string) ariaFeatures {
-	e.featOnce.Do(func() {
-		run := e.versionOf
-		if run == nil {
-			run = runVersion
-		}
-		out, err := run(exe)
-		if err != nil {
-			e.log.Warn("downloads: aria2c --version could not be read; no BitTorrent or Metalink options", "err", err)
-		}
-		e.feats = parseFeatures(out)
-		e.log.Info("downloads: aria2c features", "bittorrent", e.feats.bitTorrent, "metalink", e.feats.metalink)
-	})
-	return e.feats
+// resolverArgs make aria2c resolve names with the system's resolver,
+// which Go's own look-ups use too (SEC11 low-1): the official Windows
+// build has c-ares ("Async DNS", --async-dns on by default), which may
+// look up a name the system's resolver refused, or answer it otherwise,
+// and the address check would judge one answer while aria2c connects to
+// the other. The option exists only in a build with Async DNS (the macOS
+// build has none, and resolves with the system already): a build refuses
+// an option it does not know (exit 28, like the BitTorrent ones). Given on
+// the command line, it holds for every download of the process.
+func resolverArgs(asyncDNS bool) []string {
+	if !asyncDNS {
+		return nil
+	}
+	return []string{"--async-dns=false"}
+}
+
+// errFeaturesUnknown: aria2c --version could not be read (an error, more
+// than 10 s, no "Enabled Features:" line), so aria2c is not started (SEC19
+// low-4). The options that switch BitTorrent and Metalink off exist only
+// in a build with them, and a build refuses an option it does not know;
+// without them the official Windows build follows a .torrent, and its
+// peers, DHT and UDP trackers are not reached through the guard proxy. The
+// task fails with downloads.engine_failed (it may be retried); the next
+// start reads --version again.
+var errFeaturesUnknown = errors.New("aria2c --version could not be read, so aria2c was not started " +
+	"(without its features known, BitTorrent and Metalink cannot be switched off)")
+
+// features is what the aria2c exe was built with, read once per engine
+// when it can be read; errFeaturesUnknown when not (read again next time).
+func (e *engine) features(exe string) (ariaFeatures, error) {
+	e.featMu.Lock()
+	defer e.featMu.Unlock()
+	if e.featKnown {
+		return e.feats, nil
+	}
+	run := e.versionOf
+	if run == nil {
+		run = runVersion
+	}
+	out, err := run(exe)
+	if err != nil || !strings.Contains(out, "Enabled Features:") {
+		e.log.Warn("downloads: aria2c --version could not be read; aria2c is not started (its BitTorrent and Metalink "+
+			"options could not be given); the next download reads it again", "err", err)
+		return ariaFeatures{}, errFeaturesUnknown
+	}
+	e.feats = parseFeatures(out)
+	e.asyncDNS = hasFeature(out, "Async DNS")
+	e.featKnown = true
+	// with the features known, aria2c resolves with the system's resolver:
+	// --async-dns=false is given, or it has no other one
+	e.sysResolver.Store(true)
+	e.log.Info("downloads: aria2c features", "bittorrent", e.feats.bitTorrent, "metalink", e.feats.metalink, "async_dns", e.asyncDNS)
+	return e.feats, nil
+}
+
+// systemResolver: the aria2c started resolves names with the system's
+// resolver, as Go's look-ups do, so a name Go cannot look up is one aria2c
+// cannot either (resolver.checkHost refuses it; SEC16 R2). False before
+// the first start and when its features are unknown.
+func (e *engine) systemResolver() bool {
+	return e != nil && e.sysResolver.Load()
 }
 
 // runVersion runs "exe --version" (hidden window, at most 10 s).
@@ -476,12 +564,14 @@ func randomHex(n int) (string, error) {
 
 // execLauncher runs the real aria2c. Its output goes to out only (the
 // engine's bindWatch, which keeps nothing of it: aria2c's warnings may
-// quote a download's full URL).
+// quote a download's full URL). Its environment is this process's without
+// the proxy variables (launchEnv, guard.go).
 func execLauncher(exe string, args []string, out io.Writer) (Process, error) {
 	if out == nil {
 		out = io.Discard
 	}
 	cmd := exec.Command(exe, args...)
+	cmd.Env = launchEnv(os.Environ())
 	cmd.Dir = filepath.Dir(exe)
 	cmd.Stdout, cmd.Stderr = out, out
 	cmd.Stdin = nil

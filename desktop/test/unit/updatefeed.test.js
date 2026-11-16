@@ -60,11 +60,25 @@ test('an unusable app-update.yml keeps updates off', () => {
   assert.match(unreadable.detail, /EACCES/);
 });
 
-test('main.js loads electron-updater only after the feed check', () => {
-  const src = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'main', 'main.js'), 'utf8');
-  const body = src.slice(src.indexOf('function loadUpdater'), src.indexOf('function main()'));
-  const check = body.indexOf('if (!feed.enabled) return { updater: null, note };');
-  assert.ok(check > 0, 'feed check present');
-  assert.ok(body.indexOf("require('electron-updater')") > check, 'electron-updater is required after the check');
-  assert.equal((src.match(/require\('electron-updater'\)/g) || []).length, 1);
+test('the shell never loads electron-updater (security audit FB1 L-8)', () => {
+  const dir = path.join(__dirname, '..', '..', 'src');
+  const files = [];
+  const walk = (d, depth) => {
+    if (depth > 5) throw new Error(`too deep: ${d}`);
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      if (e.isDirectory()) walk(path.join(d, e.name), depth + 1);
+      else if (/\.(c|m)?js$/.test(e.name)) files.push(path.join(d, e.name));
+    }
+  };
+  walk(dir, 0);
+  assert.ok(files.length > 10);
+  for (const f of files) {
+    const src = fs.readFileSync(f, 'utf8');
+    assert.doesNotMatch(src, /require\(\s*['"`]electron-updater['"`]\s*\)|import\(\s*['"`]electron-updater['"`]\s*\)|from\s+['"`]electron-updater['"`]/, path.relative(dir, f));
+  }
+  // packaged: no updater whatever app-update.yml says; development: only the tests' stand-in
+  const src = fs.readFileSync(path.join(dir, 'main', 'main.js'), 'utf8');
+  const body = src.slice(src.indexOf('function loadUpdater'), src.indexOf('function refuseDebugSwitches'));
+  assert.match(body, /if \(app\.isPackaged\) return \{ updater: null, note: PACKAGED_UPDATER_NOTE \};/);
+  assert.doesNotMatch(body, /updateFeedFrom|resourcesPath/);
 });

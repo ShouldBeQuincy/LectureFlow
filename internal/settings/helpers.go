@@ -26,6 +26,15 @@ const (
 	DefaultRPM            = 60
 )
 
+// Defaults of a new provider of type anthropic (v3.2.x P2, Q13a): one
+// request per sentence at 60 requests a minute made a lecture's translation
+// take 11–19 minutes. They are applied by CreateProvider, not by the DDL
+// (A5.1 defaults unchanged), and never to a provider that exists already.
+const (
+	DefaultAnthropicMaxConcurrency = 4
+	DefaultAnthropicRPM            = 0 // no per-minute limit
+)
+
 // Ranges of a provider's limits (perf-llm, NOTES.md). max_concurrency goes
 // up to 512: DeepSeek's limit is per account (2500 concurrent requests for
 // deepseek-flash) and a lecture of ~290 translate requests gains nothing
@@ -40,7 +49,7 @@ const (
 // multi_device true, battery_aware true, mem_reserve_mb 2048).
 func DefaultASR() model.ASRSettings {
 	return model.ASRSettings{Model: "large-v3", ComputeType: "auto", Device: "cuda", Language: "en",
-		MaxParallel: 1, VRAMReserveMB: 1000, VRAMPerJobMB: 5000,
+		MaxParallel: 1, VRAMReserveMB: 1000, VRAMPerJobMB: config.DefaultVRAMPerJobMB,
 		DeviceMode: model.ASRDeviceModeAuto, MultiDevice: true, BatteryAware: true, MemReserveMB: DefaultMemReserveMB}
 }
 
@@ -224,7 +233,8 @@ func parseParams(raw string) model.RoleParams {
 // model.DefaultTranslateWindow) and dropped for every other role; thinking
 // set only when it is a valid level other than off (model.ThinkingLevel),
 // so a role without thinking resolves to exactly what it did before the
-// option existed.
+// option existed; max_tokens and (translate only) batch are passed through
+// when they are set and in range (v3.2.x D1, P2).
 func ResolveParams(role string, p model.RoleParams) model.RoleParams {
 	t := model.DefaultTemperature(role)
 	if p.Temperature != nil {
@@ -240,6 +250,17 @@ func ResolveParams(role string, p model.RoleParams) model.RoleParams {
 	}
 	if lvl := model.ThinkingLevel(p); lvl != model.ThinkingOff {
 		out.Thinking = &lvl
+	}
+	// v3.2.x: the user's output limit and (translate) batch size are carried
+	// as they are, and only when set: params without them resolve to exactly
+	// what they did before the options existed.
+	if p.MaxTokens != nil && *p.MaxTokens >= 1 && *p.MaxTokens <= MaxTokensLimit {
+		v := *p.MaxTokens
+		out.MaxTokens = &v
+	}
+	if role == model.RoleTranslate && p.Batch != nil && *p.Batch >= 1 && *p.Batch <= MaxBatch {
+		v := *p.Batch
+		out.Batch = &v
 	}
 	return out
 }
@@ -331,6 +352,10 @@ func providerWriteErr(err error, name string) error {
 	return err
 }
 
+// sealedKeyPrefix starts every sealed value internal/secrets writes
+// (enc:v1:, enc:v2:, and any later format).
+const sealedKeyPrefix = "enc:"
+
 // applyInput applies a create/patch input to p and validates the result.
 // Error texts never contain the key.
 func applyInput(p *model.Provider, in ProviderInput) error {
@@ -345,6 +370,13 @@ func applyInput(p *model.Provider, in ProviderInput) error {
 	}
 	if in.APIKey != nil {
 		if k := strings.TrimSpace(*in.APIKey); k != "" {
+			if strings.HasPrefix(k, sealedKeyPrefix) {
+				// SEC8 low-3: the Store keeps a value that already looks
+				// sealed as it is, so a ciphertext copied from another row
+				// would be stored under this provider; never a key anyway
+				return userErr(ErrInvalid, CodeAPIKeyLooksSealed, nil,
+					"API key 不能以“enc:”开头：这是本应用加密保存 key 的格式，不是服务商给的 key。请粘贴服务商提供的原始 key")
+			}
 			p.APIKey = k
 		}
 	}
@@ -538,22 +570,10 @@ func legacyRPM(v int) int {
 
 // SameOrigin reports whether two base_urls point at the same origin
 // (scheme, host and port; case-insensitive, default ports filled in). An
-// unparsable URL only matches itself.
-func SameOrigin(a, b string) bool {
-	origin := func(s string) string {
-		u, err := url.Parse(strings.TrimSpace(s))
-		if err != nil || u.Host == "" {
-			return "raw:" + strings.TrimSpace(s)
-		}
-		scheme := strings.ToLower(u.Scheme)
-		port := u.Port()
-		if port == "" {
-			port = map[string]string{"http": "80", "https": "443"}[scheme]
-		}
-		return scheme + "://" + strings.ToLower(u.Hostname()) + ":" + port
-	}
-	return origin(a) == origin(b)
-}
+// unparsable URL only matches itself. The origin is db.BaseURLOrigin, the
+// one a sealed key is bound to (sec3 L3): the key settings keeps with a
+// provider is exactly the key that still opens.
+func SameOrigin(a, b string) bool { return db.BaseURLOrigin(a) == db.BaseURLOrigin(b) }
 
 func clamp(v, lo, hi, def int) int {
 	if v == 0 {

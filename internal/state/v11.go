@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"lectureflow/internal/db"
+	"lectureflow/internal/media"
 	"lectureflow/internal/model"
 )
 
@@ -460,14 +461,16 @@ func RetryWith(ctx context.Context, st db.Store, dataDir, scope, scopeID, stage 
 			// With every translation cleared the run is a full translation,
 			// not an incremental one: drop the incremental marker and its base
 			// hash, which the stage would compare with the prefix hash of the
-			// new window and fail permanently on every retry.
+			// new window and fail permanently on every retry. The models of
+			// the cleared translations (stats.mixed_models, v3.2.x P1-b) go
+			// with them.
 			tr, err := tx.GetCurrentJob(ctx, scope, scopeID, model.StageTranslate)
 			if err != nil {
 				return err
 			}
-			if IsIncremental(tr.Stats.Note) {
+			if IsIncremental(tr.Stats.Note) || tr.Stats.MixedModels != nil {
 				stats := tr.Stats
-				stats.Note = ""
+				stats.Note, stats.MixedModels = "", nil
 				if err := tx.SetJobStats(ctx, tr.ID, stats); err != nil {
 					return err
 				}
@@ -479,9 +482,27 @@ func RetryWith(ctx context.Context, st db.Store, dataDir, scope, scopeID, stage 
 		return err
 	}
 	if dropCkpt && dataDir != "" {
-		removeASRCheckpoint(model.LectureDir(dataDir, lec.CourseID, lec.ID), lec.ID)
+		if LectureFilesOK(dataDir, lec) {
+			removeASRCheckpoint(model.LectureDir(dataDir, lec.CourseID, lec.ID), lec.ID)
+		} else {
+			slog.Warn("retry: the lecture's directory is not one of its own (its ids, or a link on the way); the asr checkpoint is not removed")
+		}
 	}
 	return nil
+}
+
+// LectureFilesOK reports whether the lecture's directory under the data
+// directory dataDir, built from its course and lecture ids as the database
+// holds them (an imported library supplies them), is a directory of its own
+// the app may read, write and remove files in: both ids one path element
+// (media.IDElement: no separator, no trailing dot or space, no device name;
+// R77b "not covered", SEC44 low-2) and no link at any folder from below
+// dataDir down to it (media.PlainPath; SEC49 L1). The rerun's and the
+// retry's file cleanup and the scheduler's look at the audio before a run
+// use it; a lecture that fails it keeps every file.
+func LectureFilesOK(dataDir string, l model.Lecture) bool {
+	return media.IDElement(l.CourseID) && media.IDElement(l.ID) &&
+		media.PlainPath(dataDir, model.LectureDir(dataDir, l.CourseID, l.ID))
 }
 
 // removeASRCheckpoint removes a lecture's asr checkpoint (model

@@ -513,7 +513,9 @@ func (b *Backend) claimUpload(ctx context.Context, s *liveSession, job Job) (*pr
 // runtime as soon as no lecture runs on it any more (leftFile: now, or at
 // the end of the running ones). false when a file was left.
 func (b *Backend) cleanupKept(ctx context.Context, s *liveSession, jobDir string) bool {
+	b.markBusyDir(s, jobDir) // T051 (removal.go); the caller marks it first when this runs in a goroutine
 	f := b.cleanupRemote(ctx, s, jobDir, true)
+	b.settleBusyDir(s, jobDir, f == "" && ctx.Err() == nil)
 	if f == "" {
 		return true
 	}
@@ -525,7 +527,7 @@ func (b *Backend) cleanupKept(ctx context.Context, s *liveSession, jobDir string
 	idle := len(b.jobs) == 0
 	b.mu.Unlock()
 	if live && idle {
-		_ = b.releaseWith(context.WithoutCancel(ctx), ReleaseCleanupFailed, f)
+		_ = b.releaseWith(context.WithoutCancel(ctx), ReleaseCleanupFailed, releaseOpts{file: f, expect: s, ifIdle: true})
 	}
 	return false
 }

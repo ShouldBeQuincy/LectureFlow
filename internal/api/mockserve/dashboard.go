@@ -76,6 +76,7 @@ func lastActivity(l *api.Lecture) string {
 func finalizeCourse(c *api.Course, lectures []api.Lecture, kc *kindCtx) {
 	numberCourse(c, lectures, kc) // v2 P13.4 (course_p2.go) and the kinds pass
 	c.LectureCount, c.DraftCount, c.StaleLectureCount, c.PatchesPending, c.RunningCount = 0, 0, 0, 0, 0
+	c.FailedCount = 0
 	last := c.CreatedAt
 	cite := false
 	for i := range lectures {
@@ -92,6 +93,9 @@ func finalizeCourse(c *api.Course, lectures []api.Lecture, kc *kindCtx) {
 		}
 		if busy(l) {
 			c.RunningCount++
+		}
+		if failedLecture(l) {
+			c.FailedCount++
 		}
 		c.PatchesPending += l.Counts.PatchesPending
 		if t := lastActivity(l); t > last {
@@ -151,6 +155,7 @@ func courseCard(c api.Course) api.CourseCard {
 		LectureCount: c.LectureCount, TermCount: c.TermCount,
 		DraftCount: c.DraftCount, StaleCount: c.StaleLectureCount,
 		RunningCount: c.RunningCount, PatchesPending: c.PatchesPending,
+		FailedCount:    c.FailedCount,
 		LastActivityAt: c.LastActivityAt,
 		CourseActions:  append([]string{}, c.CourseActions...),
 	}
@@ -196,8 +201,10 @@ func buildDashboard(courses []api.Course, lectures []api.Lecture, usage []api.Pr
 			})
 			d.ReviewTotal += l.Counts.PatchesPending
 		}
+		listed := false
 		for _, st := range l.Stages {
 			if finalFailure(st) && st.FinishedAt != nil && *st.FinishedAt >= cutoff {
+				listed = true
 				d.Failures = append(d.Failures, api.FailureItem{
 					LectureID: l.ID, LectureTitle: l.Title, Label: l.Label,
 					CourseID: c.ID, CourseName: c.Name, CourseCode: c.Code, Stage: st.Stage,
@@ -206,6 +213,10 @@ func buildDashboard(courses []api.Course, lectures []api.Lecture, usage []api.Pr
 					KindTag:        tagOf(l), // lecture kinds (kinds.go)
 				})
 			}
+		}
+		// v3.2.x r7 (T24 S2): still failed, but every failure predates the window
+		if !listed && failedLecture(&l) {
+			d.EarlierFailedTotal++
 		}
 	}
 	sort.SliceStable(inprog, func(i, j int) bool { return launched(inprog[i]) < launched(inprog[j]) })

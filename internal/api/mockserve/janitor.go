@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"lectureflow/internal/api"
+	"lectureflow/internal/glossary"
 	"lectureflow/internal/model"
 	"lectureflow/internal/settings"
 	"lectureflow/internal/stages"
@@ -374,13 +375,15 @@ func applyJanitorRule(sc *sylCourse, fallback bool) ([]model.JanitorItem, []mode
 
 // runRule applies the rule to the course now and stores its report (the
 // glossary version + 1 when something changed); provider "" = fallback.
-// Must hold s.mu.
-func (s *store) runRule(c *api.Course, sc *sylCourse, provider, modelName, note string) model.JanitorReport {
+// note and noteInfo are the report's note and its coded form (v2 P14.3),
+// as internal/glossary and internal/stages write them (the page shows
+// note_info in the interface language). Must hold s.mu.
+func (s *store) runRule(c *api.Course, sc *sylCourse, provider, modelName, note string, noteInfo *model.ErrorInfo) model.JanitorReport {
 	fallback := provider == ""
 	items, rejected := applyJanitorRule(sc, fallback)
 	from := c.GlossaryVersion
 	rep := model.JanitorReport{CourseID: c.ID, FromVersion: from, Version: from, CreatedAt: time.Now().UTC().Format(time.RFC3339),
-		ProviderName: provider, Model: modelName, Fallback: fallback, Note: note, Items: items, Rejected: rejected}
+		ProviderName: provider, Model: modelName, Fallback: fallback, Note: note, NoteInfo: noteInfo, Items: items, Rejected: rejected}
 	if len(items) > 0 {
 		rep.Version = from + 1
 		c.GlossaryVersion = rep.Version
@@ -446,7 +449,11 @@ func (s *store) startReview(c *api.Course, sc *sylCourse) {
 		}
 		provider, modelName, ok := s.janitorTarget()
 		if !ok { // appendix D2: the janitor is not usable → the rule, then a failure
-			s.runRule(c, sc, "", "", "术语表清道夫调用失败（没有可用的提供商），已按常用词规则整理")
+			// as glossary_review's fallback (internal/stages): the note and
+			// its coded form carry the cause
+			reason := "没有可用的提供商"
+			s.runRule(c, sc, "", "", glossary.NoteFallbackFailed(reason),
+				glossary.NoteInfoFallbackFailed(settings.CodeRoleNotConfigured, reason))
 			c.Stages = setStage(c.Stages, model.StageGlossaryReview, model.StatusFailed, 0.1, now)
 			msg := "没有可用的提供商：请在设置中为「术语表清道夫」选择提供商和模型（已按常用词规则整理）"
 			// coded as the real D2 fallback (codes-p2: the cause's code in params)
@@ -458,7 +465,7 @@ func (s *store) startReview(c *api.Course, sc *sylCourse) {
 			}
 		} else {
 			c.Stages = setStage(c.Stages, model.StageGlossaryReview, model.StatusDone, 1, now)
-			s.runRule(c, sc, provider, modelName, "")
+			s.runRule(c, sc, provider, modelName, "", nil)
 		}
 		s.refreshJanitor(c, sc)
 		s.courseChanged(c)
@@ -512,7 +519,7 @@ func (m *mock) reviewGlossary(w http.ResponseWriter, r *http.Request, s *store) 
 		writeJSON(w, http.StatusAccepted, api.GlossaryReviewResult{Queued: true})
 		return
 	}
-	rep := s.runRule(c, sc, "", "", "未配置术语表清道夫，按常用词规则整理")
+	rep := s.runRule(c, sc, "", "", glossary.NoteFallbackManual, glossary.NoteInfo(glossary.CodeNoteFallbackManual, nil))
 	writeJSON(w, http.StatusOK, api.GlossaryReviewResult{Report: &rep})
 }
 

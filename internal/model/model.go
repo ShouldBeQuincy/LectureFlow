@@ -222,6 +222,10 @@ const (
 const (
 	ModelChoiceSnapshot = "snapshot" // 沿用原模型 (default)
 	ModelChoiceCurrent  = "current"  // 使用当前设置
+	// ModelChoiceManual (v3.2.x P1-b, retry only): provider, model and
+	// params named for this one retry; written to the retried job's
+	// snapshot only, never to the role's setting.
+	ModelChoiceManual = "manual" // 临时指定
 )
 
 // ErrNeedsModelChoice is the "error" of the 409 body of v1.1 A4.3.

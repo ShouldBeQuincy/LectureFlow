@@ -11,7 +11,10 @@ package main
 //   - before the migrations of an older one run, it is copied to
 //     backups/lectureflow-before-upgrade-schema<N>-to-<version>-<time>.db
 //     without any credential (db.SnapshotWithoutSecrets), once per upgrade
-//     (kv upgrade.backup), keeping the newest keepUpgradeBackups; without
+//     (kv upgrade.backup; when that record cannot be written, a backup of
+//     the same upgrade made after the database last changed counts too),
+//     keeping the newest keepUpgradeBackups and the newest one of every
+//     schema they were made from; without
 //     the space for it, or when the copy fails, nothing is migrated and the
 //     start fails (startup.upgrade_backup_no_space / _failed);
 //   - then the migrations run (step "migrate"). The credentials are sealed
@@ -57,7 +60,8 @@ func backupsDir(dataDir string) string { return filepath.Join(dataDir, "backups"
 
 // checkNotNewer refuses a database from a newer LectureFlow before anything
 // else touches the data directory (a staged import is not applied either).
-// A database that cannot be read here is left to prepareDatabase.
+// A database that cannot be read here is left to prepareDatabase, unless
+// its version shows it comes from a newer LectureFlow (newerOnError).
 func checkNotNewer(ctx context.Context, dataDir string, prog *progress) error {
 	path := dbFile(dataDir)
 	if _, err := os.Stat(path); err != nil {
@@ -65,6 +69,9 @@ func checkNotNewer(ctx context.Context, dataDir string, prog *progress) error {
 	}
 	info, err := inspect(ctx, path, prog)
 	if err != nil {
+		if nf := newerOnError(dataDir, info, err, prog); nf != nil {
+			return nf
+		}
 		return nil
 	}
 	if known := db.SchemaVersion(); info.Version > known {
@@ -81,13 +88,16 @@ func prepareDatabase(ctx context.Context, dataDir, appVersion string, prog *prog
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
-		return fmt.Errorf("open db: %w", err)
+		return dbFailure(dataDir, "open db", err)
 	}
 	bdir := backupsDir(dataDir)
 	removePartialBackups(bdir)
 	info, err := inspect(ctx, path, prog)
 	if err != nil {
-		return fmt.Errorf("open db: %w", err)
+		if nf := newerOnError(dataDir, info, err, prog); nf != nil {
+			return nf
+		}
+		return dbFailure(dataDir, "open db", err)
 	}
 	known := db.SchemaVersion()
 	if info.Version > known {
@@ -98,6 +108,8 @@ func prepareDatabase(ctx context.Context, dataDir, appVersion string, prog *prog
 	}
 	if name, ok := upgradeBackupDone(info.UpgradeBackup, known, bdir); ok {
 		slog.Info("upgrade: the backup made before this upgrade is there already; not made again", "file", filepath.Join(bdir, name))
+	} else if name, ok := upgradeBackupUnrecorded(path, bdir, info.Version, appVersion); ok {
+		slog.Info("upgrade: a backup made before this upgrade is there already (its record could not be written); not made again", "file", filepath.Join(bdir, name))
 	} else if err := backupBeforeUpgrade(ctx, path, bdir, info, known, appVersion, prog); err != nil {
 		return err
 	}
@@ -110,9 +122,49 @@ func prepareDatabase(ctx context.Context, dataDir, appVersion string, prog *prog
 		if errors.As(err, &ne) {
 			return newerFailure(dataDir, ne.Found, ne.Known, err)
 		}
-		return fmt.Errorf("open db: %w", err)
+		if nf := newerOnError(dataDir, db.FileInfo{}, err, prog); nf != nil {
+			return nf
+		}
+		return dbFailure(dataDir, "open db", err)
 	}
 	return d.Close()
+}
+
+// newerOnError: reading the database failed (err), but its version says it
+// comes from a newer LectureFlow. Usually only the file header has it
+// (db.HeaderUserVersion): a schema this SQLite cannot parse fails the
+// connection itself, before PRAGMA user_version is read, so info.Version is
+// then 0; it is still taken when filled. The schema of a newer database may
+// well use what this version's SQLite cannot parse, which reports it as
+// malformed: it is refused as from a newer version
+// (startup.data_dir_newer), not called damaged (security review M1). A
+// damaged header gives no version (HeaderUserVersion checks it), so a
+// damaged file is not taken for a newer one. The newest committed version
+// in the -wal counts too (walUserVersion; D15): a newer LectureFlow
+// stopped before a checkpoint left its version only there, under a file
+// header of the older one, and SQLite reads it from there. Only when the
+// file header is a valid one: the -wal of a damaged file proves nothing.
+// Reading the -wal, as large as the database after a VACUUM, is reported
+// on prog as part of the check (stepCheck; SEC31 L2), the way the
+// connection that just failed reported reading it. nil when none says so.
+func newerOnError(dataDir string, info db.FileInfo, err error, prog *progress) *startFailure {
+	known := db.SchemaVersion()
+	v := info.Version
+	if h, ok := db.HeaderUserVersion(dbFile(dataDir)); ok {
+		if h > v {
+			v = h
+		}
+		end := prog.step(stepCheck)
+		w, ok := walUserVersion(dbFile(dataDir) + "-wal")
+		end()
+		if ok && w > v {
+			v = w
+		}
+	}
+	if v > known {
+		return newerFailure(dataDir, v, known, err)
+	}
+	return nil
 }
 
 // inspect is db.InspectFile as a step: the first connection after a start
@@ -137,6 +189,60 @@ func upgradeBackupDone(mark string, known int, bdir string) (string, bool) {
 		return "", false
 	}
 	return name, true
+}
+
+// upgradeBackupUnrecorded: a complete backup of this very upgrade is in
+// bdir although kv upgrade.backup does not name it: the record could not
+// be written (the database is read-only or held by another program, and
+// the migrations then failed the same way). Without this every "Try again"
+// made another copy, and the rotation removed older backups, such as the
+// one to go back to an older LectureFlow (security review SEC12 L-1). It
+// is one named for the same schema and version
+// (…schema<from>-to-<appVersion>-*.db), a regular file whose header says
+// user_version from, and made after the database (and its -wal) last
+// changed: a database used again since (for example restored and used with
+// the older version) gets a new backup. The newest such file is taken.
+// "Last changed" counts the creation and change (ctime) times too
+// (lastChange): another copy put in place keeps its older modification
+// time (security review SEC12 L-4); when they cannot be read, a new
+// backup is made.
+func upgradeBackupUnrecorded(path, bdir string, from int, appVersion string) (string, bool) {
+	v := unsafeVersionChars.ReplaceAllString(appVersion, "_")
+	if v == "" {
+		v = "dev"
+	}
+	// (v has no glob metacharacters: unsafeVersionChars leaves [0-9A-Za-z.+-])
+	paths, err := filepath.Glob(filepath.Join(bdir, fmt.Sprintf("%sschema%d-to-%s-*.db", upgradeBackupPrefix, from, v)))
+	if err != nil || len(paths) == 0 {
+		return "", false
+	}
+	var changed time.Time
+	for _, s := range []string{"", "-wal"} {
+		if _, err := os.Stat(path + s); errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		t, err := lastChange(path + s)
+		if err != nil {
+			return "", false
+		}
+		if t.After(changed) {
+			changed = t
+		}
+	}
+	best, bestMod := "", time.Time{}
+	for _, p := range paths {
+		fi, err := os.Lstat(p)
+		if err != nil || !fi.Mode().IsRegular() || fi.ModTime().Before(changed) {
+			continue
+		}
+		if h, ok := db.HeaderUserVersion(p); !ok || h != from {
+			continue
+		}
+		if best == "" || fi.ModTime().After(bestMod) {
+			best, bestMod = fi.Name(), fi.ModTime()
+		}
+	}
+	return best, best != ""
 }
 
 // backupBeforeUpgrade makes the backup and records it.
@@ -196,8 +302,13 @@ func upgradeBackupName(bdir string, schema int, appVersion string, now time.Time
 	}
 }
 
+// upgradeBackupSchema reads <N> of an upgrade backup's name (…schema<N>-to-…).
+var upgradeBackupSchema = regexp.MustCompile(`^` + regexp.QuoteMeta(upgradeBackupPrefix) + `schema(\d+)-to-`)
+
 // rotateUpgradeBackups removes all but the newest keepUpgradeBackups
-// upgrade backups in bdir (by modification time); keep stays.
+// upgrade backups in bdir (by modification time); keep stays, and so does
+// the newest one of every other schema they were made from (the way back
+// to an older LectureFlow is not rotated away by newer backups; SEC12 L-1).
 func rotateUpgradeBackups(bdir, keep string) {
 	paths, err := filepath.Glob(filepath.Join(bdir, upgradeBackupPrefix+"*.db"))
 	if err != nil {
@@ -224,8 +335,17 @@ func rotateUpgradeBackups(bdir, keep string) {
 		}
 		return list[i].name > list[j].name
 	})
+	newestOf := map[string]bool{} // schemas whose newest backup is already kept
 	for i, e := range list {
-		if i < keepUpgradeBackups {
+		schema := ""
+		if m := upgradeBackupSchema.FindStringSubmatch(e.name); m != nil {
+			schema = m[1]
+		}
+		first := schema != "" && !newestOf[schema]
+		if schema != "" {
+			newestOf[schema] = true
+		}
+		if i < keepUpgradeBackups || first {
 			continue
 		}
 		if err := db.RemoveDBFiles(filepath.Join(bdir, e.name)); err != nil {
@@ -276,8 +396,8 @@ func newerFailure(dataDir string, found, known int, cause error) *startFailure {
 		Code:   failDataDirNewer,
 		Params: map[string]any{"found": found, "known": known, "backups": b},
 		Err:    cause,
-		Msg: fmt.Sprintf("这个数据目录来自更新版本的 LectureFlow（数据库版本 %d，本程序最高支持 %d），为了不损坏数据没有打开它。请安装更新的版本；要回到这个版本，先恢复升级前的备份（%s）。 / "+
-			"This data directory comes from a newer LectureFlow (database version %d; this version knows up to %d) and was left untouched. Install the newer version; to go back to this one, first restore the backup made before the upgrade (%s).",
+		Msg: fmt.Sprintf("这个数据目录来自更新版本的 LectureFlow（数据库版本 %d，本程序最高支持 %d），为了不损坏数据没有打开它。请安装更新的版本；要回到这个版本，先把 lectureflow.db 连同同名的 lectureflow.db-wal、lectureflow.db-shm（如有）一起移走，再把升级前的备份（在 %s 里）复制到数据目录并改名为 lectureflow.db（只放这一个文件）。 / "+
+			"This data directory comes from a newer LectureFlow (database version %d; this version knows up to %d) and was left untouched. Install the newer version; to go back to this one, first move lectureflow.db away together with lectureflow.db-wal and lectureflow.db-shm next to it (if any), then copy the backup made before the upgrade (in %s) into the data folder and rename it to lectureflow.db (only that one file).",
 			found, known, b, found, known, b),
 	}
 }

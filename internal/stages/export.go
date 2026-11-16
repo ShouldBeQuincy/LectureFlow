@@ -187,11 +187,23 @@ var vttEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", "-->", "--&gt;")
 // comment, declaration or processing instruction (followed by a letter,
 // "/", "!" or "?") becomes "&lt;" (a character reference, which every
 // Markdown renderer shows as "<"; a backslash escape is not understood by
-// all of them), and the "[" of "![" is backslash-escaped ("!\["). Every
-// other character is kept as written: "a < b", "x <= y", "i < 10", "<-",
-// "&".
+// all of them), and the "[" of "![" is backslash-escaped ("!\[").
+//
+// Links (AUD5 low-2): a prompt-injected "[click here](https://…)" would be
+// a clickable link whose text says something else than its target. An
+// inline link needs "(" right after the "]" of its text, and a link
+// reference definition "[label]: https://…" (which also turns any "[label]"
+// elsewhere, such as the "**[mm:ss]**" timestamps, into a link) needs ":"
+// right after its label, also inside a block quote or list item; so a
+// backslash goes between a "]" and a following "(" or ":" ("]\(", "]\:").
+// Viewers do not show the backslash; with no definition in the file,
+// reference links ("[a][b]", "[a]") stay text as well. Brackets anywhere
+// else are written as they are.
+//
+// Every other character is kept as written: "a < b", "x <= y", "i < 10",
+// "<-", "&", "[note]".
 func mdText(s string) string {
-	if !strings.ContainsAny(s, "<!") {
+	if !strings.ContainsAny(s, "<!]") {
 		return s
 	}
 	var b strings.Builder
@@ -208,6 +220,8 @@ func mdText(s string) string {
 		case c == '!' && next == '[':
 			b.WriteString(`!\[`)
 			i++
+		case c == ']' && (next == '(' || next == ':'):
+			b.WriteString(`]\`)
 		default:
 			b.WriteByte(c)
 		}
@@ -343,6 +357,16 @@ func (s *exportStage) Run(ctx context.Context, lectureID string, progress func(f
 	if err != nil {
 		return err
 	}
+	// commitExport removes the files of export/ that are not this run's:
+	// only in a lecture directory of its own (R77b, SEC44 low-2; the ids
+	// come from the database, an imported library supplies them), with no
+	// link at any folder on its way (SEC49 L1). The scheduler's start check
+	// stops such a job before it runs; this is the stage's own guard, before
+	// it creates, writes or removes anything.
+	if !lfmedia.IDElement(l.CourseID) || !lfmedia.IDElement(l.ID) || !lfmedia.PlainPath(d.DataDir, d.lectureDir(l)) {
+		return sched.Permanent(model.Errorf("server.internal", nil,
+			errors.New("export: the lecture's directory is not one of its own (its ids, or a link on the way); nothing was written or removed")))
+	}
 	dir := filepath.Join(d.lectureDir(l), model.ExportDirName)
 	// The old export stays as it is until the new one is complete
 	// (test-chaos 3): the new files are written to temporary names and put
@@ -407,7 +431,8 @@ func (s *exportStage) Run(ctx context.Context, lectureID string, progress func(f
 				missing++
 			}
 			// SPEC §6.6: "**[mm:ss]** English\n\nChinese\n", one paragraph per
-			// sentence; the texts without raw HTML or images (mdText, L3)
+			// sentence; the texts without raw HTML, images (mdText, L3) or
+			// links (AUD5 low-2)
 			fmt.Fprintf(md, "**[%s]** %s\n\n%s\n\n", mmss(x.StartMS), mdText(text), mdText(zh))
 			fmt.Fprintf(en, "%s\n", text)
 			written++

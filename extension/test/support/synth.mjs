@@ -114,6 +114,13 @@ export function fakeIo(texts, files = {}) {
 
 export const GEN_HOST = 'https://lectures.example.edu';
 
+/**
+ * The generic page's document.title: the lecture, then the site's name
+ * (what src/content/scan.js frameTitle reads after the scan; the scan's
+ * frames carry no title).
+ */
+export const GEN_PAGE_TITLE = 'Lecture 7: Hashing | Example University';
+
 /** A generic page: an MP4 file, an HLS master with an audio group, DASH with DRM. */
 export function genericFrames() {
   return [

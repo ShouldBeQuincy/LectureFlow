@@ -135,6 +135,9 @@ func (m *mock) setAngle(s *store, id string, present bool) {
 // with its angles.
 func (m *mock) lectureJSON(r *http.Request, s *store, l *api.Lecture) *api.Lecture {
 	out := *l
+	if r.Method == http.MethodGet && r.URL.Query().Get("usage_total") == "1" {
+		out = *s.withUsageTotal(l) // asked for by the lecture page (r7.go)
+	}
 	out.Angles = nil
 	for _, n := range m.angles(r, s, l.ID) {
 		out.Angles = append(out.Angles, api.Angle{Name: n})

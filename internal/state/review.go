@@ -31,6 +31,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"lectureflow/internal/ctxbuild"
@@ -172,10 +173,39 @@ func ResetSentence(ctx context.Context, st db.Store, x int, lectureID string, id
 }
 
 // RetranslateSentence marks this one sentence zh_status=stale (SPEC §9.6, §17.1).
-// A sentence that was never translated (zh NULL) keeps zh_status=none, which
-// the incremental run processes as well.
+// A sentence that was never translated (zh NULL, zh_status none) keeps
+// zh_status=none, which the incremental run processes as well. A sentence
+// left "待处理" by the translate stage (v3.2.x P1: no usable answer after the
+// business retries, zh_status qa_failed with an empty or NULL zh) becomes
+// stale too: the stage does not send those again by itself.
 func RetranslateSentence(ctx context.Context, st db.Store, lectureID string, idx int) (s model.Sentence, err error) {
+	s, _, err = RetranslateSentenceWith(ctx, st, lectureID, idx, RetranslateOpts{})
+	return s, err
+}
+
+// RetranslateOpts are the options of RetranslateSentenceWith.
+type RetranslateOpts struct {
+	// Snapshot (v3.2.x P1-b, Q10a), when not empty, is the translate
+	// snapshot of the CURRENT settings: the sentence is translated again by
+	// that model, and so is every later incremental run of the lecture. The
+	// lecture's other translations are kept (unlike a retry or rerun with
+	// another model, which clears them), so the lecture then mixes the
+	// translations of two models. Only for a sentence the model could not
+	// translate (zh_status qa_failed, or stale after an earlier call);
+	// anything else → ErrConflict. The context window stays the one the
+	// lecture was translated with (every zh_hash is built with it).
+	Snapshot string
+}
+
+// RetranslateSentenceWith is RetranslateSentence with options. switched
+// reports whether the lecture's translate job got o.Snapshot: only a done
+// translate job is changed (the incremental run that follows copies its
+// snapshot, StartIncrementalTranslate) and only when the model, params or
+// prompt version differ; a job that has not finished keeps its own snapshot
+// and the choice it will be given when it is retried or rerun.
+func RetranslateSentenceWith(ctx context.Context, st db.Store, lectureID string, idx int, o RetranslateOpts) (s model.Sentence, switched bool, err error) {
 	err = st.Tx(ctx, func(tx db.Store) error {
+		switched = false
 		if err := ensureReviewable(ctx, tx, lectureID); err != nil {
 			return err
 		}
@@ -183,7 +213,15 @@ func RetranslateSentence(ctx context.Context, st db.Store, lectureID string, idx
 		if err != nil {
 			return err
 		}
-		if cur.Zh != nil && cur.ZhStatus != model.ZhStale {
+		if !model.IsEmptySnapshot(o.Snapshot) {
+			if cur.ZhStatus != model.ZhQAFailed && cur.ZhStatus != model.ZhStale {
+				return fmt.Errorf("%w: sentence %d is %s; only a sentence without a usable translation can be sent to another model", ErrConflict, idx, cur.ZhStatus)
+			}
+			if switched, err = mixTranslateSnapshot(ctx, tx, lectureID, o.Snapshot); err != nil {
+				return err
+			}
+		}
+		if cur.ZhStatus != model.ZhStale && (cur.Zh != nil || cur.ZhStatus == model.ZhQAFailed) {
 			if err := tx.SetZhStatus(ctx, lectureID, []int{idx}, model.ZhStale); err != nil {
 				return err
 			}
@@ -192,9 +230,71 @@ func RetranslateSentence(ctx context.Context, st db.Store, lectureID string, idx
 		return err
 	})
 	if err != nil {
-		return model.Sentence{}, err
+		return model.Sentence{}, false, err
 	}
-	return s, nil
+	return s, switched, nil
+}
+
+// mixTranslateSnapshot writes snapshot (an LLM snapshot of the current
+// settings) on the lecture's done translate job, with the context window of
+// the snapshot it replaces. No translation is cleared. When the provider or
+// the model changes, the job's stats.mixed_models gets the old and the new
+// model (MixedModelsWith).
+func mixTranslateSnapshot(ctx context.Context, tx db.Store, lectureID, snapshot string) (bool, error) {
+	next, ok := model.ParseLLMSnapshot(snapshot)
+	if !ok {
+		return false, fmt.Errorf("%w: not a translate snapshot", ErrBadInput)
+	}
+	tr, err := tx.GetCurrentJob(ctx, model.ScopeLecture, lectureID, model.StageTranslate)
+	if err != nil {
+		return false, err
+	}
+	if tr.Status != model.StatusDone {
+		return false, nil
+	}
+	w := model.SnapshotWindow(tr.ConfigSnapshot)
+	next.Params.Window = &w
+	raw := model.MarshalSnapshot(next)
+	if model.SameSnapshot(model.StageTranslate, tr.ConfigSnapshot, raw) {
+		return false, nil
+	}
+	if err := tx.SetJobSnapshot(ctx, tr.ID, raw); err != nil {
+		return false, err
+	}
+	if old, ok := model.ParseLLMSnapshot(tr.ConfigSnapshot); ok && (old.ProviderID != next.ProviderID || old.Model != next.Model) {
+		stats := tr.Stats
+		stats.MixedModels = MixedModelsWith(tr.Stats.MixedModels, ModelLabel(old), ModelLabel(next))
+		if err := tx.SetJobStats(ctx, tr.ID, stats); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// ModelLabel is how stats.mixed_models names the model of an LLM snapshot:
+// "provider name / model" (the provider id when the snapshot has no name).
+func ModelLabel(s model.LLMSnapshot) string {
+	name := strings.TrimSpace(s.ProviderName)
+	if name == "" {
+		name = s.ProviderID
+	}
+	return name + " / " + s.Model
+}
+
+// MixedModelsWith returns list with each of labels appended that it does
+// not hold yet (stable order, no duplicates). A result with fewer than two
+// labels means one model: nil.
+func MixedModelsWith(list []string, labels ...string) []string {
+	out := slices.Clone(list)
+	for _, l := range labels {
+		if !slices.Contains(out, l) {
+			out = append(out, l)
+		}
+	}
+	if len(out) < 2 {
+		return nil
+	}
+	return out
 }
 
 func reviewed(review string) bool {

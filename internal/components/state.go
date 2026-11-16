@@ -195,9 +195,51 @@ func (m *Manager) loadState() (s *state, recovered bool, err error) {
 	return s, recovered, nil
 }
 
+// exeOK checks an entry's Exe (security audit L-13): a "/"-separated path
+// inside its directory (safeRelPath: no absolute path, drive, UNC path,
+// backslash or ".."), required for the python runtime and tools, absent or
+// equally safe for the other kinds. An entry that fails it is treated like
+// a damaged receipt and never run.
+func exeOK(e Installed) bool {
+	switch e.Kind {
+	case KindPythonRuntime, KindTool:
+		return safeRelPath(e.Exe)
+	}
+	return e.Exe == "" || safeRelPath(e.Exe)
+}
+
+// filesOK checks an entry's Files[].Path like Exe (inside its directory);
+// the manager stats them (intact) and reads them to reuse their content.
+func filesOK(e Installed) bool {
+	for _, f := range e.Files {
+		if !safeRelPath(f.Path) {
+			return false
+		}
+	}
+	return true
+}
+
+// filePath is the absolute path of an entry's file; false when Path is not
+// a safe relative path.
+func (m *Manager) filePath(e Installed, f InstalledFile) (string, bool) {
+	if !safeRelPath(f.Path) || !safeRelPath(e.Dir) {
+		return "", false
+	}
+	return filepath.Join(m.abs(e.Dir), filepath.FromSlash(f.Path)), true
+}
+
+// exePath is the absolute path of an entry's Exe; false when it has none
+// or it is not a safe relative path.
+func (m *Manager) exePath(e Installed) (string, bool) {
+	if e.Exe == "" || !safeRelPath(e.Exe) || !safeRelPath(e.Dir) {
+		return "", false
+	}
+	return filepath.Join(m.abs(e.Dir), filepath.FromSlash(e.Exe)), true
+}
+
 func (s *state) valid() bool {
 	check := func(e Installed) bool {
-		return e.ID != "" && e.Version != "" && safeRelPath(e.Dir)
+		return e.ID != "" && e.Version != "" && safeRelPath(e.Dir) && exeOK(e) && filesOK(e)
 	}
 	for id, e := range s.Active {
 		if id != e.ID || !check(e) {
@@ -280,7 +322,7 @@ func readReceipt(dir string) (Installed, error) {
 	if err := json.Unmarshal(data, &r); err != nil {
 		return r, err
 	}
-	if r.ID == "" || r.Version == "" || !safeRelPath(r.Dir) {
+	if r.ID == "" || r.Version == "" || !safeRelPath(r.Dir) || !exeOK(r) || !filesOK(r) {
 		return r, errors.New("incomplete receipt")
 	}
 	return r, nil

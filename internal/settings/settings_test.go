@@ -655,6 +655,64 @@ func TestProbedModelsAndTestModel(t *testing.T) {
 	}
 }
 
+// T041: moving a provider to another base_url (or API type) drops the probe
+// cache of the old address; a rename, key or limit change keeps it. The
+// OnChange hooks (the "changed" event) run either way.
+func TestUpdateProviderProbeCache(t *testing.T) {
+	s, _ := newService(t)
+	p := create(t, s, "P", model.ProviderOpenAI, "https://api.example.com/v1", fakeKey)
+	var hooks atomic.Int32
+	s.OnChange(func() { hooks.Add(1) })
+	probe := func() {
+		t.Helper()
+		if err := s.SetProbedModels(bg(), p.ID, model.ProbedModels{Error: "HTTP 404"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cached := func() bool {
+		t.Helper()
+		_, ok, err := s.ProbedModels(bg(), p.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	update := func(in ProviderInput) {
+		t.Helper()
+		if _, err := s.UpdateProvider(bg(), p.ID, in); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	probe()
+	conc, rpm := 3, 30
+	update(ProviderInput{Name: sp("Renamed"), APIKey: sp("sk-test-other"), MaxConcurrency: &conc, RPM: &rpm})
+	if !cached() || hooks.Load() != 1 {
+		t.Fatalf("rename / key / limits: cache kept = %v, hooks %d", cached(), hooks.Load())
+	}
+	update(ProviderInput{BaseURL: sp("https://api.example.com/v1")}) // same address
+	if !cached() {
+		t.Fatal("an unchanged base_url dropped the cache")
+	}
+	update(ProviderInput{BaseURL: sp("https://api.example.com/v2")}) // same origin, other path
+	if cached() || hooks.Load() != 3 {
+		t.Fatalf("new base_url: cache kept = %v, hooks %d", cached(), hooks.Load())
+	}
+	probe()
+	update(ProviderInput{BaseURL: sp("https://other.example.org/v1")}) // another host
+	if cached() {
+		t.Fatal("another host kept the cache")
+	}
+	probe()
+	update(ProviderInput{Type: sp(model.ProviderAnthropic)})
+	if cached() {
+		t.Fatal("a new type kept the cache")
+	}
+	if got, _ := s.Provider(p.ID); got.Name != "Renamed" {
+		t.Fatalf("name = %q", got.Name)
+	}
+}
+
 func TestReadsNeverTouchTheDatabase(t *testing.T) {
 	st := openStore(t)
 	s, err := Open(bg(), st, legacyConfig(t))

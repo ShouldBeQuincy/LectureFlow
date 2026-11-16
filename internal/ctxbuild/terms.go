@@ -37,6 +37,30 @@ func DropTerm(en string) bool {
 	return true
 }
 
+// Length limits of one glossary entry, in characters (runes) after trimming
+// (AUD5 low-1). Real entries are far shorter (an English term has at most
+// six words, §6.0.1; the longest translations, with alternatives as in
+// "公开 / 公钥 (public key)", are a few dozen characters); an entry over a
+// limit is not a term but text, e.g. instructions injected through a
+// syllabus or slides, which would otherwise stand under MANDATORY TERMS of
+// every later request of the course. They are rules of the glossary's
+// content, checked where an entry is written: MergeTerms drops such
+// extracted entries whole (never cut to half a phrase), a manual term or
+// edit over a limit is refused, and the janitor's fix_zh over the limit is
+// not applied. The prompts are not filtered: every enabled term still goes
+// into {glossary_lines}, and QA checks them as before (SPEC §7).
+const (
+	TermEnMaxChars = 100
+	TermZhMaxChars = 100
+)
+
+// TermTooLong reports whether a glossary entry is over TermEnMaxChars or
+// TermZhMaxChars.
+func TermTooLong(en, zh string) bool {
+	return utf8.RuneCountInString(strings.TrimSpace(en)) > TermEnMaxChars ||
+		utf8.RuneCountInString(strings.TrimSpace(zh)) > TermZhMaxChars
+}
+
 // enabledTerms returns the enabled terms sorted by en_key (SPEC §12), with
 // duplicates (same en_key) removed. Empty en is skipped.
 func enabledTerms(terms []model.Term) []model.Term {

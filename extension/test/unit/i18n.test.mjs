@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { UI_LANGUAGES, isLanguage, chainOf, bcp47Of, formatMessage, mergeCatalogs, loadCatalog } from '../../src/lib/i18n.js';
+import { UI_LANGUAGES, isLanguage, chainOf, bcp47Of, formatMessage, mergeCatalogs, loadCatalog, tracksFoundKey, reportRowKey } from '../../src/lib/i18n.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const read = (dir) => JSON.parse(fs.readFileSync(path.join(root, '_locales', dir, 'messages.json'), 'utf8'));
@@ -82,11 +82,59 @@ test('a button named inside a sentence is named exactly as the button', () => {
     ['refreshText', 'refreshButton'],
     ['profilesHint', 'unreviewed'],
     ['oneEach', 'presetDual'],
+    ['discNotOpen', 'openApp'],
+    ['discNotOpen', 'connRecheck'],
+    ['failAngle', 'presetMain'],
+    ['bulkRefreshNote', 'sendButton'],
+    ['discRegister', 'connRecheck'],
+    ['courseCreate', 'connRecheck'],
   ];
   for (const dir of DIRS) {
     const m = read(dir);
     for (const [sentence, button] of pairs) assert.ok(m[sentence].message.includes(m[button].message), `${dir}: ${sentence} quotes ${button} “${m[button].message}”`);
   }
+});
+
+test('generic detection’s label on the card is not the footer’s “Detect automatically on this site” (SEC42 低-7)', () => {
+  assert.ok(!/automatic/i.test(en.sourceGeneric.message), en.sourceGeneric.message);
+  const zh = read('zh_CN');
+  assert.ok(!zh.grantSite.message.includes(zh.sourceGeneric.message), zh.sourceGeneric.message);
+});
+
+test('generic detection’s label and the footer’s “Detect automatically on this site” share no word in any language; zh_CN and en say the same (I61, I66)', () => {
+  // Chinese is written without spaces: no two characters in a row in common;
+  // the others: no word of four letters or more in common.
+  const words = (s) => s.toLowerCase().split(/[\s.,;:!?()«»“”"'·]+/u).filter((w) => [...w].length >= 4);
+  const pairs = (s) => [...s].slice(1).map((ch, i) => [...s][i] + ch).filter((p) => /^\p{Script=Han}{2}$/u.test(p));
+  for (const dir of DIRS) {
+    const m = read(dir);
+    const a = m.sourceGeneric.message;
+    const b = m.grantSite.message;
+    const shared = dir.startsWith('zh') ? pairs(a).filter((p) => b.includes(p)) : words(a).filter((w) => words(b).includes(w));
+    assert.deepEqual(shared, [], `${dir}: “${a}” / “${b}”`);
+  }
+  // one meaning in the two finished languages: “found on the page”
+  assert.equal(en.sourceGeneric.message, 'Found on the page');
+  assert.equal(read('zh_CN').sourceGeneric.message, '在页面上找到');
+});
+
+test('the report’s two descriptions say what the redaction does to addresses: the path is kept, long IDs in it become fakes, parameter values placeholders; read it before sharing (R83 信息 1)', () => {
+  // the old wording promised more than src/lib/redact.js does: path segments
+  // such as a course code stay as they are
+  const old = { en: /path structure/i, zh_CN: /路径结构/, zh_TW: /路徑結構/, zh_HK: /路徑結構/, ru: /структура пути/i, hi: /पाथ की संरचना/ };
+  const fakes = { en: /fakes of the same shape/, zh_CN: /同形的假值/, zh_TW: /格式相同的假值/, zh_HK: /格式一樣嘅假值/, ru: /фиктивными значениями того же вида/, hi: /नकली मानों/ };
+  const before = { en: /[Rr]ead it before you share it\./, zh_CN: /分享前请先看一遍。/, zh_TW: /分享前請先看過一遍。/, zh_HK: /分享之前請先睇一次。/, ru: /просмотрите его\./, hi: /शेयर करने से पहले इसे एक बार पढ़ लें।/ };
+  for (const dir of DIRS) {
+    const m = read(dir);
+    for (const key of ['exportReportHint', 'reportsHint']) {
+      const s = m[key].message;
+      assert.ok(!old[dir].test(s), `${dir}.${key} still says “path structure”: ${s}`);
+      assert.ok(fakes[dir].test(s), `${dir}.${key}: long IDs in the path become fakes`);
+      assert.ok(before[dir].test(s), `${dir}.${key}: read it before sharing`);
+    }
+  }
+  // ru: «поддельный» reads as "forged" in a privacy note; the reviewer's «фиктивными» (I73, I77)
+  for (const key of ['exportReportHint', 'reportsHint']) assert.ok(!/поддельн/i.test(read('ru')[key].message), `ru.${key} still says «поддельн…»`);
 });
 
 test('the terms LectureFlow’s own translations use (glossary §9, web/i18n): 刮削, the DRM sentence, the presets', () => {
@@ -166,4 +214,26 @@ test('the store name is the in-page button (user decision 2026-10-27); the quiet
   assert.equal(read('zh_CN').extName.message, '发送至 LectureFlow');
   assert.equal(read('zh_CN').restrictedNoticeQuiet.message, '检测到该媒体流或受讲师或大学政策限制。LectureFlow 仅将您有权访问的媒体流拉取至本地用于个人无障碍学习（转录/翻译）。请确保您遵守学校规定。');
   assert.equal(read('zh_CN').restrictedRemember.message, '对这个平台（$P1$）不再提醒');
+});
+
+test('the track count header is singular for one track (T081)', () => {
+  assert.equal(tracksFoundKey(1), 'tracksDetectedOne');
+  for (const n of [0, 2, 3, 11, '2']) assert.equal(tracksFoundKey(n), 'tracksDetected');
+  assert.equal(formatMessage(en[tracksFoundKey(1)], ['1']), '1 track found');
+  assert.equal(formatMessage(en[tracksFoundKey(3)], ['3']), '3 tracks found');
+  assert.equal(formatMessage(en[tracksFoundKey(0)], ['0']), '0 tracks found');
+});
+
+test('the options page report row is singular for one track', () => {
+  assert.equal(reportRowKey(1), 'reportRowOne');
+  for (const n of [0, 2, 3, 11, '2']) assert.equal(reportRowKey(n), 'reportRow');
+  assert.equal(formatMessage(en[reportRowKey(1)], ['example.org', '1']), 'example.org · 1 track');
+  assert.equal(formatMessage(en[reportRowKey(4)], ['example.org', '4']), 'example.org · 4 tracks');
+  for (const dir of ['en', 'hi', 'ru', 'zh_CN', 'zh_HK', 'zh_TW']) {
+    const c = read(dir);
+    assert.ok(c.reportRowOne, dir);
+    assert.deepEqual(c.reportRowOne.placeholders, c.reportRow.placeholders, dir);
+    const one = formatMessage(c.reportRowOne, ['example.org', '1']);
+    assert.ok(one.includes('example.org') && one.includes('1'), `${dir}: ${one}`);
+  }
 });

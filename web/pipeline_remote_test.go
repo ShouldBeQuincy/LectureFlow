@@ -39,7 +39,7 @@ func TestPipelineRemoteStepsFollowTheCard(t *testing.T) {
 		t.Fatal(err)
 	}
 	url := "file:///" + strings.TrimPrefix(filepath.ToSlash(dir), "/") + "/"
-	out, err := exec.Command(node, filepath.Join("testdata", "pipeline_remote_test.mjs"), url).CombinedOutput()
+	out, err := runNode(t, node, "pipeline_remote_test.mjs", url)
 	if err != nil || !strings.Contains(string(out), "pipeline remote checks: ok") {
 		t.Fatalf("pipeline_remote_test.mjs: %v\n%s", err, out)
 	}

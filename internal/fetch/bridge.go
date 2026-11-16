@@ -6,6 +6,7 @@ package fetch
 import (
 	"context"
 	"errors"
+	"net"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -39,21 +40,33 @@ func localRequestError() error {
 	return bridge.NewError(bridge.CodeBadRequest, map[string]any{"field": "tracks.url", "reason": "local_address"})
 }
 
+// unusualRequestError answers a page or track URL whose host name has
+// unusual characters (blocklist.UnusualHost; the extension sends ASCII,
+// punycode, hosts only): request.invalid with the reason, like
+// localRequestError (no new bridge code).
+func unusualRequestError(field string) error {
+	return bridge.NewError(bridge.CodeBadRequest, map[string]any{"field": field, "reason": "unusual_host"})
+}
+
 // refuseBlocked answers a request whose page (the Referer the extension
 // sends: the page address, or only its origin when the tracks are on
 // another) or any track is on a site LectureFlow does not handle
-// (internal/blocklist): downloads.site_blocked {category}. The extension
-// keeps such pages out on its own; this is the second line.
+// (internal/blocklist): downloads.site_blocked {category}; a host the list
+// cannot compare safely is unusualRequestError. The extension keeps such
+// pages out on its own; this is the second line.
 func refuseBlocked(referer string, tracks []liveTrack) error {
-	category := blocklist.URLCategory(referer)
+	category, field := blocklist.URLCategory(referer), "referer"
 	for _, t := range tracks {
 		if category != "" {
 			break
 		}
-		category = blocklist.URLCategory(t.url)
+		category, field = blocklist.URLCategory(t.url), "tracks.url"
 	}
-	if category == "" {
+	switch category {
+	case "":
 		return nil
+	case blocklist.CategoryUnusualHost:
+		return unusualRequestError(field)
 	}
 	return bridge.NewError(CodeSiteBlocked, map[string]any{"category": category})
 }
@@ -230,7 +243,7 @@ func checkTracks(tracks []bridge.Track) ([]liveTrack, error) {
 		}
 		u, _ := url.Parse(tr.URL)
 		rec := trackRecord{Kind: tr.Kind, Format: tr.Format, Role: truncateRunes(tr.Role, 64), Label: cleanTitle(truncateRunes(tr.Label, 200)),
-			Quality: truncateRunes(tr.Quality, 64), SizeBytes: tr.SizeBytes, Host: u.Host, PathHash: pathHash(u.EscapedPath())}
+			Quality: truncateRunes(tr.Quality, 64), SizeBytes: boundSize(tr.SizeBytes), Host: u.Host, PathHash: pathHash(u.EscapedPath())}
 		if tr.Format == bridge.FormatDASH {
 			rec.Selector = tr.Selector
 		}
@@ -252,6 +265,80 @@ func checkCreds(cookies []bridge.Cookie, referer string) error {
 		return badField("referer")
 	}
 	return nil
+}
+
+// cookiesForTracks keeps the cookies a browser would send to the host of
+// at least one track (domainMatch). The extension reads the cookies of the
+// track URLs (cookies.getAll), so it sends no other; one of another host
+// (a hand-made message) is left out, so that no redirect, playlist entry
+// or segment that leads elsewhere ever carries it: with the cookies a
+// request carries only for its own host (cookieHeader), those of a task go
+// to the hosts the task named and nowhere else (AUD3 medium-1, the app's
+// side). It returns the cookies kept and how many were left out.
+func cookiesForTracks(cs []bridge.Cookie, tracks []liveTrack) ([]bridge.Cookie, int) {
+	hosts := make([]string, 0, len(tracks))
+	for _, t := range tracks {
+		if u, err := url.Parse(t.url); err == nil {
+			hosts = append(hosts, u.Hostname())
+		}
+	}
+	out := make([]bridge.Cookie, 0, len(cs))
+	for _, c := range cs {
+		for _, h := range hosts {
+			if domainMatch(h, c) {
+				out = append(out, c)
+				break
+			}
+		}
+	}
+	return out, len(cs) - len(out)
+}
+
+func (q *Queue) trackCookies(cs []bridge.Cookie, tracks []liveTrack) []bridge.Cookie {
+	kept, dropped := cookiesForTracks(cs, tracks)
+	if dropped > 0 {
+		q.log.Warn("downloads: cookies of no track's host left out", "count", dropped)
+	}
+	return kept
+}
+
+// hostOnly is the host of a "host[:port]" (download_task.page_host, a
+// track record's host), without the brackets of an IPv6 address.
+func hostOnly(hostport string) string {
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		return h
+	}
+	return strings.Trim(hostport, "[]")
+}
+
+// sameSource reports whether a refresh may give a task's tracks the fresh
+// URLs matched to them (AUD3 low-1, the app's side): every fresh URL on
+// the host of the track it replaces, or the refresh from the page the task
+// was sent from (its host: the platform may have moved its media since).
+// A page that embeds a player frame of a platform (so that its own media
+// passes as that platform's session) is neither: it cannot swap its media
+// into a task waiting for a refresh. Sent from another page that embeds
+// the player (an LMS) the media is on the same hosts and the refresh goes
+// on. An unknown page (no Referer) matches no page.
+func sameSource(rec db.DownloadTask, matched []liveTrack, referer string) bool {
+	if rec.PageHost != "" && referer != "" {
+		if u, err := url.Parse(referer); err == nil && u.Hostname() != "" && sameHost(u.Hostname(), hostOnly(rec.PageHost)) {
+			return true
+		}
+	}
+	for _, m := range matched {
+		u, err := url.Parse(m.url)
+		if err != nil || !sameHost(u.Hostname(), hostOnly(m.rec.Host)) {
+			return false
+		}
+	}
+	return true
+}
+
+// otherSourceError answers a refresh that fails sameSource: request.invalid
+// with the reason, like localRequestError (no new bridge code).
+func otherSourceError() error {
+	return bridge.NewError(bridge.CodeBadRequest, map[string]any{"field": "tracks.url", "reason": "other_host"})
 }
 
 func tracksJSON(ts []liveTrack) string {
@@ -379,12 +466,13 @@ func (q *Queue) Enqueue(ctx context.Context, req *bridge.EnqueueRequest) (*bridg
 			return nil, bridge.NewError(bridge.CodeDuplicate, map[string]any{"state": old.State, "taskId": old.ID})
 		}
 		// sent again: the row is reused; partial files are kept only for
-		// the very same tracks
+		// the very same tracks, and not when the import refused the file
+		// (ImportRefused: a sign-in page, say; the same file fails again)
 		if t := q.tasks[old.ID]; t != nil {
 			t.forget()
 			delete(q.tasks, old.ID)
 		}
-		if !sameTracks(old.TracksJSON, rec.TracksJSON) {
+		if !sameTracks(old.TracksJSON, rec.TracksJSON) || (old.State == bridge.StateFailed && RefusedFile(old.ErrorCode)) {
 			removeAllRetry(q.taskDir(old.ID))
 		} else if old.State == bridge.StateFailed {
 			// the partial files stay (a cancelled or done task has none
@@ -393,7 +481,7 @@ func (q *Queue) Enqueue(ctx context.Context, req *bridge.EnqueueRequest) (*bridg
 		}
 		rec.ID, rec.CreatedAt = old.ID, old.CreatedAt
 	}
-	t := &task{rec: rec, tracks: tracks, cookies: append([]bridge.Cookie(nil), req.Cookies...), referer: req.Referer}
+	t := &task{rec: rec, tracks: tracks, cookies: q.trackCookies(req.Cookies, tracks), referer: req.Referer}
 	if err := q.queueLocked(t); err != nil {
 		if errors.Is(err, errGone) {
 			return nil, bridge.NewError(bridge.CodeCourseGone, nil)
@@ -407,8 +495,11 @@ func (q *Queue) Enqueue(ctx context.Context, req *bridge.EnqueueRequest) (*bridg
 }
 
 // Refresh gives a task new credentials (the tracks again, matched to the
-// task's by role, then by kind; the format must stay). A needs_refresh or
-// failed task waits for a slot again and resumes where it stopped; a
+// task's by role, then by kind; the format must stay; each on the host of
+// the track it replaces unless sent from the task's own page: sameSource).
+// A needs_refresh or
+// failed task waits for a slot again and resumes where it stopped (a
+// failed task whose file the import refused starts over); a
 // waiting task takes the new credentials; a running or done task is left
 // alone and its state answered. A cancelled task is refresh.not_found.
 func (q *Queue) Refresh(ctx context.Context, req *bridge.RefreshRequest) (*bridge.RefreshReply, error) {
@@ -460,9 +551,22 @@ func (q *Queue) Refresh(ctx context.Context, req *bridge.RefreshRequest) (*bridg
 	if err != nil {
 		return nil, err
 	}
-	t.tracks, t.cookies, t.referer = matched, append([]bridge.Cookie(nil), req.Cookies...), req.Referer
+	if !sameSource(t.rec, matched, req.Referer) {
+		q.log.Warn("downloads: a refresh from another page with tracks on other hosts refused", "task", t.rec.ID)
+		return nil, otherSourceError()
+	}
+	t.tracks, t.cookies, t.referer = matched, q.trackCookies(req.Cookies, matched), req.Referer
 	if t.rec.State == bridge.StateQueued {
 		return reply(), nil
+	}
+	if t.rec.State == bridge.StateFailed && RefusedFile(t.rec.ErrorCode) {
+		// the import refused the file (ImportRefused: a sign-in page, say):
+		// it is downloaded anew with the new credentials, as Enqueue does,
+		// not imported again to be refused again (R12 D-3). The directory
+		// is this task's alone (taskDir: the row's id), and no runner holds
+		// it: a task is saved failed by its runner as it ends (run).
+		removeAllRetry(q.taskDir(t.rec.ID))
+		t.rec.BytesDone, t.rec.BytesTotal = 0, -1
 	}
 	if err := q.queueLocked(t); err != nil {
 		if errors.Is(err, errGone) {

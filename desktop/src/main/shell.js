@@ -30,7 +30,10 @@ const {
 
 const { resolveDataDir } = require('./lib/datadir');
 const { buildServerArgs, resolveServerCommand, serviceEnv, EXIT_RESTART } = require('./lib/serverutil');
-const { decideClose, interpretCloseDialog, wantSleepBlock, runningCount } = require('./lib/policy');
+const {
+  decideClose, decideQuit, closeDialogKeys, interpretCloseDialog, wantSleepBlock, runningCount, queuedCount,
+} = require('./lib/policy');
+const { OPEN_EXTERNAL_LIMIT, createRateLimit } = require('./lib/ratelimit');
 const { isServerUrl, isExternalWebUrl } = require('./lib/security');
 const { iconPng } = require('./lib/pngicon');
 const { shortcutFor, nextZoomLevel } = require('./lib/menu');
@@ -45,6 +48,7 @@ const { createApiClient } = require('./apiclient');
 const { SleepGuard } = require('./sleepguard');
 const { TrayController } = require('./tray');
 const { registerIpc } = require('./ipc');
+const { createPathGranter } = require('./lib/pathgrant');
 const { writeLocaleMemo } = require('./lib/i18n');
 const { hardenSession, hardenWebContents } = require('./websecurity');
 const { launcherFor, launcherBlocked, isPortable } = require('./lib/nmhost');
@@ -60,6 +64,16 @@ const PRELOAD = path.join(SHELL_ROOT, 'preload.js');
 // storage: it is only added to outgoing request headers.
 const PARTITION = 'persist:lectureflow';
 const POLL_MS = 5000;
+// Closing the window or Quit in the tray while the service does not answer
+// (review R69 L-7): poll()'s last reading of the activity stands in when it
+// is at most this old; otherwise the activity is unknown.
+const ACTIVITY_FALLBACK_MS = 30000;
+// What the close and quit decisions and the close dialog assume while the
+// activity is unknown: a job and a fetch of a recording may both run. So
+// the shell asks (or follows a remembered choice) instead of quitting at
+// once, and the dialog's detail is close.detail_both, which also says that
+// an unfinished fetch loses its sign-in data (review R84 L-3).
+const ACTIVITY_UNKNOWN = Object.freeze({ running: 2, queued: 0, downloads: 1 });
 const STOP_TIMEOUT_MS = 10000;
 const RESTART_WINDOW_MS = 60000;
 const MAX_RESTARTS = 3;
@@ -82,6 +96,17 @@ function isDir(p) {
   }
 }
 
+/**
+ * closeFactsNote: the log's account of what a close or quit decision went by
+ * (Shell._closeFacts): the counts, how old a stand-in reading was, or that
+ * the activity was unknown, so "no tasks" and "no answer" read differently.
+ */
+function closeFactsNote(facts) {
+  if (facts.unknown) return '(activity unknown)';
+  const note = `(running ${runningCount(facts.activity)}) (queued ${queuedCount(facts.activity)})`;
+  return facts.ageS === undefined ? note : `${note} (activity from ${facts.ageS} s ago)`;
+}
+
 class Shell {
   /**
    * translator: createShellTranslator(); its t is handed to the tray and IPC
@@ -91,8 +116,13 @@ class Shell {
    * loaded only when the service says in-app updates are not configured.
    * selfUpdateFor(dataDir) → a SelfUpdateApplier, or null when this copy is
    * never updated in place (development).
+   * installDir: the installation directory the service checks (-install-dir;
+   * lib/updatefiles.installDirOf), null when there is none.
+   * noSelfUpdate: this copy of the app cannot replace itself
+   * (describeInstallation: unsupported); the service is told
+   * (-no-self-update, lib/serverutil.js buildServerArgs).
    */
-  constructor({ translator, localeFile = null, onLocaleChange = () => {}, log, isDev, loadUpdater = null, selfUpdateFor = null, background = false }) {
+  constructor({ translator, localeFile = null, onLocaleChange = () => {}, log, isDev, loadUpdater = null, selfUpdateFor = null, background = false, installDir = null, noSelfUpdate = false }) {
     this.translator = translator;
     this.t = translator.t;
     this.localeFile = localeFile;
@@ -107,11 +137,16 @@ class Shell {
     this.generation = 0;
     this.dataDir = null;
     this.quitting = false;
-    this.closing = false;
+    this.closing = false; // a close or quit question is being asked
+    this.trayQuestion = null; // AbortController of the tray's quit question while it is open
     this.restarts = [];
     this.pollTimer = null;
     this.polling = false;
     this.lastSettings = null;
+    // { activity, at, gen }: poll()'s last answer of /api/app/activity, when
+    // (this.now) and from which start of the service (generation).
+    this.lastActivity = null;
+    this.now = () => performance.now(); // monotonic milliseconds
     this.backgroundNotice = null;
     this.shutdownPromise = null;
     this.lastError = null; // kind of the error page on screen ('location_invalid' offers "use the default location")
@@ -120,6 +155,8 @@ class Shell {
     // In-app update: the applier of the current data dir; probation while a
     // freshly installed version starts (see the file header).
     this.selfUpdateFor = selfUpdateFor;
+    this.installDir = installDir;
+    this.noSelfUpdate = !!noSelfUpdate;
     this.applier = null;
     this.probation = false;
     this.probationFailing = false;
@@ -129,6 +166,10 @@ class Shell {
     // A route the browser extension asked for ("open") before the app page
     // could show it; loadApp goes there.
     this.pendingRoute = null;
+    // One limit for every link handed to the system browser: the page's
+    // openExternal (ipc.js) and navigation / window.open (openExternal
+    // below). Security audit FB1 L-6, review R44.
+    this.openExternalLimit = createRateLimit(OPEN_EXTERNAL_LIMIT);
 
     this.api = createApiClient({ getServer: () => this._serverForApi() });
     this.updatePath = loadUpdater ? new UpdatePathChooser({
@@ -142,7 +183,8 @@ class Shell {
       t: this.t,
       icon: this._trayIcon(),
       onOpen: () => this.showMainWindow(),
-      onQuit: () => setImmediate(() => app.quit()), // not inside the tray's own click handler
+      // Asks first while tasks run or wait (T26 S1); not inside the tray's own click handler.
+      onQuit: () => setImmediate(() => this.onQuitRequested()),
     });
   }
 
@@ -166,6 +208,8 @@ class Shell {
       onRetry: () => this.retry(),
       onOpenLogs: () => this.openLogs(),
       onRestoreDefault: () => this.restoreDefaultLocation(),
+      openExternalLimit: this.openExternalLimit,
+      grantPaths: createPathGranter({ api: this.api, log: this.log }),
       log: this.log,
     });
     this.createWindow();
@@ -476,6 +520,8 @@ class Shell {
         launcher: launcherFor({ isPackaged: app.isPackaged, platform: this.platform, execPath: process.execPath, env: process.env }),
         launcherBlocked: launcherBlocked({ isPackaged: app.isPackaged, platform: this.platform, execPath: process.execPath }),
         portable: isPortable({ isPackaged: app.isPackaged, platform: this.platform, env: process.env }),
+        installDir: this.installDir,
+        noSelfUpdate: this.noSelfUpdate,
       }),
       env: serviceEnv(process.env, cmd.extraEnv), // no usage reporting (serverutil NO_TELEMETRY_ENV)
       // (a data dir the service has yet to create cannot be the working directory)
@@ -504,9 +550,25 @@ class Shell {
       const page = this._startErrorPage(err, program);
       // the service could not create the data dir (the shell leaves that to it)
       if (dataDirMissing && !isDir(dataDir)) page.detail = [this.t('reason.unwritable', { path: dataDir }), page.detail].filter(Boolean).join('\n');
-      // another LectureFlow on the data folder is not this version's fault:
-      // no probation failure (no rollback); the error page and "Try again"
-      fail(page, err instanceof StartError && isEnvironmentFailure(err.failure) ? null : startFailureReason(err));
+      // another LectureFlow on the data folder, a locked, read-only or
+      // unreachable database, a full or failing disk: not this version's
+      // fault. No probation failure (no rollback), and the start does not
+      // count as a try (else "Try again" would use up the tries and roll
+      // back all the same, SEC3 T6); the error page and "Try again". At
+      // most MAX_REFUNDS times per installation (a defect of the new
+      // version can look the same, SEC12 M-1): then refundTry says no and
+      // the failure counts like any other.
+      const environment = err instanceof StartError && isEnvironmentFailure(err.failure);
+      let refunded = false;
+      if (environment && this.probation && !this.probationFailing) {
+        refunded = await this.applier.refundTry().catch((e) => {
+          this.log.warn(`selfupdate: ${e && e.message}`);
+          return false;
+        });
+        if (refunded) this._endProbation();
+      }
+      // (outside a probation fail() ignores the reason)
+      fail(page, refunded ? null : startFailureReason(err));
       return;
     }
     if (gen !== this.generation || this.quitting) {
@@ -651,7 +713,7 @@ class Shell {
     if (!(err instanceof StartError)) return { ...page, detail: String(err && err.message) };
     // a failure the service named (lib/startfail.js): what to do, in the
     // interface language; its ERROR line (Chinese and English) as details
-    const text = startFailureText(err.failure, this.t);
+    const text = startFailureText(err.failure, this.t, this.translator.locale);
     if (text) return { ...page, body: text, detail: err.reason || '' };
     switch (err.kind) {
       case 'spawn_failed':
@@ -732,8 +794,18 @@ class Shell {
     });
   }
 
+  /**
+   * openExternal: a link from navigation, window.open or the openExternal
+   * permission (websecurity.js) to the system browser. No user gesture can
+   * be checked here; the shared limit applies, and a link over it is
+   * dropped with a log line, quietly.
+   */
   openExternal(url) {
     if (!isExternalWebUrl(url)) return;
+    if (!this.openExternalLimit()) {
+      this.log.warn('open external link: too many links in a short time; dropped');
+      return;
+    }
     shell.openExternal(url).catch((err) => this.log.warn(`open external link: ${err.message}`));
   }
 
@@ -769,7 +841,11 @@ class Shell {
     try {
       if (this.updatePath && !this.updatePath.decided) await this.updatePath.decide().catch(() => {});
       if (this.updates) await this.updates.sync().catch(() => {});
-      const activity = await this.api.activity().catch(() => null);
+      const gen = this.generation;
+      const activity = await this.api.activity().then((a) => {
+        if (gen === this.generation) this.lastActivity = { activity: a, at: this.now(), gen };
+        return a;
+      }, () => null);
       let settings = this.lastSettings;
       if (runningCount(activity) > 0) settings = await this.api.settings().catch(() => this.lastSettings);
       if (settings) this.lastSettings = settings;
@@ -783,39 +859,18 @@ class Shell {
     }
   }
 
-  // ---- closing the window ----
+  // ---- closing the window, Quit in the tray ----
 
   async onCloseRequested() {
     if (this.closing) return;
     this.closing = true;
     try {
-      let activity = null;
-      let settings = null;
-      if (this.phase === 'ready') {
-        [activity, settings] = await Promise.all([
-          this.api.activity({ timeoutMs: 2000 }).catch(() => null),
-          this.api.settings({ timeoutMs: 2000 }).catch(() => null),
-        ]);
-      }
-      const decision = decideClose({ platform: this.platform, activity, settings });
-      this.log.info(`close requested: ${decision} (running ${runningCount(activity)})`);
+      const facts = await this._closeFacts();
+      const activity = facts.unknown ? ACTIVITY_UNKNOWN : facts.activity;
+      const decision = decideClose({ platform: this.platform, activity, settings: facts.settings });
+      this.log.info(`close requested: ${decision} ${closeFactsNote(facts)}`);
       if (decision === 'ask') {
-        const result = await dialog.showMessageBox(this.win, {
-          type: 'question',
-          title: 'LectureFlow',
-          message: this.t('close.message'),
-          detail: this.t('close.detail'),
-          buttons: [this.t('close.background'), this.t('close.quit'), this.t('close.cancel')],
-          defaultId: 0,
-          cancelId: 2,
-          noLink: true,
-          checkboxLabel: this.t('close.remember'),
-          checkboxChecked: false,
-        });
-        const { action, remember } = interpretCloseDialog(result);
-        if (remember) {
-          await this.api.patchSettings({ close_behavior: remember }).catch((err) => this.log.warn(`save close behaviour: ${err.message}`));
-        }
+        const action = await this._askClose(activity);
         if (action === 'background') this.hideToBackground();
         else if (action === 'quit') app.quit();
         return;
@@ -826,6 +881,106 @@ class Shell {
     } finally {
       this.closing = false;
     }
+  }
+
+  /**
+   * onQuitRequested: "Quit" in the tray menu (T26 S1). With tasks it asks
+   * the close question first (policy.decideQuit), without "remember my
+   * choice"; "continue in background" and cancel leave the app as it is,
+   * hidden in the tray. The question has
+   * no parent window, so it is not modal: when the window is shown
+   * meanwhile, showMainWindow withdraws it as cancelled (review R69 L-1),
+   * and closing the window asks again on the window.
+   */
+  async onQuitRequested() {
+    if (this.closing || this.quitting) return;
+    this.closing = true;
+    const question = new AbortController();
+    this.trayQuestion = question;
+    const withdrawn = () => {
+      if (question.signal.aborted) this.log.info('quit question withdrawn: the window was shown');
+      return question.signal.aborted;
+    };
+    try {
+      const facts = await this._closeFacts();
+      if (withdrawn()) return;
+      const activity = facts.unknown ? ACTIVITY_UNKNOWN : facts.activity;
+      const decision = decideQuit({ activity, settings: facts.settings });
+      this.log.info(`quit requested: ${decision} ${closeFactsNote(facts)}`);
+      if (decision === 'ask') {
+        const action = await this._askClose(activity, { signal: question.signal, offerRemember: false });
+        if (withdrawn() || action !== 'quit') return;
+      }
+      app.quit();
+    } finally {
+      if (this.trayQuestion === question) this.trayQuestion = null;
+      this.closing = false;
+    }
+  }
+
+  /**
+   * _closeFacts: { activity, settings, ageS?, unknown? } for the close and
+   * quit decisions. Before the service is ready both are null (nothing runs).
+   * Settings that do not answer are null. When the activity does not answer
+   * within 2 s (review R69 L-7), poll()'s last reading stands in if it is
+   * from this start of the service and at most ACTIVITY_FALLBACK_MS old
+   * (ageS: its age in seconds); otherwise the activity is unknown (unknown:
+   * true, activity null) and the caller assumes tasks. In both cases
+   * settings that do not answer either fall back on the last ones poll()
+   * read, so a remembered "quit" still quits.
+   */
+  async _closeFacts() {
+    if (this.phase !== 'ready') return { activity: null, settings: null };
+    const gen = this.generation;
+    const [read, settings] = await Promise.all([
+      this.api.activity({ timeoutMs: 2000 }).then((activity) => ({ activity }), () => null),
+      this.api.settings({ timeoutMs: 2000 }).catch(() => null),
+    ]);
+    if (read) return { activity: read.activity, settings };
+    const known = settings || this.lastSettings;
+    const last = this.lastActivity;
+    const age = last && last.gen === gen ? this.now() - last.at : NaN;
+    if (age >= 0 && age <= ACTIVITY_FALLBACK_MS) return { activity: last.activity, settings: known, ageS: Math.round(age / 1000) };
+    return { activity: null, settings: known, unknown: true };
+  }
+
+  /**
+   * _askClose: the close dialog for these tasks (policy.closeDialogKeys);
+   * a remembered answer is saved. Returns 'background' | 'quit' | 'cancel'.
+   * Attached to the window while it is shown; from the tray the window is
+   * hidden, and a dialog on a hidden window could stay out of sight.
+   * signal (an AbortSignal) closes the dialog as cancelled; Electron honours
+   * it on Windows and Linux (on macOS only with a parent window, but there
+   * is no tray there). offerRemember: the "remember my choice" box, which
+   * sets close_behavior — what closing the window does. The tray's quit
+   * question leaves it out (review R69 L-2): there a remembered
+   * "background" would not apply, and "quit" would silently stop closing
+   * the window from asking.
+   */
+  async _askClose(activity, { signal = null, offerRemember = true } = {}) {
+    const text = closeDialogKeys(activity);
+    const options = {
+      type: 'question',
+      title: 'LectureFlow',
+      message: this.t(text.message),
+      detail: this.t(text.detail),
+      buttons: [this.t('close.background'), this.t('close.quit'), this.t('close.cancel')],
+      defaultId: 0,
+      cancelId: 2,
+      noLink: true,
+    };
+    if (offerRemember) {
+      options.checkboxLabel = this.t('close.remember');
+      options.checkboxChecked = false;
+    }
+    if (signal) options.signal = signal;
+    const win = this.win && !this.win.isDestroyed() && this.win.isVisible() ? this.win : null;
+    const result = await (win ? dialog.showMessageBox(win, options) : dialog.showMessageBox(options));
+    const { action, remember } = interpretCloseDialog(result);
+    if (remember && offerRemember) {
+      await this.api.patchSettings({ close_behavior: remember }).catch((err) => this.log.warn(`save close behaviour: ${err.message}`));
+    }
+    return action;
   }
 
   hideToBackground() {
@@ -844,6 +999,9 @@ class Shell {
 
   showMainWindow() {
     if (this.quitting) return;
+    // The tray's quit question is not modal; with the window back it is
+    // withdrawn (review R69 L-1), so closing the window can ask again.
+    if (this.trayQuestion) this.trayQuestion.abort();
     this.startHidden = false;
     if (!this.win || this.win.isDestroyed()) {
       this.createWindow();

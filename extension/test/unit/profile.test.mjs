@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   checkProfile, profileMatchesUrl, findProfile, profilePermissionOrigins, selectorReads, sessionIdFor,
-  lectureFor, downloadPolicyFor, applyProfile, localizedLabel, readResults, cleanText,
+  lectureFor, downloadPolicyFor, applyProfile, localizedLabel, readResults, cleanText, pageTitleFor, isPlaceholderTitle,
 } from '../../src/lib/profile.js';
 import { normalizeRecordedAt, parseDurationSec } from '../../src/lib/dates.js';
 import { detectTracks } from '../../src/lib/detect.js';
@@ -235,4 +235,49 @@ test('durations', () => {
   assert.equal(parseDurationSec('1h 5m'), 3900);
   assert.equal(parseDurationSec('about an hour'), 0);
   assert.equal(parseDurationSec(''), 0);
+});
+
+test('generic detection names the lecture with the page title, without the site name (T048)', () => {
+  // archive.org: the item page's title ends with the site's name; nothing scraped said more than "Recording"
+  assert.equal(pageTitleFor('Chemical History of a Candle : Michael Faraday : Internet Archive', 'https://archive.org/details/x'), 'Chemical History of a Candle : Michael Faraday');
+  assert.equal(pageTitleFor('Week 3 – Hashing | Example University', 'https://lectures.example.ac.uk/watch/3'), 'Week 3 – Hashing');
+  assert.equal(pageTitleFor('Lecture 7: Hashing - Example', 'https://www.example.com/v/7'), 'Lecture 7: Hashing');
+  // a colon inside the title is not a separator; a last part that is not the site stays
+  assert.equal(pageTitleFor('Lecture 7: Hashing', 'https://example.com/'), 'Lecture 7: Hashing');
+  assert.equal(pageTitleFor('Part 1 - Introduction', 'https://example.com/'), 'Part 1 - Introduction');
+  // only the site's name, or a placeholder: no title (LectureFlow names it)
+  for (const t of ['', '   ', 'Recording', 'video', 'UNTITLED', 'Audio', 'Media', 'Player', 'Example', 'Recording | Example']) {
+    assert.equal(pageTitleFor(t, 'https://example.com/watch'), '', JSON.stringify(t));
+  }
+  assert.ok(isPlaceholderTitle(' Recording ') && !isPlaceholderTitle('Recording 3'));
+  // whitespace collapsed, 300 characters at most; an address host has no site name to drop
+  assert.equal(pageTitleFor('  Week\n 4 ', 'http://127.0.0.1:8080/'), 'Week 4');
+  assert.equal(pageTitleFor('x'.repeat(400), '').length, 300);
+  // lectureFor: generic detection takes it; a profile keeps its own selectors (Panopto's
+  // "Panopto Viewer" stays rejected), and without a page nothing changes
+  assert.deepEqual(lectureFor(null, {}, 61.6, null, { title: 'Recording', url: 'https://archive.org/details/x' }), { title: '', recordedAt: '', durationSec: 62 });
+  assert.equal(lectureFor(null, {}, 0, null, { title: 'Week 4 | Example', url: 'https://example.com/' }).title, 'Week 4');
+  const m = { profile: panopto, url: S.panoptoPageUrl };
+  assert.equal(lectureFor(m, { 'lecture.title.3': { count: 1, value: 'Panopto Viewer' } }, 0, null, { title: 'Panopto Viewer', url: S.panoptoPageUrl }).title, '');
+});
+
+// SEC18b 4: a profile regex runs on at most MAX_REGEX_INPUT (1024)
+// characters of the address without its query; a longer query changes
+// nothing, a longer host and path is not truncated but does not match.
+test('long addresses: a long query still names the track and matches the page; a host and path over 1024 characters do not', () => {
+  const GUID = 'a0000000-0000-4000-8000-0000000000a1';
+  const track = (url) => ({ id: url, url, kind: 'video', format: 'hls', sizeBytes: -1, sizeEstimated: false, sources: ['request'], frameIds: [0], protected: false });
+  const base = `https://cdn.example.org/sessions/${GUID}/${GUID}.hls/master.m3u8`;
+  const longQuery = `${base}?Policy=${'p'.repeat(1500)}&Signature=${'s'.repeat(1000)}&Key-Pair-Id=K1`;
+  assert.ok(longQuery.length > 2500);
+  const named = applyProfile(panopto, [track(longQuery)], 'en');
+  assert.deepEqual(named.tracks.map((t) => t.role), ['primary-video']);
+  assert.equal(profileMatchesUrl(panopto, `https://x.cloud.panopto.eu/Panopto/Pages/Viewer.aspx?id=1&x=${'q'.repeat(2000)}`), true);
+  // host and path over 1024: generic name, no truncation
+  const longPath = `https://cdn.example.org/${'p/'.repeat(520)}sessions/${GUID}/${GUID}.hls/master.m3u8`;
+  assert.ok(longPath.length > 1024);
+  const unnamed = applyProfile(panopto, [track(longPath)], 'en');
+  assert.deepEqual(unnamed.tracks, []);
+  assert.equal(unnamed.others.length, 1);
+  assert.equal(profileMatchesUrl(panopto, `https://x.cloud.panopto.eu/${'a/'.repeat(520)}Panopto/Pages/Viewer.aspx`), false);
 });

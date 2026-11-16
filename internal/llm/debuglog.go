@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/oklog/ulid/v2"
+
 	"lectureflow/internal/sched"
 )
 
@@ -36,14 +38,16 @@ type debugEntry struct {
 }
 
 // debugLog appends request and response to {logDir}/{job_id}.jsonl when
-// log_level = debug. Authentication headers (Authorization, x-api-key) are
+// log_level = debug. Old files are removed with the call log's (calllog.go,
+// pruneLocked: CallLogKeepDays, CallLogMaxBytes; by the day a file was
+// last written). Authentication headers (Authorization, x-api-key) are
 // never written, and a key echoed in the response or the error is redacted
 // (sec2-app L1).
 func (c *HTTPClient) debugLog(ctx context.Context, call callInfo, h http.Header, reqBody []byte, attempt, status int, respBody []byte, err error, d time.Duration) {
 	if c.cfg.LogLevel != "debug" {
 		return
 	}
-	jobID := "nojob"
+	jobID := debugNoJob
 	if j, ok := sched.JobFrom(ctx); ok && j.ID != "" {
 		jobID = j.ID
 	}
@@ -90,13 +94,19 @@ func (c *HTTPClient) debugLog(ctx context.Context, call callInfo, h http.Header,
 	}
 	line = append(line, '\n')
 
-	c.logMu.Lock()
-	defer c.logMu.Unlock()
+	// debugMu of the call log: its pruning (calllog.go, pruneLocked) also
+	// removes old debug log files and must not remove one being written.
+	mu := &c.logMu
+	if c.calls != nil {
+		mu = &c.calls.debugMu
+	}
+	mu.Lock()
+	defer mu.Unlock()
 	if err := os.MkdirAll(c.logDir, 0o755); err != nil {
 		slog.Warn("llm debug log", "err", err)
 		return
 	}
-	f, err := os.OpenFile(filepath.Join(c.logDir, filepath.Base(jobID)+".jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(filepath.Join(c.logDir, filepath.Base(jobID)+debugLogExt), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		slog.Warn("llm debug log", "err", err)
 		return
@@ -105,4 +115,29 @@ func (c *HTTPClient) debugLog(ctx context.Context, call callInfo, h http.Header,
 	if _, err := f.Write(line); err != nil {
 		slog.Warn("llm debug log", "err", err)
 	}
+}
+
+const (
+	debugLogExt = ".jsonl"
+	// debugNoJob is the name of the debug log of requests outside a job.
+	debugNoJob = "nojob"
+)
+
+// isDebugLogName reports whether name is one the debug log writes: a job
+// id (a ULID, db.NewID) or debugNoJob, then ".jsonl". The call log's
+// pruning (calllog.go) removes old files of these names only (T-PERF-08):
+// they hold prompts and answers, and nothing else of the folder may go.
+func isDebugLogName(name string) bool {
+	id, ok := strings.CutSuffix(name, debugLogExt)
+	if !ok {
+		return false
+	}
+	if id == debugNoJob {
+		return true
+	}
+	if len(id) != ulid.EncodedSize || id != strings.ToUpper(id) {
+		return false
+	}
+	_, err := ulid.ParseStrict(id)
+	return err == nil
 }

@@ -36,4 +36,33 @@ func sentHookFrom(ctx context.Context) func() {
 	return fn
 }
 
+type firstEventHookKey struct{}
+
+// WithFirstEventHook returns ctx whose HTTP attempts call fn when the answer
+// of a streamed request begins: on its message_start event, the first event
+// of a Messages API stream, which the server sends once it has read the
+// prompt (stream.go). The stages use it to time the prompt-cache warm-up on
+// Anthropic (v3.2.x r2 N46), whose cache becomes readable for other
+// requests only once the first request's answer has begun.
+//
+// fn is called at most once per attempt, from the goroutine reading the
+// stream, before the rest of the answer is read; a retried request may call
+// it again. Comment lines and pings ahead of message_start (a proxy keeping
+// the connection open) do not call it. It is not called for an attempt
+// that gets no message_start: a request that is not streamed (an
+// OpenAI-compatible provider, an older Claude model, a server that ignored
+// "stream" and sent the whole message), an error status, a stream that
+// fails or ends before message_start, an idle timeout, a time-out or a
+// cancel before it. An error event or a failure after message_start does
+// not undo the call. A caller waiting for it must therefore have its own
+// limit.
+func WithFirstEventHook(ctx context.Context, fn func()) context.Context {
+	return context.WithValue(ctx, firstEventHookKey{}, fn)
+}
+
+func firstEventHookFrom(ctx context.Context) func() {
+	fn, _ := ctx.Value(firstEventHookKey{}).(func())
+	return fn
+}
+
 var _ RateFeedback = (*sched.Pool)(nil)

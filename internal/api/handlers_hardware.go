@@ -113,10 +113,15 @@ func (s *Server) detectHardwareWith(ctx context.Context, fresh bool) (hwdetect.H
 
 // ---- hardware.last (ext-step1, .claude/ext-brief.md §2) ----
 
-// kvHardwareLast keeps the last hardware detection across restarts, so the
-// diagnostics know whether this computer has an NVIDIA GPU without running
-// anything (split so the error-code scan does not take it for a code).
-const kvHardwareLast = "hardware" + ".last"
+// KVHardwareLast keeps the last hardware detection across restarts, so the
+// diagnostics (and the resource bar, cmd/lectureflow/nvidia.go) know
+// whether this computer has an NVIDIA GPU without running anything (split
+// so the error-code scan does not take it for a code). The only definition
+// of the key (r4 D10): cmd reads it from here.
+const KVHardwareLast = "hardware" + ".last"
+
+// kvHardwareLast is KVHardwareLast under the package's older name.
+const kvHardwareLast = KVHardwareLast
 
 // HardwareLast is the JSON of kv hardware.last: what the diagnostics page
 // needs to pick its checks, never a serial number or another identifier.

@@ -68,6 +68,13 @@ type Options struct {
 	// CredentialSweep how often that is checked (default 1 min).
 	FailedCredentialTTL time.Duration
 	CredentialSweep     time.Duration
+	// SpaceInterval is how often a running download looks at the free
+	// space and at the size of the task's directory (default
+	// DefaultSpaceInterval); MaxTaskBytes the most a task's files may hold
+	// (default DefaultMaxTaskBytes; <0 = no limit). AUD3 low-2,
+	// disklimit.go.
+	SpaceInterval time.Duration
+	MaxTaskBytes  int64
 
 	// allowLoopback lets downloads reach this computer (local.go): the
 	// tests' media servers listen on 127.0.0.1. Only this package's tests
@@ -118,6 +125,12 @@ func New(o Options) *Queue {
 	}
 	if o.MinFree == 0 {
 		o.MinFree = 2 << 30
+	}
+	if o.SpaceInterval <= 0 {
+		o.SpaceInterval = DefaultSpaceInterval
+	}
+	if o.MaxTaskBytes == 0 {
+		o.MaxTaskBytes = DefaultMaxTaskBytes
 	}
 	if o.FailedCredentialTTL <= 0 {
 		o.FailedCredentialTTL = DefaultFailedCredentialTTL
@@ -500,6 +513,10 @@ type failure struct {
 	code    string
 	params  map[string]any
 	detail  string // for 查看详情 and the log; never a URL with its query
+	// discard: every file of the task goes with the failure, and its
+	// progress (disklimit.go: too large); discardAfter removes them before
+	// the runner saves the task.
+	discard bool
 }
 
 func (f *failure) Error() string {
@@ -756,13 +773,19 @@ func (q *Queue) run(ctx context.Context, t *task, snap runSnapshot) {
 		delete(q.tasks, id)
 	default:
 		f := asFailure(err)
-		if f.code == CodeNoSpace && f.params == nil {
-			free, _ := q.o.FreeSpace(q.o.DataDir)
-			f.params = map[string]any{"free_bytes": free, "keep_bytes": max(q.o.MinFree, 0)}
+		if f.discard {
+			// its files went (discardAfter): so does the progress they held
+			t.prog = nil
+			t.rec.BytesDone, t.rec.BytesTotal = 0, -1
 		}
+		q.fillNoSpace(f)
 		state := bridge.StateFailed
 		if f.refresh {
 			state = bridge.StateNeedsRefresh
+			t.forget()
+		} else if !Retryable(f.code) {
+			// no retry is offered (failedRetry): nothing to keep the
+			// credentials for; the task stays in memory for its detail
 			t.forget()
 		} else if t.hasCreds() {
 			t.failedAt = q.o.Now() // kept for a retry, at most FailedCredentialTTL
@@ -811,23 +834,11 @@ func (q *Queue) progress(t *task, i int, done, total int64) {
 
 // ---------- the HTTP layer ----------
 
-func allowedActions(state string) []string {
-	switch state {
-	case bridge.StateQueued, bridge.StateDownloading, bridge.StateMerging, bridge.StateNeedsRefresh:
-		return []string{ActionCancel}
-	case bridge.StateFailed:
-		return []string{ActionRetry, ActionRemove}
-	case bridge.StateDone, bridge.StateCancelled:
-		return []string{ActionRemove}
-	}
-	return []string{} // importing: a few seconds, nothing to do
-}
-
 func (q *Queue) infoLocked(rec db.DownloadTask, t *task) TaskInfo {
 	info := TaskInfo{
 		ID: rec.ID, Platform: rec.Platform, SessionID: rec.SessionID, CourseID: rec.CourseID, Title: rec.Title,
 		State: rec.State, BytesDone: rec.BytesDone, BytesTotal: rec.BytesTotal, OverrideDisabled: rec.OverrideDisabled,
-		AllowedActions: allowedActions(rec.State), CreatedAt: rec.CreatedAt, UpdatedAt: rec.UpdatedAt, Tracks: []TrackInfo{},
+		AllowedActions: AllowedActions(rec.State, rec.ErrorCode), CreatedAt: rec.CreatedAt, UpdatedAt: rec.UpdatedAt, Tracks: []TrackInfo{},
 	}
 	if rec.RecordedAt != nil {
 		info.RecordedAt = *rec.RecordedAt
@@ -965,6 +976,8 @@ func (q *Queue) Cancel(ctx context.Context, id int64) (TaskInfo, error) {
 // or with every track already downloaded, it waits for a slot; otherwise
 // (the app restarted since) it becomes needs_refresh. A needs_refresh task
 // answers CodeNeedsRefresh: only the extension can bring new credentials.
+// A failure a retry cannot fix (Retryable) answers its own code, 409 (the
+// task offers remove only).
 func (q *Queue) Retry(ctx context.Context, id int64) (TaskInfo, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -974,6 +987,11 @@ func (q *Queue) Retry(ctx context.Context, id int64) (TaskInfo, error) {
 	}
 	switch t.rec.State {
 	case bridge.StateFailed:
+		if !Retryable(t.rec.ErrorCode) {
+			// the same failure again (failedRetry): its own reason, 409
+			info := errorInfo(t.rec, "")
+			return TaskInfo{}, model.Errorf(info.Code, info.Params, ErrConflict)
+		}
 	case bridge.StateNeedsRefresh:
 		return TaskInfo{}, codedConflict(CodeNeedsRefresh, "")
 	default:

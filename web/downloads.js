@@ -146,6 +146,31 @@ function fraction(d) {
   return d.state === 'downloading' ? null : 0;
 }
 
+// Why a task failed or needs a refresh (Download.error). When the lecture
+// import refused the fetched file itself (an upload.media_* code,
+// fetch.RefusedFile: empty, a web page, a playlist, a refused format) the
+// task has its own texts: the upload's say to upload another file.
+function reasonText(info) {
+  return refusedText(info) || U.errorInfoText(info, '');
+}
+
+// The task's own text of a refused file ({code, params}: an ErrorInfo or an
+// ApiError), '' for any other code.
+function refusedText(info) {
+  const p = (info && info.params) || {};
+  switch (info && info.code) {
+    case 'upload.media_empty':
+      return t('downloads.refused.empty');
+    case 'upload.media_html':
+      return t('downloads.refused.html');
+    case 'upload.media_playlist':
+      return t('downloads.refused.playlist', { kind: p.kind ?? '?' });
+    case 'upload.media_format':
+      return t('downloads.refused.format', { format: p.format ?? '?' });
+  }
+  return '';
+}
+
 const hasBar = (d) => d.state !== 'failed' && d.state !== 'cancelled';
 
 function setBar(bar, d) {
@@ -231,7 +256,7 @@ export function downloadsSlot({ ctx, courseId, onFinished }) {
     const title = d.title || t('downloads.untitled');
     const meta = [d.recorded_at ? U.fmtDayShort(d.recorded_at, true) : '', U.listJoin((d.tracks || []).map(trackName).filter(Boolean))].filter(Boolean);
     const tone = stateTone(d.state);
-    const bar = hasBar(d) ? h('progress', { class: 'up-progress', max: '1' }) : null;
+    const bar = hasBar(d) ? h('progress', { class: 'up-progress', max: '1', 'aria-label': title }) : null; // named by the task (L16)
     setBar(bar, d);
     return h(
       'li',
@@ -246,7 +271,7 @@ export function downloadsSlot({ ctx, courseId, onFinished }) {
 
   // the second line of a task that waits for the user
   function note(d) {
-    const reason = U.errorInfoText(d.error, '');
+    const reason = reasonText(d.error);
     if (d.state === 'needs_refresh') {
       const hint = t('downloads.needs_refresh.hint');
       // the queue's reasons already end with the same instruction: say it once
@@ -275,6 +300,8 @@ export function downloadsSlot({ ctx, courseId, onFinished }) {
     const acts = Array.isArray(d.allowed_actions) ? d.allowed_actions : [];
     const off = busy.has(d.id);
     const out = [];
+    // the buttons are the task's allowed_actions and nothing else: a failure
+    // a retry cannot fix offers remove only (internal/fetch failedRetry)
     if (acts.includes('retry')) out.push(btn(t('downloads.action.retry'), { size: 'sm', kind: 'primary', icon: 'rotate-cw', disabled: off, fkey: `dl:${d.id}:retry`, onclick: () => act(d, 'retry') }));
     if (acts.includes('cancel')) out.push(btn(t('downloads.action.cancel'), { size: 'sm', disabled: off, fkey: `dl:${d.id}:cancel`, onclick: () => act(d, 'cancel') }));
     if (acts.includes('remove')) out.push(btn(t('common.remove'), { size: 'sm', disabled: off, fkey: `dl:${d.id}:remove`, onclick: () => act(d, 'remove') }));
@@ -305,7 +332,9 @@ export function downloadsSlot({ ctx, courseId, onFinished }) {
         if (alive && res && res.id === d.id) items = items.map((x) => (x.id === d.id ? res : x));
       }
     } catch (e) {
-      if (alive) toast(e.message, 'error');
+      // a retry no longer offered (the row was out of date) answers the
+      // task's own reason (409): a refused file's in the row's words
+      if (alive) toast(refusedText(e) || e.message, 'error');
     } finally {
       busy.delete(d.id);
       if (alive) {

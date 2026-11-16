@@ -238,6 +238,20 @@ func finalFailure(st api.StageView) bool {
 	return st.Status == model.StatusFailed && st.WaitingFor == nil
 }
 
+// failedLecture: Course.failed_count counts it (v3.2.x r7, T24 S2) — a
+// launched lecture with a stage that failed for good, at any time.
+func failedLecture(l *api.Lecture) bool {
+	if l.Draft {
+		return false
+	}
+	for _, st := range l.Stages {
+		if finalFailure(st) {
+			return true
+		}
+	}
+	return false
+}
+
 func containsStr(xs []string, s string) bool {
 	for _, x := range xs {
 		if x == s {

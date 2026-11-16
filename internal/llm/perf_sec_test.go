@@ -224,6 +224,13 @@ func TestRedirectsKeepTheKeyOnItsHost(t *testing.T) {
 		{"https://api.deepseek.com/x", "https://api.deepseek.com:8443/x", false},
 		{"https://api.deepseek.com:443/x", "https://api.deepseek.com/x", true},
 		{"https://api.deepseek.com/x", "https://deepseek.com/x", false},
+		// SEC10: hosts by db.HostKey's rule, as the key's bound origin
+		{"https://api.lmσ.example/x", "https://api.lmς.example/x", false}, // sigma / final sigma: EqualFold's pair, two hosts
+		{"https://api.lmς.example/x", "https://api.lm%CF%83.example/x", false},
+		{"https://api.lmσ.example/x", "https://api.lm%CF%83.example:443/y", true}, // the same bytes
+		{"https://api.vİdeo.example/x", "https://api.video.example/x", false},     // U+0130
+		{"https://api.Key.example/x", "https://api.key.example/x", false},         // U+212A: the same host after IDNA; hardening
+		{"https://API.Key.EXAMPLE/x", "https://api.key.example/y", true},
 	} {
 		if got := sameOrigin(u(tc.from), u(tc.to)); got != tc.want {
 			t.Errorf("sameOrigin(%s, %s) = %v", tc.from, tc.to, got)

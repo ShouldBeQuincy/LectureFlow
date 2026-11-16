@@ -23,6 +23,16 @@ const DBName = "lectureflow.db"
 // dbSidecars are the files SQLite keeps next to the database.
 var dbSidecars = []string{"-wal", "-shm", "-journal"}
 
+// BeforeRollbackName is the database as it was when a rollback of an
+// in-app update put the update's snapshot back: the desktop shell copies
+// the database files to this name (with -wal and -shm after it) in the
+// data directory and keeps one generation
+// (desktop/src/main/selfupdate.js _restoreDb, DB_BEFORE_ROLLBACK_NAME).
+// LectureFlow never opens it; it holds the credentials the database held,
+// so the one a move leaves in the old directory is scrubbed with the old
+// database (ScrubOldDataDir). A move copies it like any other file.
+const BeforeRollbackName = DBName + ".lf-before-rollback"
+
 // dsn builds the connection string of path; readOnly opens it with
 // mode=ro (the source may be in use by another LectureFlow instance).
 func dsn(path string, readOnly bool) (string, error) {

@@ -81,7 +81,7 @@ function marks(w) {
 function cleanEnv() {
   const env = { ...process.env };
   for (const k of Object.keys(env)) {
-    if (/^(LECTUREFLOW_|FAKE_|ELECTRON_RUN_AS_NODE$)/i.test(k)) delete env[k];
+    if (/^(LECTUREFLOW_|FAKE_|ELECTRON_RUN_AS_NODE$)|_API_KEY$/i.test(k)) delete env[k];
   }
   return env;
 }

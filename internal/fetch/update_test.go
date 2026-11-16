@@ -191,6 +191,37 @@ func TestUpdateDownloaderCancelAndResume(t *testing.T) {
 	}
 }
 
+// SEC19 info-5: the update's session lets a host be on this computer or
+// the local network only when its URL is one of the user's own sources
+// (DownloadRequest.UserURLs); any other URL of the update (GitHub,
+// update.json's) is judged like a recording's, so a public name that
+// resolves here, or an official URL pointed at this computer, is refused.
+func TestUpdateTrustsOnlyTheUsersSources(t *testing.T) {
+	e := newQEnv(t, func(o *Options) { o.allowLoopback = false }) // (the product's policy)
+	srv := newUpdateServer(t)
+	pkg := pattern(9, 20_000)
+	srv.files["/pkg.exe"] = pkg
+	mirror := srv.srv.URL + "/pkg.exe" // (on 127.0.0.1)
+	dl := e.q.UpdateDownloader()
+	path := updatePath(t)
+	if err := dl.Download(context.Background(), selfupdate.DownloadRequest{URLs: []string{mirror}, UserURLs: []string{mirror},
+		Path: path, Size: int64(len(pkg))}); err != nil {
+		t.Fatalf("the user's mirror on this computer: %v", err)
+	}
+	if !bytes.Equal(readAll(t, path), pkg) {
+		t.Fatal("the file differs")
+	}
+	before := len(srv.headers())
+	other := filepath.Join(filepath.Dir(updatePath(t)), "other.exe.part")
+	err := dl.Download(context.Background(), selfupdate.DownloadRequest{URLs: []string{mirror}, Path: other, Size: int64(len(pkg))})
+	if err == nil || !strings.Contains(err.Error(), "this computer") {
+		t.Fatalf("a URL that is not the user's, on this computer: %v", err)
+	}
+	if n := len(srv.headers()); n != before {
+		t.Errorf("the server was asked %d times", n-before)
+	}
+}
+
 // aria2c missing: the update still downloads, over net/http; a file that
 // cannot be written is a local error (selfupdate.io_failed).
 func TestUpdateDownloaderFallbackAndLocalError(t *testing.T) {

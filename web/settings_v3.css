@@ -305,3 +305,97 @@
 /* device list: the colab:remote row */
 .dev-remote { display: flex; flex-direction: column; gap: 6px; }
 .dev-remote .set-note { margin: 0; }
+/* v3.2.x: a lecture retrying in place (in place of its frozen progress) */
+.rc-sub.rc-reconnect { display: inline-flex; align-items: center; gap: 4px; color: color-mix(in srgb, var(--warn) 85%, var(--text-1)); }
+.rc-sub.rc-reconnect > .icon { flex: none; }
+/* ssh-1b: Settings → 远程服务器 — the server cards and the "add a server"
+   wizard (steps in a row that wraps on narrow screens; commands in the
+   Colab section's code boxes) */
+.rs-form { display: flex; flex-direction: column; gap: 12px; }
+.rs-list { display: flex; flex-direction: column; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.rs-card { display: flex; flex-direction: column; gap: 6px; padding: 12px; border: 1px solid var(--border-1); border-radius: var(--r-lg); background: var(--bg-content); min-width: 0; }
+.rs-card.is-paused { background: var(--bg-sunken); }
+.rs-card-hd { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; min-width: 0; }
+.rs-card-hd > .icon { flex: none; color: var(--accent-text); }
+.rs-name { font-weight: 650; font-size: var(--fs-md); min-width: 0; overflow-wrap: anywhere; }
+.rs-sub { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: var(--fs-sm); color: var(--text-2); min-width: 0; }
+.rs-sub .mono { overflow-wrap: anywhere; }
+.rs-facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 200px), 1fr)); gap: 4px 16px; min-width: 0; }
+.rs-fact { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.rs-fact-k { font-size: var(--fs-xs); color: var(--text-3); }
+.rs-fact-v { font-size: var(--fs-sm); color: var(--text-1); overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.rs-actions { gap: 6px; margin-top: 2px; }
+.rs-card .set-note { margin: 0; }
+.rs-progress { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.rs-progress-top { display: flex; justify-content: space-between; gap: 8px; font-size: var(--fs-sm); color: var(--text-2); }
+.rs-progress-p { font-variant-numeric: tabular-nums; color: var(--text-1); }
+.rs-wiz { display: flex; flex-direction: column; gap: 10px; padding: 12px; border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border-1)); border-radius: var(--r-lg); background: var(--bg-content); min-width: 0; }
+.rs-wiz-hd { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+.rs-wiz-hd .colab-sub { margin: 0; overflow-wrap: anywhere; }
+.rs-steps { display: flex; flex-wrap: wrap; gap: 4px 6px; margin: 0; padding: 0; list-style: none; }
+.rs-step { display: flex; align-items: center; gap: 5px; padding: 2px 8px 2px 3px; border-radius: 999px; font-size: var(--fs-xs); color: var(--text-3); background: var(--bg-sunken); }
+.rs-step-n { display: grid; place-items: center; width: 18px; height: 18px; border-radius: 50%; background: var(--bg-content); font-variant-numeric: tabular-nums; }
+.rs-step.is-done { color: var(--text-2); }
+.rs-step.is-done .rs-step-n { background: var(--ok-soft); color: var(--ok); }
+.rs-step.is-current { color: var(--accent-text); background: var(--accent-soft); font-weight: 600; }
+.rs-step.is-current .rs-step-n { background: var(--accent); color: #fff; }
+.rs-wiz-bd { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.rs-wiz-bd .set-intro { margin: 0; max-width: 72ch; }
+.rs-wiz-bd .set-note { margin: 0; }
+.rs-wiz-title { margin: 0; font-size: var(--fs-md); font-weight: 650; }
+.rs-wiz-foot { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.rs-wiz-actions { justify-content: flex-end; gap: 6px; }
+.rs-fields { display: flex; flex-direction: column; max-width: 520px; }
+.rs-fields-row { display: grid; grid-template-columns: minmax(0, 1fr) 7.5em; gap: 0 10px; align-items: start; }
+.rs-fields .dlg-field { margin-bottom: 10px; }
+.rs-os-hint { margin: 2px 0 0; font-size: var(--fs-sm); color: var(--text-2); max-width: 72ch; }
+.rs-cmd { margin-top: 0; }
+.rs-fpbox { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; padding: 10px 12px; border-radius: var(--r-md); background: var(--bg-sunken); min-width: 0; }
+.rs-fp-big { font-size: var(--fs-md); font-weight: 600; overflow-wrap: anywhere; user-select: all; }
+/* SEC7 M1: a confirmed host key that changed — the warning, both fingerprints side by side */
+.rs-keychange {
+  display: flex; gap: 10px; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--err) 40%, var(--border-1));
+  border-left-width: 4px; border-left-color: var(--err); border-radius: var(--r-md); background: var(--err-soft); color: var(--text-1);
+}
+.rs-keychange:focus-visible { outline: 2px solid var(--err); outline-offset: 2px; }
+.rs-keychange > .icon { flex: none; margin-top: 2px; color: var(--err); }
+.rs-keychange-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; line-height: 1.55; }
+.rs-keychange-text p { margin: 0; max-width: 72ch; font-size: var(--fs-sm); }
+.rs-fpcmp { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 0; }
+.rs-fpcmp-row { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: var(--r-md); background: var(--bg-sunken); min-width: 0; }
+.rs-fpcmp-row.is-new { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--err) 45%, transparent); }
+.rs-fpcmp-k { font-size: var(--fs-sm); color: var(--text-2); }
+.rs-fpcmp-v { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin: 0; min-width: 0; }
+.rs-fpcmp-row.is-old .rs-fp-big { color: var(--text-2); }
+.rs-keycheck { padding: 8px 0; font-weight: 600; }
+.rs-model { display: flex; flex-direction: column; gap: 4px; }
+.rs-rec { display: inline-flex; align-items: center; gap: 6px; }
+.rs-choices { display: flex; flex-direction: column; gap: 6px; max-width: 640px; }
+.rs-choice { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border: 1px solid var(--border-1); border-radius: var(--r-md); cursor: pointer; }
+.rs-choice input { margin-top: 3px; accent-color: var(--accent); flex: none; }
+.rs-choice.is-sel { border-color: var(--accent); background: var(--bg-selected); }
+.rs-choice-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.rs-remove { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+.rs-remove .rs-cmd-text { display: block; padding: 6px 10px; border: 1px solid var(--border-1); border-radius: var(--r-md); background: var(--bg-sunken); font-size: var(--fs-xs); overflow-wrap: anywhere; user-select: all; }
+.rs-check { display: flex; align-items: flex-start; gap: 8px; font-size: var(--fs-sm); }
+.rs-check input { margin-top: 3px; accent-color: var(--accent); }
+.rs-edit-hint { margin: -4px 0 12px; }
+@media (max-width: 560px) {
+  .rs-fields-row { grid-template-columns: minmax(0, 1fr); }
+  .rs-fpcmp { grid-template-columns: minmax(0, 1fr); }
+  .rs-wiz-actions { justify-content: stretch; }
+  .rs-wiz-actions .btn { flex: 1 1 auto; }
+}
+/* the device list: an SSH server's row */
+.dev-ssh { display: flex; flex-direction: column; gap: 6px; }
+.dev-ssh .set-note { margin: 0; }
+/* the resource panel: the SSH servers (one card each; not connected: one line) */
+.insp-ssh .ssh-card + .ssh-card, .insp-ssh .ssh-card + .ssh-line, .insp-ssh .ssh-line + .ssh-card { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-1); }
+.insp-ssh .ssh-line { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 4px 0; }
+.insp-ssh .ssh-line .rc-line-t { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.insp-ssh .ssh-line .chip { flex: none; }
+/* the diagnostics: a group per SSH server with its "test connection" */
+.sys-remote .card-hd { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.sys-remote-test { margin-left: auto; }
+/* the section title stays on one line next to "添加服务器" in a narrow window */
+#set-remote .card-title > span { white-space: nowrap; }

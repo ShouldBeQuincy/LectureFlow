@@ -9,6 +9,12 @@ package sshremote
 // key, so a plain key is never written). The API hands out only the public
 // key, as an authorized_keys line with "restrict" (no forwarding, no PTY,
 // no ~/.ssh/rc) and its fingerprint.
+//
+// sec3 L3: the key is sealed bound to its server (secrets.SealFor with the
+// database's kv purpose and the row KVKeyPrefix + server id, the binding
+// db.SealSecrets also gives it), and opened only for the server that uses
+// it: a key_ref pointing at another server's row, or a ciphertext copied
+// into this server's row, does not open.
 
 import (
 	"context"
@@ -17,10 +23,12 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"golang.org/x/crypto/ssh"
 
+	"lectureflow/internal/db"
 	"lectureflow/internal/secrets"
 )
 
@@ -31,9 +39,13 @@ const KVKeyPrefix = "remote.ssh.key."
 // private key can be stored or read.
 var ErrNoDataKey = errors.New("sshremote: the credential store is not available")
 
-// newKey generates a key pair and returns the sealed private key and the
-// public key's authorized_keys line ("restrict ssh-ed25519 AAAA… comment").
-func newKey(comment string) (sealed, authorized string, err error) {
+// KeyRef is the kv row of a server's sealed private key.
+func KeyRef(serverID string) string { return KVKeyPrefix + serverID }
+
+// newKey generates a key pair and returns the private key sealed for the
+// kv row ref and the public key's authorized_keys line ("restrict
+// ssh-ed25519 AAAA… comment").
+func newKey(comment, ref string) (sealed, authorized string, err error) {
 	if !secrets.HasKey() {
 		return "", "", ErrNoDataKey
 	}
@@ -45,7 +57,7 @@ func newKey(comment string) (sealed, authorized string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	sealed, err = secrets.Seal(pem.EncodeToMemory(block))
+	sealed, err = secrets.SealFor(db.SealPurposeKV, ref, pem.EncodeToMemory(block))
 	if err != nil {
 		return "", "", err
 	}
@@ -62,13 +74,31 @@ func authorizedLine(pub ssh.PublicKey, comment string) string {
 	return "restrict " + line + " " + comment
 }
 
-// openKey opens a sealed private key as a signer.
-func openKey(sealed string) (ssh.Signer, error) {
+// publicKeyLineRe is exactly what authorizedLine makes for a server:
+// "restrict", the ed25519 key and the comment "lectureflow-<slug>", single
+// spaces, nothing else.
+var publicKeyLineRe = regexp.MustCompile(`^restrict ssh-ed25519 [A-Za-z0-9+/]+={0,2} lectureflow-[a-z0-9-]{1,32}$`)
+
+// checkPublicKeyLine refuses a stored public key line that is not one
+// authorizedLine made (SEC7 L2). The line goes between quotes into the
+// commands the user pastes into a shell on the server (PublicKeyOf); only
+// Add writes it, but it is read back from the database, so no quoting is
+// relied on: a line with anything else in it gets no command.
+func checkPublicKeyLine(line string) error {
+	if !publicKeyLineRe.MatchString(line) || PublicFingerprint(line) == "" {
+		return &FieldError{Field: "public_key"}
+	}
+	return nil
+}
+
+// openKey opens a private key sealed for the kv row ref as a signer.
+func openKey(ref, sealed string) (ssh.Signer, error) {
 	if !secrets.HasKey() {
 		return nil, ErrNoDataKey
 	}
-	// OpenAny: a value sealed with an earlier key (not re-sealed yet) opens too.
-	b, _, err := secrets.OpenAny(sealed)
+	// OpenAnyFor: a value sealed with an earlier key, or 3.2.0's unbound
+	// format (not sealed again yet), opens too.
+	b, _, err := secrets.OpenAnyFor(db.SealPurposeKV, ref, sealed)
 	if err != nil {
 		return nil, err
 	}
@@ -85,8 +115,9 @@ type keyStore interface {
 	SetKV(ctx context.Context, key, value string) error
 }
 
-// loadSigner reads and opens a server's key.
-func loadSigner(ctx context.Context, st keyStore, ref string) (ssh.Signer, error) {
+// loadSigner reads a server's key from the kv row ref (its key_ref) and
+// opens it for that server: the key must be sealed for KeyRef(serverID).
+func loadSigner(ctx context.Context, st keyStore, serverID, ref string) (ssh.Signer, error) {
 	v, ok, err := st.GetKV(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -97,7 +128,7 @@ func loadSigner(ctx context.Context, st keyStore, ref string) (ssh.Signer, error
 	if !secrets.IsSealed(v) {
 		return nil, fmt.Errorf("sshremote: the key %s is not sealed", ref)
 	}
-	return openKey(v)
+	return openKey(KeyRef(serverID), v)
 }
 
 // PublicFingerprint is the SHA256 fingerprint of an authorized_keys line.

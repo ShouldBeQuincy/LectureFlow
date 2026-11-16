@@ -1111,15 +1111,30 @@ func TestDevicesVRAMCalibrationPerCard(t *testing.T) {
 	cuda, igpu := devRow(model.DeviceCUDA0, 300, 1), devRow(model.DeviceOVGPU, 200, 1)
 	cuda.Model, cuda.Precision = "large-v2", model.PrecisionFloat16
 	de = newDevEnv(t, []model.ASRDevice{cuda, igpu}, nil)
+	// Not fixed sleeps (under load the CUDA run could see no VRAM sample, or
+	// the two runs not overlap): the CUDA run lasts until it was sampled and
+	// the other run has started; the other run lasts until the CUDA run ended.
+	otherStarted, cudaDone := make(chan struct{}), make(chan struct{})
 	de.asr.hook = func(ctx context.Context, id, dev string) error {
 		if dev == model.DeviceCUDA0 {
+			defer close(cudaDone)
 			de.gpu.set(14000, 24000, 7000) // +6000 MB over the 1000 MB baseline
-			time.Sleep(80 * time.Millisecond)
+			err := de.waitSampledPeak(id, 6000)
+			select {
+			case <-otherStarted:
+			case <-ctx.Done():
+				err = ctx.Err()
+			}
 			de.gpu.set(20000, 24000, 1000)
-			return nil
+			return err
 		}
-		time.Sleep(120 * time.Millisecond) // overlaps the CUDA run on another device
-		return nil
+		close(otherStarted)
+		select { // overlaps the CUDA run on another device
+		case <-cudaDone:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	l1, l2 := de.lectureOn(autoOn(cuda)), de.lectureOn(autoOn(cuda))
 	de.prepDone(l1, l2)

@@ -124,6 +124,16 @@ type ASRDeviceView struct {
 	Running         []DeviceTaskView `json:"running"` // never null
 	BatteryHold     bool             `json:"battery_hold"`
 	Options         DeviceOptions    `json:"options"`
+	// VRAMHint (GET /api/system only, cuda:0 only): the card's VRAM is
+	// too small for the device's model, or the model's files are missing
+	// and the card's recommendation is another model
+	// (NVIDIAVRAMHint: code system.devices.vram_low |
+	// system.devices.vram_model_missing; r6: system.devices.vram_low_missing |
+	// system.devices.vram_low_missing_install when the model the card is
+	// too small for is not installed either), or the scheduler's per-task
+	// estimate does not fit (WithVRAMQueue: system.devices.vram_queue_only,
+	// or params.extra of the others). Advice only; absent otherwise.
+	VRAMHint *model.ErrorInfo `json:"vram_hint,omitempty"`
 }
 
 // ASRDevicePatchInput is the body of PATCH /api/asr/devices/{id}: absent

@@ -20,16 +20,20 @@ type Runner func(ctx context.Context, name string, args ...string) (stdout, stde
 
 // Problem is why a file is refused as a lecture's media.
 type Problem struct {
-	// Kind is "playlist" (SniffPlaylist found a playlist) or "format"
-	// (ffmpeg would read it with a demuxer outside Demuxers).
+	// Kind is "empty" (the file has no bytes), "html" (SniffHTML: a web
+	// page, test-media I6), "playlist" (SniffPlaylist found a playlist) or
+	// "format" (ffmpeg would read it with a demuxer outside Demuxers).
 	Kind string
 	// Format is the playlist kind of SniffPlaylist, or the demuxer name
-	// ffprobe reported ("hls", "concat", …; "" when it did not say).
+	// ffprobe reported ("hls", "concat", …; "" when it did not say); ""
+	// for empty and html.
 	Format string
 }
 
 // Kinds of Problem.
 const (
+	ProblemEmpty    = "empty"
+	ProblemHTML     = "html"
 	ProblemPlaylist = "playlist"
 	ProblemFormat   = "format"
 )
@@ -93,18 +97,26 @@ func ProbeFormat(ctx context.Context, run Runner, ffprobe, path string) (format 
 	return format, !FormatAllowed(format), nil
 }
 
-// Check inspects a stored upload at path: a text playlist (SniffFile) is a
+// Check inspects a stored upload at path: an empty file is a ProblemEmpty,
+// an HTML page (SniffHTML) a ProblemHTML (test-media I6: refused when it
+// arrives, not when prep fails on it), a text playlist (SniffPlaylist) a
 // ProblemPlaylist; otherwise ffprobe (next to ffmpeg, FFprobeFor) runs with
 // InputArgs, and a demuxer outside Demuxers is a ProblemFormat. When
 // ffprobe cannot be found or cannot read the file, the file passes (nil,
 // nil): prep reports an unreadable file with its own message, and reads it
 // with InputArgs as well. err is only an I/O error reading path.
 func Check(ctx context.Context, run Runner, ffmpeg, path string) (*Problem, error) {
-	kind, err := SniffFile(path)
+	head, err := readHead(path)
 	if err != nil {
 		return nil, err
 	}
-	if kind != "" {
+	if len(head) == 0 {
+		return &Problem{Kind: ProblemEmpty}, nil
+	}
+	if SniffHTML(head) {
+		return &Problem{Kind: ProblemHTML}, nil
+	}
+	if kind := SniffPlaylist(head); kind != "" {
 		return &Problem{Kind: ProblemPlaylist, Format: kind}, nil
 	}
 	if run == nil {

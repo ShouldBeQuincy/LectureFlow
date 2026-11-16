@@ -78,11 +78,116 @@ const UUID_RE = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-
 // case and digits, 32+ characters: Kaltura KS tickets and JWTs can sit in
 // paths), 3 uuid, 4 hex, 5 letter-and-digit token, 6 digits, 7 a run of
 // 32+ letters (with - or _ at most; see lettersToken): a token with no
-// digit in it (security review L6).
+// digit in it (security review L6), 8 a shorter letter-and-digit run (10 to
+// 19 characters), 9 a run of 10 to 31 letters: both kept only when they
+// read as words and numbers (see wordish; FB1 L-3, SEC18 低-4 / 低-6).
 const SEGMENT_RE = new RegExp(
-  `(\\$[A-Za-z]*(?:%0\\d+d)?\\$)|((?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*[a-z])(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_-]))|(${UUID_RE})|((?<![0-9A-Za-z])[0-9a-fA-F]{16,}(?![0-9A-Za-z]))|((?<![0-9A-Za-z])(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{20,}(?![0-9A-Za-z]))|(\\d{5,})|((?<![A-Za-z0-9_-])[A-Za-z_-]{32,}(?![A-Za-z0-9_-]))`,
+  `(\\$[A-Za-z]*(?:%0\\d+d)?\\$)|((?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*[a-z])(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_-]))|(${UUID_RE})|((?<![0-9A-Za-z])[0-9a-fA-F]{16,}(?![0-9A-Za-z]))|((?<![0-9A-Za-z])(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{20,}(?![0-9A-Za-z]))|(\\d{5,})|((?<![A-Za-z0-9_-])[A-Za-z_-]{32,}(?![A-Za-z0-9_-]))|((?<![0-9A-Za-z])(?=[A-Za-z]*[0-9])(?=[0-9]*[A-Za-z])[A-Za-z0-9]{10,19}(?![0-9A-Za-z]))|((?<![0-9A-Za-z])[A-Za-z]{10,31}(?![0-9A-Za-z]))`,
   'g',
 );
+
+const isUpper = (c) => c >= 'A' && c <= 'Z';
+const isLower = (c) => c >= 'a' && c <= 'z';
+const isDigit = (c) => c >= '0' && c <= '9';
+
+/**
+ * Whether a run of letters and digits reads as words and numbers rather
+ * than a token (SEC18 低-6): it splits whole into
+ *   W  a word: [A-Z]?[a-z]{3,}                 ("Week", "lecture", "Audio")
+ *   A  an acronym: [A-Z]{2,5}                  ("CS", "AAC")
+ *   N  a number, with a unit from UNITS: \d+(unit)?  ("10", "1080p", "128k", "1920x")
+ *   S  a short code: [A-Za-z][a-z]?\d+(unit)?      ("Mp4", "H264", "Hz2ch"), at most one
+ * with at least one W — or only N ("1920x1080p30"). "Week10Lecture2",
+ * "Mp4Audio128k", "DeliveryInfo" read so; "Xk9pQ2mZ7vL4", "QwErTyUiOpAsDf",
+ * "ABCDEFGHIJKL", "CSC3631W10L2" do not. A random string is unlikely to
+ * split this way; when unsure, the run is masked.
+ */
+const UNITS = new Set(['x', 'p', 'i', 'k', 'm', 's', 'h', 'ch', 'hz', 'kb', 'mb', 'gb', 'ms', 'st', 'nd', 'rd', 'th']);
+export function wordish(run) {
+  const s = String(run);
+  const n = s.length;
+  if (n === 0 || n > 64) return false;
+  const span = (i, f) => {
+    let j = i;
+    while (j < n && f(s[j])) j++;
+    return j - i;
+  };
+  const memo = new Map();
+  const go = (i, word, codes, allNumbers) => {
+    if (codes > 1) return false;
+    if (i === n) return word || allNumbers;
+    const key = `${i}|${word}|${codes}|${allNumbers}`;
+    if (memo.has(key)) return memo.get(key);
+    const tries = [];
+    const up = isUpper(s[i]) ? 1 : 0;
+    for (let k = 3, L = span(i + up, isLower); k <= L; k++) tries.push([up + k, 'W']);
+    for (let k = 2, U = Math.min(5, span(i, isUpper)); k <= U; k++) tries.push([k, 'A']);
+    const unit = (j, k) => k === 0 || UNITS.has(s.slice(j, j + k));
+    const d = span(i, isDigit);
+    if (d) for (let k = 0, L = Math.min(2, span(i + d, isLower)); k <= L; k++) if (unit(i + d, k)) tries.push([d + k, 'N']);
+    if (isUpper(s[i]) || isLower(s[i])) {
+      for (const pre of [1, 2]) {
+        if (pre === 2 && !isLower(s[i + 1])) continue;
+        const dd = span(i + pre, isDigit);
+        if (!dd) continue;
+        for (let k = 0, L = Math.min(2, span(i + pre + dd, isLower)); k <= L; k++) if (unit(i + pre + dd, k)) tries.push([pre + dd + k, 'S']);
+      }
+    }
+    let ok = false;
+    for (const [len, kind] of tries) {
+      if (go(i + len, word || kind === 'W', codes + (kind === 'S' ? 1 : 0), allNumbers && kind === 'N')) {
+        ok = true;
+        break;
+      }
+    }
+    memo.set(key, ok);
+    return ok;
+  };
+  return go(0, false, 0, true);
+}
+
+// A piece of a run cut by "-", "_", "." or a percent escape that may stand
+// in a slug: words and numbers as above, a short word ("One", "of"), a
+// short acronym, a number, one or two letters with a number ("v2", "w123456789").
+function pieceOk(p) {
+  return wordish(p) || /^\d+$/.test(p) || /^[A-Z]?[a-z]{1,3}$/.test(p) || /^[A-Z]{1,5}$/.test(p) || /^[A-Za-z]{1,2}\d+$/.test(p);
+}
+
+// Letters and digits joined by "-", "_", "." or percent escapes
+// ("aB3dE-5gH7j-K9xQ2", "Xk9p%51Q2mZ7vL4"): a token cut into pieces too
+// short for the runs above (SEC18 低-4). Taken whole when it holds 12+
+// letters and digits and a piece that is not pieceOk; UUIDs are left to
+// SEGMENT_RE, a known file extension at the end stays.
+const SEP_RUN_RE = /(?<![A-Za-z0-9._%-])[A-Za-z0-9]+(?:(?:[._-]|%[0-9A-Fa-f]{2})[A-Za-z0-9]+)+(?![A-Za-z0-9._%-])/g;
+const SEP_SPLIT = /([._-]|%[0-9A-Fa-f]{2})/;
+
+// A language tag as BCP 47 writes it, in its canonical case: language (2–3
+// lower-case letters), optional extended language (3 lower-case), script
+// (4 letters, the first upper case) and region (2 upper-case letters or 3
+// digits): "en", "yue", "zh-Hans-CN", "es-419", "zh-cmn-Hans-CN". Anything
+// else in a language field — a name ("Li-Ming", "Bob"), an id, a tag
+// written in another case ("en-gb", "EN") — is reduced to its shape (FB1
+// L-3 DASH lang, SEC18 低-5).
+const LANG_TAG = /^[a-z]{2,3}(?:-[a-z]{3})?(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|\d{3}))?$/;
+
+/** A language tag kept as it is when it is one (LANG_TAG), its shape otherwise. */
+export function safeLanguage(tag) {
+  const s = String(tag ?? '');
+  return LANG_TAG.test(s) ? s : shape(s);
+}
+
+// A query parameter without a value ("?embed") stays only when it is one of
+// these common switches (compared in lower case); anything else — a token,
+// a key, a person's name ("?jsmith") — is replaced like a value (FB1 L-3,
+// SEC18 低-4).
+const FLAG_WORDS = new Set([
+  'embed', 'embedded', 'download', 'dl', 'autoplay', 'autostart', 'nocache', 'no-cache', 'nocookie', 'noredirect', 'raw',
+  'play', 'preview', 'mobile', 'desktop', 'html5', 'hls', 'dash', 'mp4', 'audio', 'video', 'live', 'hd', 'sd', 'fullscreen',
+  'debug', 'amp', 'print', 'inline', 'attachment', 'refresh', 'reload', 'json', 'xml', 'list', 'popup', 'iframe', 'loop', 'muted',
+]);
+function flagWord(name) {
+  return FLAG_WORDS.has(String(name).toLowerCase());
+}
 
 /**
  * Whether a 32+ run of letters (and - or _) is a token rather than words: no
@@ -206,6 +311,40 @@ export function createRedactor(opts = {}) {
         .join('');
     });
 
+  // A token cut by separators: the same shape, separators kept, a percent
+  // escape masked as "%00".
+  const fakeSepTok = (s) =>
+    counter(maps.tok, s, (n) => {
+      let id = String(n);
+      return s
+        .split(SEP_SPLIT)
+        .map((p, i) => {
+          if (i % 2 === 1) return p.startsWith('%') ? '%00' : p;
+          let mask = p.replace(/[A-Z]/g, 'A').replace(/[a-z]/g, 'a').replace(/[0-9]/g, '0');
+          if (id && mask.length >= id.length) {
+            mask = id + mask.slice(id.length);
+            id = '';
+          }
+          return mask;
+        })
+        .join('');
+    });
+
+  /** A run joined by separators (SEP_RUN_RE): its fake, or '' to leave it to SEGMENT_RE. */
+  function sepRun(m) {
+    if (new RegExp(UUID_RE).test(m)) return '';
+    let body = m;
+    let ext = '';
+    const dot = m.lastIndexOf('.');
+    if (dot > 0 && KNOWN_EXT.has(m.slice(dot + 1).toLowerCase())) {
+      body = m.slice(0, dot);
+      ext = m.slice(dot);
+    }
+    const pieces = body.split(SEP_SPLIT).filter((_, i) => i % 2 === 0);
+    if (pieces.join('').length < 12 || pieces.every(pieceOk)) return '';
+    return fakeSepTok(body) + ext;
+  }
+
   /** One path segment (still percent-encoded). */
   function segment(seg, prev = '') {
     if (EMAIL_LIKE.test(seg) || /@|%40/i.test(seg)) {
@@ -219,9 +358,14 @@ export function createRedactor(opts = {}) {
       if (!escapedToken(m)) return m;
       aside.push(fakeEscTok(m));
       return `\u0000${aside.length - 1}\u0000`;
+    }).replace(SEP_RUN_RE, (m) => {
+      const fake = sepRun(m);
+      if (!fake) return m;
+      aside.push(fake);
+      return `\u0000${aside.length - 1}\u0000`;
     });
     const out = work
-      .replace(SEGMENT_RE, (m, tpl, b64, uuid, hex, tok, num, letters) => {
+      .replace(SEGMENT_RE, (m, tpl, b64, uuid, hex, tok, num, letters, short, word) => {
         if (tpl) return tpl;
         if (b64) return fakeTok(b64);
         if (uuid) return upperIf(uuid, fakeUuid(uuid));
@@ -229,6 +373,9 @@ export function createRedactor(opts = {}) {
         if (tok) return fakeTok(tok);
         if (num) return fakeNum(num);
         if (letters) return lettersToken(letters) ? fakeTok(letters) : letters;
+        // not a token: its long digit runs are still ids ("w123456789")
+        if (short) return pieceOk(short) ? short.replace(/\d{5,}/g, fakeNum) : fakeTok(short);
+        if (word) return pieceOk(word) ? word : fakeTok(word);
         return m;
       })
       .replace(/\u0000(\d+)\u0000/g, (_, i) => aside[Number(i)]);
@@ -290,8 +437,8 @@ export function createRedactor(opts = {}) {
         }
         if (isIdentityField(name)) note('identity_field', `query parameter "${shapeName(name)}"`);
         if (/@|%40/.test(rawName)) note('email', 'query parameter name');
-        const safeName = segment(rawName);
-        return eq < 0 ? safeName : `${safeName}=${valuePlaceholder(p.slice(eq + 1))}`;
+        if (eq < 0) return flagWord(name) ? rawName : valuePlaceholder(rawName);
+        return `${segment(rawName)}=${valuePlaceholder(p.slice(eq + 1))}`;
       })
       .join('&');
   }
@@ -370,6 +517,7 @@ const HLS_SAFE_ATTRS = new Set([
 ]);
 const HLS_URI_ATTRS = new Set(['URI', 'SERVER-URI']);
 const HLS_HEX_ATTRS = new Set(['IV']);
+const HLS_LANG_ATTRS = new Set(['LANGUAGE', 'ASSOC-LANGUAGE']);
 const SAFE_VALUE = /^[A-Za-z0-9 .,:+\-_/=x]*$/;
 const HLS_ATTR_TAGS = new Set([
   '#EXT-X-STREAM-INF', '#EXT-X-I-FRAME-STREAM-INF', '#EXT-X-MEDIA', '#EXT-X-KEY', '#EXT-X-SESSION-KEY', '#EXT-X-MAP',
@@ -409,6 +557,7 @@ function redactHls(text, r) {
           let nv;
           if (HLS_URI_ATTRS.has(k)) nv = r.uriRef(v);
           else if (HLS_HEX_ATTRS.has(k)) nv = /^0x[0-9a-f]+$/i.test(v) ? '0x' + r.fakeHex(v.slice(2)) : r.shape(v);
+          else if (HLS_LANG_ATTRS.has(k)) nv = safeLanguage(v);
           else if (HLS_SAFE_ATTRS.has(k) && SAFE_VALUE.test(v)) nv = v;
           else {
             if (!HLS_SAFE_ATTRS.has(k) && !['NAME', 'VALUE', 'ID', 'CLASS'].includes(k) && isIdentityField(k)) {
@@ -481,6 +630,7 @@ function redactMpd(text, r) {
       let nv;
       if (MPD_URL_ATTRS.has(local)) nv = r.uriRef(v);
       else if (local === 'value') nv = mpdValue(v, r);
+      else if (local === 'lang') nv = safeLanguage(v);
       else if (MPD_ID_ATTRS.has(k) || MPD_ID_ATTRS.has(local)) nv = r.segment(v);
       else if ((MPD_SAFE_ATTRS.has(k) || MPD_SAFE_ATTRS.has(local)) && MPD_SAFE_VALUE.test(v)) nv = v;
       else if (/^(availabilityStartTime|publishTime|availabilityEndTime)$/.test(local)) nv = r.shape(v);

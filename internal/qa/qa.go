@@ -24,6 +24,11 @@ const (
 	CodeSymbolMax  = 0.3 // rule 3: target counts as code/formula at >= 30% code symbols
 	MinLengthRatio = 0.5 // rule 4
 	MaxLengthRatio = 4.0 // rule 4
+	// ShortTargetWords: for a target of at most this many English words
+	// (EnglishWords) rule 4 skips the lower bound and computes the upper
+	// bound for ShortTargetWords+1 words (MaxLengthRatio*(ShortTargetWords+1)
+	// characters). Amendment of SPEC §7.4 item 4.
+	ShortTargetWords = 3
 )
 
 // codeSymbols is the symbol set of rule 3 ("= ( ) { } ; 等符号").
@@ -90,10 +95,21 @@ func Failures(target, zh string, terms []model.Term) []Failure {
 		fails = append(fails, Failure{Code: CodeMostlyEnglish, Params: map[string]any{"percent": pct}})
 	}
 
-	// 4. length ratio
+	// 4. length ratio. For very short targets (at most ShortTargetWords
+	//    words: "Okay?" → "好的，明白了吗？" is a fine translation) the lower
+	//    bound is not checked (an empty zh is caught by rule 1) and the upper
+	//    bound is computed as if the target had ShortTargetWords+1 words, so
+	//    a one-word target expanded into a whole sentence still fails and the
+	//    limit is continuous at 3/4 words. The reported ratio uses the same
+	//    word count, so it is outside [min, max] exactly when the check fails.
+	//    User-approved amendment of SPEC §7.4 item 4 (NOTES.md).
 	if words := EnglishWords(target); words > 0 {
+		short := words <= ShortTargetWords
+		if short {
+			words = ShortTargetWords + 1
+		}
 		r := float64(ZhChars(zh)) / float64(words)
-		if r < MinLengthRatio || r > MaxLengthRatio {
+		if (!short && r < MinLengthRatio) || r > MaxLengthRatio {
 			// the ratio as the sentence has always written it (%.2f)
 			r2, _ := strconv.ParseFloat(fmt.Sprintf("%.2f", r), 64)
 			fails = append(fails, Failure{Code: CodeLengthRatio, Params: map[string]any{"ratio": r2, "min": MinLengthRatio, "max": MaxLengthRatio}})
@@ -168,7 +184,9 @@ func ZhChars(zh string) int {
 }
 
 // EnglishWords counts the whitespace-separated tokens of s that contain at
-// least one letter or digit.
+// least one letter or digit: pure-punctuation tokens ("—", "?") are not
+// words; contractions ("don't"), hyphenated words ("well-known") and numbers
+// ("42", "3.14") count as one word each.
 func EnglishWords(s string) int {
 	n := 0
 	for _, f := range strings.Fields(s) {

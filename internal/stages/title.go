@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"unicode/utf8"
 
 	"lectureflow/internal/calendar"
 	"lectureflow/internal/ctxbuild"
@@ -32,53 +33,69 @@ func RequestTitleForce(ctx context.Context, st db.Store, lectureID string) error
 	return st.SetKV(ctx, KVTitleForcePrefix+lectureID, "1")
 }
 
+// KVLegacyTitlePrefix: title_legacy:{lecture_id} = the lecture's title when
+// the database was upgraded to v2 phase 2 (test-upgrade F7). Before v2 the
+// upload form's title was stored without a source, and migration 006 gave
+// every such lecture title_source filename, so a title the user typed cannot
+// be told from one taken from the file name (the backfilled
+// original_filename is the title plus the media's extension in both cases).
+// While the lecture still has that title with source filename, the title
+// task treats it as possibly the user's and leaves it (legacyTitle). "" =
+// not set.
+const KVLegacyTitlePrefix = "title_legacy:"
+
+// MarkLegacyTitle records l's title as a pre-v2 title of unknown origin
+// (KVLegacyTitlePrefix) when its source is filename. It is meant for the
+// one-time original_filename backfill (cmd/lectureflow, P13.3.1), for each
+// lecture that has no original_filename yet, i.e. was created before v2
+// phase 2; new lectures always have one.
+func MarkLegacyTitle(ctx context.Context, st db.Store, l model.Lecture) error {
+	if titleSource(l.TitleSource) != model.TitleSourceFilename || strings.TrimSpace(l.Title) == "" {
+		return nil
+	}
+	return st.SetKV(ctx, KVLegacyTitlePrefix+l.ID, l.Title)
+}
+
+// legacyTitle reports whether l's title may be one a user typed before v2
+// (test-upgrade F7), so the title task must not replace it: the source is
+// filename and either the lecture has no original_filename (created before
+// v2 phase 2: every later lecture gets one at creation) or its title is
+// still the one recorded by MarkLegacyTitle. A title the program set since
+// (a filename rule's title) no longer matches the record and is replaced as
+// usual. Lectures created since v2 are never legacy.
+func legacyTitle(ctx context.Context, tx db.Store, l model.Lecture) (bool, error) {
+	if titleSource(l.TitleSource) != model.TitleSourceFilename || strings.TrimSpace(l.Title) == "" {
+		return false, nil
+	}
+	if l.OriginalFilename == "" {
+		return true, nil
+	}
+	v, ok, err := tx.GetKV(ctx, KVLegacyTitlePrefix+l.ID)
+	if err != nil {
+		return false, err
+	}
+	return ok && v != "" && v == l.Title, nil
+}
+
 // auxAttempts is the number of requests of an auxiliary task whose answer
 // is unparsable or fails its check: P7 "校验失败重试一次" (also used for the
 // title and filename_rule tasks).
 const auxAttempts = 2
 
-// retryProblems is a check error that lists its problems for the retry.
-type retryProblems interface{ Problems() []string }
-
-// askJSONRetry is askJSON with auxAttempts tries whose retry tells the
-// model why its answer was rejected (lead ruling after the phase 2
-// acceptance): the same system prompt and user message, followed by
-// ctxbuild.WithRetryFeedback with the problems of the rejection — the
-// error's Problems() when it has them (a retryProblems), else its text; an
-// unparsable answer gets ctxbuild.NotJSONProblem. last is the reason of the
-// last rejected answer; transport and context errors are returned at once
-// (unusable = false).
+// askJSONRetry is askJSON with auxAttempts tries (lead ruling after the
+// phase 2 acceptance: the retry tells the model why its answer was
+// rejected; askJSONTries, stages.go). When every answer was rejected,
+// unusable is true and err is the reason of the last one; transport and
+// context errors are returned at once (unusable = false).
 func askJSONRetry[T any](ctx context.Context, c llm.Client, role, system, user string, check func(*T) error) (v T, unusable bool, err error) {
-	var last error
-	u := user
-	reject := func(problems []string) { u = ctxbuild.WithRetryFeedback(user, problems) }
-	for range auxAttempts {
-		var a T
-		res, err := c.Complete(ctx, role, system, u, true)
-		if err != nil {
-			return a, false, err
-		}
-		if err := llm.ParseJSON(res.Text, &a); err != nil {
-			last = err
-			reject([]string{ctxbuild.NotJSONProblem(err.Error())})
-			continue
-		}
-		if check != nil {
-			if err := check(&a); err != nil {
-				last = err
-				var rp retryProblems
-				if errors.As(err, &rp) {
-					reject(rp.Problems())
-				} else {
-					reject([]string{err.Error()})
-				}
-				continue
-			}
-		}
-		return a, false, nil
+	v, last, err := askJSONTries(ctx, c, role, system, user, auxAttempts, check)
+	if err != nil {
+		return v, false, err
 	}
-	var zero T
-	return zero, true, last
+	if last != nil {
+		return v, true, last
+	}
+	return v, false, nil
 }
 
 // titleStage is the auxiliary task title (SPEC-v2 P13.5): a title and a
@@ -113,15 +130,39 @@ type titleAnswer struct {
 
 // titleRejected lists what an answer breaks of the P13.5 limits, the
 // titles' problems apart from the descriptions' (a failed task still writes
-// valid descriptions, see Run). The texts are English: they are the retry
-// feedback (askJSONRetry) and the job error's detail.
-type titleRejected struct{ titles, blurbs []string }
+// valid descriptions, see Run). Each problem has two English texts:
+//
+//   - the retry feedback (Problems, askJSONRetry), which quotes the
+//     offending value so that the model sees what it wrote;
+//   - the error text (Error): the field, the count, the limit and the rule,
+//     never the generated text. It becomes the job error's detail (shown
+//     under 查看详情) and the scheduler's "job failed" line of the service
+//     log, which goes into the diagnostics zip (R7 A-S4).
+type titleRejected struct{ titles, blurbs []rejectedField }
 
-func (e *titleRejected) Problems() []string {
-	return append(append([]string(nil), e.titles...), e.blurbs...)
+// rejectedField is one problem of a checked answer: feedback for the model,
+// summary for the error (see titleRejected).
+type rejectedField struct{ feedback, summary string }
+
+func (e *titleRejected) all() []rejectedField {
+	return append(append([]rejectedField(nil), e.titles...), e.blurbs...)
 }
 
-func (e *titleRejected) Error() string { return strings.Join(e.Problems(), "; ") }
+func (e *titleRejected) Problems() []string {
+	var out []string
+	for _, p := range e.all() {
+		out = append(out, p.feedback)
+	}
+	return out
+}
+
+func (e *titleRejected) Error() string {
+	var out []string
+	for _, p := range e.all() {
+		out = append(out, p.summary)
+	}
+	return strings.Join(out, "; ")
+}
 
 // checkTitleAnswer applies the limits of the P13.5 prompt; the error is a
 // *titleRejected naming every field that breaks them, with the counts.
@@ -133,20 +174,27 @@ func checkTitleAnswer(a *titleAnswer) error {
 	a.BlurbZh = oneLineTrim(a.BlurbZh)
 	a.Kind = looseString(strings.TrimSpace(string(a.Kind)))
 	var r titleRejected
-	words := func(list *[]string, field, v string, limit int) {
+	empty := func(field string) rejectedField {
+		return rejectedField{feedback: field + " is empty", summary: field + " is empty"}
+	}
+	words := func(list *[]rejectedField, field, v string, limit int) {
 		switch n := ctxbuild.EnglishWords(v); {
 		case v == "":
-			*list = append(*list, field+" is empty")
+			*list = append(*list, empty(field))
 		case n > limit:
-			*list = append(*list, fmt.Sprintf("%s has %d words; at most %d are allowed: %q", field, n, limit, v))
+			sum := fmt.Sprintf("%s has %d words; at most %d are allowed", field, n, limit)
+			*list = append(*list, rejectedField{feedback: fmt.Sprintf("%s: %q", sum, v), summary: sum})
 		}
 	}
-	zh := func(list *[]string, field, v string, limit int) {
+	zh := func(list *[]rejectedField, field, v string, limit int) {
 		switch n := ctxbuild.ZhLen(v); {
 		case v == "":
-			*list = append(*list, field+" is empty")
+			*list = append(*list, empty(field))
 		case n > limit:
-			*list = append(*list, fmt.Sprintf("%s has %d characters; at most %d are allowed (each Chinese character or punctuation mark counts as one, an English term as one): %q", field, n, limit, v))
+			sum := fmt.Sprintf("%s has %d characters; at most %d are allowed", field, n, limit)
+			*list = append(*list, rejectedField{
+				feedback: fmt.Sprintf("%s (each Chinese character or punctuation mark counts as one, an English term as one): %q", sum, v),
+				summary:  sum})
 		}
 	}
 	words(&r.titles, "title_en", a.TitleEn, ctxbuild.TitleWords)
@@ -184,7 +232,7 @@ func (s *titleStage) Run(ctx context.Context, lectureID string, progress func(fl
 		}
 		return err
 	}
-	a, unusable, err := askJSONRetry(ctx, d.LLM, s.role, req.System, req.User, check)
+	a, unusable, err := askJSONRetry(llm.WithJSONSchema(ctx, ctxbuild.SchemaTitle), d.LLM, s.role, req.System, req.User, check)
 	if err != nil {
 		if !unusable {
 			return err
@@ -209,7 +257,7 @@ func (s *titleStage) Run(ctx context.Context, lectureID string, progress func(fl
 			d.events().Changed("lecture", lectureID)
 			d.kindEvents(kw)
 		}
-		return model.Errorf("title.invalid_output", map[string]any{"attempts": auxAttempts}, err)
+		return model.Errorf("title.invalid_output", map[string]any{"attempts": auxAttempts}, withoutAnswerText(err))
 	}
 	progress(0.9)
 	kw, err := d.applyTitle(context.WithoutCancel(ctx), lectureID, a)
@@ -279,8 +327,10 @@ func (d Deps) titleInput(ctx context.Context, lectureID string) (ctxbuild.TitleI
 }
 
 // applyTitle writes the answer (P13.5 应用): the blurbs always; the titles
-// when title_source is filename or llm (not set by the user), or when the
-// user confirmed a regeneration (title_force) — then the source becomes llm;
+// when title_source is filename or llm (not set by the user) and the title
+// is not a pre-v2 one of unknown origin (legacyTitle, test-upgrade F7), or
+// when the user confirmed a regeneration (title_force) — then the source
+// becomes llm;
 // the kind as applyTitleKind decides. Reading title_source, kind_source and
 // the force flag in the same transaction as the write means an edit made by
 // the user while the request ran is kept.
@@ -307,8 +357,21 @@ func (d Deps) applyTitle(ctx context.Context, lectureID string, a titleAnswer) (
 		if kw, err = d.applyTitleKind(ctx, tx, lectureID, string(a.Kind)); err != nil {
 			return err
 		}
-		if titleSource(l.TitleSource) == model.TitleSourceUser && !force {
-			return nil
+		if !force {
+			if titleSource(l.TitleSource) == model.TitleSourceUser {
+				return nil
+			}
+			// a pre-v2 title that may be the user's (F7): kept like a user
+			// title, title_zh included (the Chinese title display shows
+			// title_zh in its place); 重新生成 (force) still replaces it
+			legacy, err := legacyTitle(ctx, tx, l)
+			if err != nil {
+				return err
+			}
+			if legacy {
+				slog.Info("title: kept a title from before v2 that may be the user's", "lecture", lectureID)
+				return nil
+			}
 		}
 		return tx.SetLectureTitles(ctx, lectureID, a.TitleEn, &a.TitleZh, model.TitleSourceLLM)
 	})
@@ -339,7 +402,9 @@ func (d Deps) applyTitleKind(ctx context.Context, tx db.Store, lectureID, kind s
 	}
 	id := cat.resolve(kind)
 	if id == "" {
-		slog.Info("title: kind not in the catalog, dropped", "lecture", lectureID, "kind", kind)
+		// the value comes from the model: logged cleaned and cut (R7 A-S4)
+		slog.Info("title: kind not in the catalog, dropped", "lecture", lectureID,
+			"kind", logKindValue(kind), "kind_len", utf8.RuneCountInString(kind))
 		return kindWrite{}, nil
 	}
 	l, err := tx.GetLecture(ctx, lectureID)
@@ -372,4 +437,32 @@ func (d Deps) applyTitleKind(ctx context.Context, tx db.Store, lectureID, kind s
 		}
 	}
 	return kw, nil
+}
+
+// logKindMax is the longest kind value logKindValue keeps, in runes.
+const logKindMax = 40
+
+// logKindFreeText stands in the service log for a kind answer that is not
+// shaped like an id.
+const logKindFreeText = "(not an id)"
+
+// logKindValue is a kind the model answered, for the service log. A catalog
+// id is short and plain, so a value of at most logKindMax runes made of ASCII
+// letters, digits, "_", "-" and "." only (a mistaken id such as "practical")
+// is logged as is; anything else (spaces, other scripts, control or
+// bidirectional characters, a long value) is free text the model wrote and
+// is replaced by logKindFreeText — the log line carries its length instead.
+func logKindValue(kind string) string {
+	if kind == "" {
+		return ""
+	}
+	n := 0
+	for _, r := range kind {
+		plain := r == '_' || r == '-' || r == '.' ||
+			('0' <= r && r <= '9') || ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z')
+		if n++; !plain || n > logKindMax {
+			return logKindFreeText
+		}
+	}
+	return kind
 }

@@ -6,6 +6,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"lectureflow/internal/components"
@@ -129,11 +130,10 @@ func (s *Server) useEnvKey(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, apiErr(http.StatusNotFound, "onboarding.env_key_missing", map[string]any{"provider_type": pp.ID, "env": env}))
 		return
 	}
-	norm := func(u string) string { return strings.ToLower(strings.TrimRight(strings.TrimSpace(u), "/")) }
 	var match *model.Provider
 	ps := s.set.Providers()
 	for i := range ps {
-		if norm(ps[i].BaseURL) == norm(pp.BaseURL) {
+		if samePresetBaseURL(ps[i].BaseURL, pp.BaseURL) {
 			match = &ps[i]
 			break
 		}
@@ -165,6 +165,40 @@ func (s *Server) useEnvKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.respondProvider(w, r, p, http.StatusCreated)
+}
+
+// samePresetBaseURL reports whether a provider's base_url is the preset's:
+// the same origin as the backend compares them (settings.SameOrigin, the
+// origin a sealed key is bound to: ASCII case and default ports only, a
+// host with a byte outside ASCII equals only itself) and the same path and
+// query (ASCII case, trailing slashes ignored). Unicode lower-casing would
+// let a look-alike host ("apİ…", U+0130) match the preset's while net/http
+// dials another (punycode) domain with the key (SEC9 new-low-2).
+func samePresetBaseURL(a, b string) bool {
+	if !settings.SameOrigin(a, b) {
+		return false
+	}
+	return baseURLRest(a) == baseURLRest(b)
+}
+
+// baseURLRest is the path and query of a base_url, trailing slashes
+// removed and ASCII letters lower-cased ("" when it does not parse: then
+// SameOrigin has compared the whole text already).
+func baseURLRest(s string) string {
+	u, err := url.Parse(strings.TrimSpace(s))
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	rest := strings.TrimRight(u.EscapedPath(), "/")
+	if u.RawQuery != "" || u.ForceQuery {
+		rest += "?" + u.RawQuery
+	}
+	return strings.Map(func(r rune) rune {
+		if 'A' <= r && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}, rest)
 }
 
 // freeProviderName is the name of a provider created from preset pp: the

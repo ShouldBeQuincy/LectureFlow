@@ -61,11 +61,12 @@ func (r *Registry) cudaName(ctx context.Context) (string, error) {
 }
 
 // nvidiaName is `nvidia-smi --query-gpu=name --format=csv,noheader`, first
-// non-empty line.
+// non-empty line. It runs in nvidia-smi's own directory, not the service's
+// current one (procutil.CommandInExeDir; SEC52 info-7).
 func nvidiaName(ctx context.Context, exe string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, cudaNameTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, exe, "--query-gpu=name", "--format=csv,noheader").Output()
+	out, err := procutil.CommandInExeDir(ctx, exe, "--query-gpu=name", "--format=csv,noheader").Output()
 	if err != nil {
 		return "", fmt.Errorf("nvidia-smi: %w", err)
 	}
@@ -106,7 +107,7 @@ func fakeProbe(withDevices bool) *OVProbe {
 	return p
 }
 
-// workerProbe runs `{python_openvino} {worker_dir}/asr_openvino.py --probe`.
+// workerProbe runs `{python_openvino} -s {worker_dir}/asr_openvino.py --probe`.
 // Errors are coded: CodeOVNotInstalled (no interpreter at all: the desktop
 // application without asr-openvino), CodeOVPythonMissing (the configured
 // interpreter does not exist), CodeOVImportFailed (exit 2: openvino cannot
@@ -120,7 +121,21 @@ func (r *Registry) workerProbe(ctx context.Context) (*OVProbe, error) {
 		return nil, model.Errorf(CodeOVPythonMissing, map[string]any{"path": py},
 			fmt.Errorf("python_openvino not found: %s", py))
 	}
+	// A path with a directory part is started by its absolute path, the
+	// file executableExists just found: the probe runs in the worker
+	// directory (below), where the system would look for a relative one
+	// (SEC52 info-1). A bare name stays a PATH look-up.
+	if filepath.Base(py) != py {
+		if abs, err := filepath.Abs(py); err == nil {
+			py = abs
+		}
+	}
 	script := filepath.Join(r.cfg.WorkerDir, "asr_openvino.py")
+	// absolute: the probe runs in the script's directory (below), so a
+	// relative path would no longer name it there
+	if abs, err := filepath.Abs(script); err == nil {
+		script = abs
+	}
 	if fi, err := os.Stat(script); err != nil || fi.IsDir() {
 		msg := "asr_openvino.py not found: " + script
 		return nil, model.Errorf(CodeProbeFailed, map[string]any{"error": msg}, errors.New(msg))
@@ -129,8 +144,17 @@ func (r *Registry) workerProbe(ctx context.Context) (*OVProbe, error) {
 	defer cancel()
 	defer r.trackPython(py)()
 	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, py, script, "--probe")
-	cmd.Env = pyenv.Environ() // no usage reporting (the probe imports openvino)
+	// -s and pyenv's environment: no PYTHONPATH and the like (pyenv
+	// "Isolation"), no usage reporting (the probe imports openvino)
+	cmd := exec.CommandContext(ctx, py, pyenv.ScriptArgs(script, "--probe")...)
+	// The worker directory (the application's own resources/worker, or the
+	// repository's worker/ in development), not the service's current
+	// directory: the Windows DLL search looks in the current directory when
+	// openvino loads its native libraries (SEC47 info-5, SEC50 info-2).
+	// sys.path is unaffected: in script mode it starts with this directory
+	// anyway, and -s with the filtered environment stays as it was.
+	cmd.Dir = filepath.Dir(script)
+	cmd.Env = pyenv.Environ()
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := procutil.Run(cmd, procutil.Tied) // ends with LectureFlow, also on a crash (test-chaos 1)
 	if err != nil {

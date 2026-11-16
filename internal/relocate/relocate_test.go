@@ -67,6 +67,13 @@ func jsonEsc(s string) string {
 	return string(b[1 : len(b)-1])
 }
 
+// The fixture's kv rows holding paths (a JSON value, a slash path, prose).
+const (
+	kvFixtureJSON  = model.KVResumePrefix + "L1"
+	kvFixtureSlash = "title_legacy:L1"
+	kvFixtureProse = model.KVJanitorLastRunPrefix + "C1"
+)
+
 // seed inserts rows with absolute paths under dir into d (columns present
 // in every schema version).
 func seed(t *testing.T, d *sql.DB, dir string) {
@@ -82,9 +89,10 @@ func seed(t *testing.T, d *sql.DB, dir string) {
 		{"INSERT INTO lecture (id, course_id, title, media_path, created_at) VALUES ('L1', 'C1', 'Week 1', ?, '2026-01-02T00:00:00Z')", []any{media}},
 		{"INSERT INTO lecture (id, course_id, title, media_path, created_at) VALUES ('L2', 'C1', 'Week 2', ?, '2026-01-03T00:00:00Z')", []any{sibling}},
 		{"INSERT INTO material (id, course_id, filename, path, created_at) VALUES ('M1', 'C1', 'source.pdf', ?, '2026-01-02T00:00:00Z')", []any{pdf}},
-		{"INSERT INTO kv (key, value) VALUES ('test.json', ?)", []any{`{"audio":"` + jsonEsc(media) + `","n":1}`}},
-		{"INSERT INTO kv (key, value) VALUES ('test.slash', ?)", []any{filepath.ToSlash(media)}},
-		{"INSERT INTO kv (key, value) VALUES ('test.prose', ?)", []any{"open " + pdf + ": denied"}},
+		// kv rows of keys an import keeps (importedKV), so the import tests see them rewritten too
+		{"INSERT INTO kv (key, value) VALUES ('" + kvFixtureJSON + "', ?)", []any{`{"audio":"` + jsonEsc(media) + `","n":1}`}},
+		{"INSERT INTO kv (key, value) VALUES ('" + kvFixtureSlash + "', ?)", []any{filepath.ToSlash(media)}},
+		{"INSERT INTO kv (key, value) VALUES ('" + kvFixtureProse + "', ?)", []any{"open " + pdf + ": denied"}},
 	}
 	for _, s := range stmts {
 		if _, err := d.Exec(s.q, s.args...); err != nil {
@@ -151,9 +159,9 @@ func readRows(t *testing.T, path string) map[string]string {
 	q("media", "SELECT media_path FROM lecture WHERE id = 'L1'")
 	q("sibling", "SELECT media_path FROM lecture WHERE id = 'L2'")
 	q("pdf", "SELECT path FROM material WHERE id = 'M1'")
-	q("json", "SELECT value FROM kv WHERE key = 'test.json'")
-	q("slash", "SELECT value FROM kv WHERE key = 'test.slash'")
-	q("prose", "SELECT value FROM kv WHERE key = 'test.prose'")
+	q("json", "SELECT value FROM kv WHERE key = '"+kvFixtureJSON+"'")
+	q("slash", "SELECT value FROM kv WHERE key = '"+kvFixtureSlash+"'")
+	q("prose", "SELECT value FROM kv WHERE key = '"+kvFixtureProse+"'")
 	q("old", "SELECT value FROM kv WHERE key = '"+KVOldDataDir+"'")
 	q("onboarding", "SELECT value FROM kv WHERE key = '"+model.KVOnboardingState+"'")
 	return out
@@ -558,6 +566,17 @@ func TestIsInstallationEntry(t *testing.T) {
 
 // ---- import ----
 
+// importableFixture drops the fixture's media path outside the data
+// directory (lecture L2's sibling directory, which the move tests keep
+// unrewritten): an import refuses a stored path outside its record's
+// directory (SEC44 medium-2).
+func importableFixture(t *testing.T, d *sql.DB) {
+	t.Helper()
+	if _, err := d.Exec("UPDATE lecture SET media_path = '' WHERE id = 'L2'"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type importEnv struct {
 	src, cur string // the development data dir; the current (new) data dir
 }
@@ -568,7 +587,7 @@ func newImportEnv(t *testing.T) *importEnv {
 	t.Helper()
 	root := t.TempDir()
 	e := &importEnv{src: filepath.Join(root, "dev", "data"), cur: filepath.Join(root, "AppData", "LectureFlow")}
-	newFixture(t, e.src)
+	importableFixture(t, newFixture(t, e.src).db)
 	if err := os.MkdirAll(e.cur, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -801,6 +820,7 @@ func TestImportOlderVersionMigrates(t *testing.T) {
 	const oldVersion = 2 // before 003/004: the upgrade adds launched_at and backfills it
 	migrateFiles(t, d, oldVersion)
 	seed(t, d, src)
+	importableFixture(t, d)
 	d.Close()
 	cur := filepath.Join(root, "new")
 	if err := os.MkdirAll(cur, 0o755); err != nil {

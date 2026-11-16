@@ -17,7 +17,7 @@ import { h, btn, skeleton, errorBlock, toast, confirmDialog, download } from './
 import { icon } from './icons.js';
 import { t } from './i18n.js';
 import * as U from './util.js';
-import { MOCK, MOCK_SCENARIO, ApiError, errorText } from './api.js';
+import { api, MOCK, MOCK_SCENARIO, ApiError, errorText } from './api.js';
 import { createUpdateHint } from './update_hint.js';
 import { createUpdateSection } from './settings_update.js';
 
@@ -63,6 +63,24 @@ export async function appRequest(method, path, body, opts = {}) {
 function fileNameOf(cd) {
   const m = /filename="?([^";]+)"?/i.exec(cd || '');
   return m ? m[1] : '';
+}
+
+/**
+ * "Export diagnostics" (POST /api/app/diagnostics): the zip handed to the
+ * browser as a download, then a toast (while shown() says the page is
+ * still there); a failure is toasted as an error. Settings → App and the
+ * diagnostics page (r7, T24 G10) share it.
+ */
+export async function exportDiagnosticsFile(shown = () => true) {
+  try {
+    const { blob, name } = await appRequest('POST', '/api/app/diagnostics', undefined, { as: 'blob' });
+    const url = URL.createObjectURL(blob);
+    download(url, name || 'lectureflow-diagnostics.zip');
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    if (shown()) toast(t('settings.app.diag_done'), 'success');
+  } catch (e) {
+    if (shown()) toast(e.message, 'error');
+  }
 }
 
 // GET /api/app, shared by the App and About sections of one page.
@@ -218,8 +236,9 @@ export function createAppSection(ui) {
     if (picking || !window.lectureflow || typeof window.lectureflow.pickFolder !== 'function') return;
     picking = true;
     redraw();
+    let path = null;
     try {
-      const path = await window.lectureflow.pickFolder();
+      path = await window.lectureflow.pickFolder();
       if (!path || !alive) return;
       const ok = await confirmDialog({
         title: t('settings.app.move_title'),
@@ -234,6 +253,7 @@ export function createAppSection(ui) {
         ),
         okText: t('settings.app.move_ok'),
       });
+      if (!ok) api.forgetFolderPick(path); // declined: the pick is given up, not left to expire
       if (!ok || !alive) return;
       const s = await appRequest('POST', '/api/app/data-dir', { path });
       if (!alive) return;
@@ -242,6 +262,9 @@ export function createAppSection(ui) {
       schedulePoll();
     } catch (e) {
       if (alive) toast(e.message, 'error');
+      // The move was refused: the service returned the pick's grant, and
+      // trying again asks for the folder again, so the pick is given up.
+      if (path) api.forgetFolderPick(path);
     } finally {
       picking = false;
       redraw();
@@ -299,15 +322,7 @@ export function createAppSection(ui) {
     if (exporting) return;
     exporting = true;
     redraw();
-    try {
-      const { blob, name } = await appRequest('POST', '/api/app/diagnostics', undefined, { as: 'blob' });
-      const url = URL.createObjectURL(blob);
-      download(url, name || 'lectureflow-diagnostics.zip');
-      setTimeout(() => URL.revokeObjectURL(url), 30000);
-      if (alive) toast(t('settings.app.diag_done'), 'success');
-    } catch (e) {
-      if (alive) toast(e.message, 'error');
-    }
+    await exportDiagnosticsFile(() => alive);
     exporting = false;
     redraw();
   }

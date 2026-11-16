@@ -10,6 +10,7 @@ import (
 
 	"lectureflow/internal/db"
 	"lectureflow/internal/model"
+	"lectureflow/internal/stages"
 )
 
 // backfillOriginalFilenames gives the lectures created before v2 phase 2 an
@@ -21,7 +22,9 @@ import (
 // with it or there is no media path). The user may have renamed a lecture
 // since; the result only serves as a sample for the filename rule
 // (P13.3.2) and in the lecture details. Lectures that already have a name
-// are never changed. One transaction. Returns the number of lectures named.
+// are never changed. Each lecture without a name also gets its title
+// recorded as one of unknown origin (stages.MarkLegacyTitle). One
+// transaction. Returns the number of lectures named.
 func backfillOriginalFilenames(ctx context.Context, st db.Store) (int, error) {
 	n := 0
 	err := st.Tx(ctx, func(tx db.Store) error {
@@ -40,6 +43,12 @@ func backfillOriginalFilenames(ctx context.Context, st db.Store) (int, error) {
 			for _, l := range lecs {
 				if l.OriginalFilename != "" {
 					continue
+				}
+				// created before v2 phase 2: a title with source filename
+				// may be one the user typed (test-upgrade F7); the title
+				// task keeps it while it is unchanged
+				if err := stages.MarkLegacyTitle(ctx, tx, l); err != nil {
+					return err
 				}
 				name := guessOriginalFilename(l)
 				if name == "" {

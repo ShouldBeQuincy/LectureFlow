@@ -39,6 +39,12 @@
 // stream-parallel: the system area says when playback files are being made
 // in the background (the stream task: a CPU slot, in parallel with
 // transcription), from the job events (opts.subscribe).
+// ssh-1b: the snapshot's remotes[] of kind ssh (the user's own SSH servers,
+// settings_remote.js) follow the Colab area, one card each: connected, the
+// machine as nvidia-smi on it reports itself, latency, agent version and
+// where the job files live, the CPU and GPU sparklines, the same segmented
+// memory bar as Colab, the GPU memory used and the lectures running there;
+// not connected, one line (name and state).
 
 import { h, clear, iconBtn, errorBlock, skeleton, preserveFocus, toast } from './dom.js';
 import { icon } from './icons.js';
@@ -46,6 +52,7 @@ import * as U from './util.js';
 import { t, has } from './i18n.js';
 import { tariffTag, updateTariffTag, hasPeaks } from './tariff_ui.js';
 import * as C from './settings_colab.js';
+import * as R from './settings_remote.js';
 
 const NA = '--';
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -183,14 +190,25 @@ export function mountInspector(el, opts) {
   }
 
   function setResources(r) {
-    const fresh = loading || !!error;
+    const fresh = loading || !!error || offline;
     C.noteRemote(r && r.remote);
     pushHistory(r);
     res = r;
     error = '';
     loading = false;
+    offline = false; // a snapshot came: the service answers
     if (fresh || !parts) preserveFocus(render);
     else update();
+  }
+
+  // T24 G6, T25 G4: the event stream dropped (app.js): "已断开" in place of
+  // "实时", and none of the readings of before the service went (they no
+  // longer change); the next snapshot draws the panel again.
+  let offline = false;
+  function setOffline(on) {
+    if (offline === !!on) return;
+    offline = !!on;
+    preserveFocus(render);
   }
 
   function update() {
@@ -204,6 +222,7 @@ export function mountInspector(el, opts) {
     }
     syncSwitch(parts.sw, res.gpu);
     updateRemote();
+    updateSSH();
     if (parts.devMode) updateDevices();
     else {
       const g = gpuBody(res.gpu);
@@ -260,10 +279,18 @@ export function mountInspector(el, opts) {
         'div',
         { class: 'insp-head' },
         h('h2', { class: 'insp-title' }, t('resources.title')),
-        res ? h('span', { class: 'insp-live', title: t('resources.live_tip') }, h('span', { class: 'live-dot' }), t('resources.live')) : null,
+        offline
+          ? h('span', { class: 'insp-live tone-warn', title: t('resources.offline_tip') }, icon('circle-alert', { size: 12 }), t('resources.offline'))
+          : res
+            ? h('span', { class: 'insp-live', title: t('resources.live_tip') }, h('span', { class: 'live-dot' }), t('resources.live'))
+            : null,
         iconBtn('panel-right-close', t('resources.collapse'), { class: 'insp-toggle', fkey: 'insp:toggle', onclick: opts.onCollapse }),
       ),
     );
+    if (offline) {
+      el.append(h('div', { class: 'insp-body' }, h('p', { class: 'insp-note tone-warn', role: 'status' }, icon('circle-alert', { size: 14 }), t('resources.offline_note'))));
+      return;
+    }
     if (loading) {
       el.append(h('div', { class: 'insp-body' }, skeleton(4), skeleton(3)));
       return;
@@ -285,7 +312,8 @@ export function mountInspector(el, opts) {
     parts.provKey = provKeyOf();
     // without devices the remote area follows the GPU section
     const remote = parts.devMode ? null : remoteArea();
-    el.append(h('div', { class: 'insp-body' }, gpuSec, remote, parts.prov), parts.foot);
+    const ssh = parts.devMode ? null : sshArea();
+    el.append(h('div', { class: 'insp-body' }, gpuSec, remote, ssh, parts.prov), parts.foot);
   }
 
   // ---- transcription devices (SPEC-v2 I10) and power management ----
@@ -326,6 +354,7 @@ export function mountInspector(el, opts) {
     if (policy() || res.system) secs.push(systemSection());
     secs.push(active);
     secs.push(remoteArea());
+    secs.push(sshArea());
     if (standby().length) secs.push(standbySection());
     parts.devSec = h('div', { class: 'insp-group' }, secs);
     return parts.devSec;
@@ -359,6 +388,7 @@ export function mountInspector(el, opts) {
       parts.sysBody.replaceWith(b);
       parts.sysBody = b;
     }
+    if (parts.pwWait) fillPowerWait();
     for (const d of cards()) {
       const ref = parts.devRefs.get(d.id);
       if (!ref) continue;
@@ -474,7 +504,7 @@ export function mountInspector(el, opts) {
   const settingsLink = () => h('a', { class: 'rc-link', href: '#/settings/colab', dataset: { fkey: 'insp:remote:settings' } }, t('resources.remote.settings_link'));
 
   function updateRemote() {
-    if (!parts.remote) return;
+    if (!parts || !parts.remote) return; // collapsed, or cut off (no parts)
     if (remoteShapeOf() !== parts.remote.shape) {
       preserveFocus(fillRemote);
       return;
@@ -498,11 +528,15 @@ export function mountInspector(el, opts) {
     }
   }
 
+  // R76 L-5: the workbench's "立即关机" is this one too (app.js
+  // ctx.colabShutdown): one confirmation, one busy state, one result; the
+  // app hears of each change of the busy state (opts.onRemoteBusy) and of
+  // the status the answer brought.
   async function remoteShutdown(mode) {
     if (remoteBusy) return;
     if (mode === 'now' && !(await C.confirmShutdownNow())) return;
     remoteBusy = mode;
-    updateRemote();
+    busyChanged();
     try {
       const v = await C.shutdownColab(mode);
       if (v && v.status && res) res = { ...res, remote: v.status };
@@ -511,7 +545,12 @@ export function mountInspector(el, opts) {
       toast(e.message, 'error');
     }
     remoteBusy = '';
+    busyChanged();
+  }
+
+  function busyChanged() {
     updateRemote();
+    if (opts.onRemoteBusy) opts.onRemoteBusy();
   }
 
   // "重新查询" (the account was not read): asks Colab now.
@@ -532,11 +571,27 @@ export function mountInspector(el, opts) {
   // The notes every remote state may carry: no authorization, a session
   // left over by an earlier run, the last error, the cool-down after a
   // used-up window, the automatic dispatch held after a shutdown button.
-  function remoteNotes(r) {
+  // v3.2.x: the runtime held but not answering ("仍在计费" / "仍在占用本次
+  // 使用窗口"; a hint only), a runtime not released and retried, and the
+  // last error only when it is not older than the current session.
+  // T24 S6: a runtime the program keeps trying to release (the session
+  // being released, or one left from before) says it can be ended by hand
+  // on the Colab website; with both at once the one from before is said to
+  // be another runtime (the two sentences read nearly the same).
+  function remoteNotes(r, jobs) {
     const out = [];
     if (!r.configured) out.push(h('p', { class: 'insp-note tone-warn' }, icon('key-round', { size: 14 }), t('resources.remote.auth_missing')));
-    if (r.leftover) out.push(h('p', { class: 'insp-note tone-warn' }, icon('triangle-alert', { size: 14 }), C.infoText({ code: r.leftover.code, params: { accelerator: r.leftover.accelerator } })));
-    if (r.last_error) out.push(h('p', { class: 'insp-note tone-warn' }, icon('circle-alert', { size: 14 }), C.infoText(r.last_error)));
+    const warn = C.runtimeWarning(r, jobs);
+    const byHand = t('resources.remote.manual_end');
+    if (warn) out.push(h('p', { class: 'insp-note tone-warn rc-billing', role: 'status' }, icon('triangle-alert', { size: 14 }), h('span', null, r.state === 'stopping' ? U.sentenceJoin([warn, byHand]) : warn)));
+    if (r.leftover) {
+      const lo = r.leftover;
+      const failed = lo.code === 'colab.release_failed';
+      const text = failed && warn ? (lo.accelerator ? t('resources.remote.leftover_earlier', { accelerator: lo.accelerator }) : t('resources.remote.leftover_earlier_any')) : C.leftoverText(r.leftover);
+      out.push(h('p', { class: 'insp-note tone-warn' }, icon('triangle-alert', { size: 14 }), failed ? U.sentenceJoin([text, byHand]) : text));
+    }
+    const err = C.visibleError(r);
+    if (err) out.push(h('p', { class: 'insp-note tone-warn' }, icon('circle-alert', { size: 14 }), C.infoText(err)));
     if (r.cooldown_until) {
       const sec = (new Date(r.cooldown_until).getTime() - Date.now()) / 1000;
       if (sec > 0) out.push(h('p', { class: 'insp-note' }, icon('clock', { size: 14 }), t('resources.remote.cooldown', { time: C.durText(sec) })));
@@ -765,6 +820,18 @@ export function mountInspector(el, opts) {
     // the worker's stage only while it prepares (check, install, model…)
     const stage = j.step ? [C.stepName(j.step), j.step === 'remote_transcribe' && j.stage && j.stage !== 'transcribe' ? C.stageName(j.stage) : ''].filter(Boolean).join(' · ') : jobStage(j.stage);
     const title = j.title || stage;
+    // v3.2.x: the runtime does not answer and the lecture retries in place —
+    // "连接不稳定，正在重试（2/3）" and the time to the next try replace the
+    // progress and the time left (both frozen meanwhile)
+    const rc = C.reconnectText(j.reconnect);
+    if (rc) {
+      const sub = [j.title ? stage : '', rc.next].filter(Boolean).join(' · ');
+      return [
+        h('span', { class: 'rc-task' }, h('span', { class: 'rc-task-t', title }, title)),
+        h('span', { class: 'rc-sub rc-reconnect tone-warn', role: 'status' }, icon('refresh-cw', { size: 12 }), h('span', null, rc.text)),
+        sub ? h('span', { class: 'rc-sub' }, sub) : null,
+      ];
+    }
     const sub = [j.title ? stage : '', j.eta > 0 ? t('resources.remote.eta', { time: C.durText(j.eta) }) : '', j.split > 1 ? t('resources.remote.job_split', { n: j.split }) : ''].filter(Boolean).join(' · ');
     const p = j.step !== 'wait_accelerator' && j.progress > 0 ? U.pct(j.progress) : '';
     return [h('span', { class: 'rc-task' }, h('span', { class: 'rc-task-t', title }, title), p ? h('span', { class: 'rc-task-p' }, p) : null), sub ? h('span', { class: 'rc-sub' }, sub) : null];
@@ -794,12 +861,18 @@ export function mountInspector(el, opts) {
     if (u && u.vram_used_mb != null) rows.push(line(t('resources.remote.vram_used'), U.fmtMB(u.vram_used_mb), u.vram_whisper_mb != null ? t('resources.remote.seg.whisper') + ' ' + U.fmtMB(u.vram_whisper_mb) : ''));
     if (u && u.data_disk_mb != null) rows.push(line(t('resources.remote.data_disk'), U.fmtMB(u.data_disk_mb)));
     if (u) rows.push(h('div', { class: 'rc-sep' }));
-    if (c.jobs.length) rows.push(kv('audio-lines', t('resources.remote.jobs_k'), c.jobs.map(jobLine)));
+    // stopping: "正在释放运行时…" in place of the lectures (handed back, so
+    // their old steps and progress are not shown)
+    if (st === 'stopping') rows.push(h('p', { class: 'insp-note rc-releasing', role: 'status' }, icon('loader-circle', { size: 14, class: 'spin' }), h('span', null, t('resources.remote.releasing_note'))));
+    else if (c.jobs.length) rows.push(kv('audio-lines', t('resources.remote.jobs_k'), c.jobs.map(jobLine)));
     else if (st === 'running') rows.push(kv('audio-lines', t('resources.remote.jobs_k'), t('resources.remote.idle')));
     if (c.queued > 0 || c.ahead > 0) {
       const q = [[U.fmtInt(c.queued), t('resources.remote.fit_unit', { n: U.count(c.queued) })].join(' ')];
       if (c.ahead > 0) q.push(t('resources.remote.queue_ahead', { n: U.count(c.ahead) }));
-      const plan = r.planned > 0 && r.planned_fit < r.planned ? h('span', { class: 'rc-sub' }, t('resources.remote.plan', { n: r.planned, fit: r.planned_fit })) : null;
+      // T24 G11: none fits is said plainly ("约 0 节能在本次处理" read
+      // badly), and where the others go
+      const fit = r.planned_fit > 0 ? t('resources.remote.plan', { n: r.planned, fit: r.planned_fit }) : t('resources.remote.plan_none', { n: r.planned });
+      const plan = r.planned > 0 && r.planned_fit < r.planned ? h('span', { class: 'rc-sub' }, U.sentenceJoin([fit, t('resources.remote.plan_rest')])) : null;
       rows.push(kv('list-checks', t('resources.remote.queue_k'), q.join(' · '), plan));
     }
     rows.push(cuRow(r, a));
@@ -811,7 +884,134 @@ export function mountInspector(el, opts) {
     const auth = C.authLeftText(r.auth);
     if (auth) rows.push(kv('key-round', t('resources.remote.auth_k'), auth));
     if (r.shutdown_after_current && st !== 'stopping') rows.push(h('p', { class: 'insp-note' }, icon('circle-pause', { size: 14 }), t('resources.remote.after_current_set')));
-    rows.push(...remoteNotes(r));
+    rows.push(...remoteNotes(r, c.jobs));
+    return h('div', { class: 'rc-part' }, rows);
+  }
+
+  // ---- SSH servers (ssh-1b) ----
+
+  // parts.ssh: {wrap, shape, refs: Map(id → {top, ram, rest})} — rebuilt
+  // when the servers or their connected / not connected shape change;
+  // otherwise each card's blocks (no controls) are replaced and its memory
+  // bar updated in place (its hover card survives the 2-second refresh).
+  const sshShapeOf = () => JSON.stringify(R.sshCards(res).map((c) => [c.id, R.cardConnected(c), !!(c.usage && C.ramSegments(c.usage))]));
+
+  function sshArea() {
+    const wrap = h('div', { class: 'insp-ssh-slot' });
+    parts.ssh = { wrap, shape: '', refs: new Map() };
+    fillSSH();
+    return wrap;
+  }
+
+  function fillSSH() {
+    const ref = parts.ssh;
+    ref.shape = sshShapeOf();
+    ref.refs = new Map();
+    clear(ref.wrap);
+    const cards = R.sshCards(res);
+    ref.wrap.hidden = !cards.length;
+    if (!cards.length) return;
+    const items = cards.map((c) => {
+      if (!R.cardConnected(c)) return sshLine(c);
+      const r = { top: sshTop(c), ram: null, rest: sshRest(c) };
+      const lay = c.usage ? C.ramSegments(c.usage) : null;
+      if (lay) {
+        r.ram = ramMeter();
+        r.ram.update(lay, c);
+      }
+      ref.refs.set(c.id, r);
+      return h('div', { class: 'rc-body ssh-card', dataset: { server: c.id } }, r.top, r.ram ? r.ram.el : null, r.rest);
+    });
+    ref.wrap.append(
+      h(
+        'section',
+        { class: 'insp-sec insp-remote insp-ssh', 'aria-label': t('settings.remote.title') },
+        h('div', { class: 'insp-sec-head' }, h('h3', null, t('settings.remote.title')), h('a', { class: 'rc-link', href: '#/settings/remote', dataset: { fkey: 'insp:ssh:settings' } }, t('system.open_settings'))),
+        items,
+      ),
+    );
+  }
+
+  function updateSSH() {
+    if (!parts.ssh) return;
+    if (sshShapeOf() !== parts.ssh.shape) {
+      preserveFocus(fillSSH);
+      return;
+    }
+    for (const c of R.sshCards(res)) {
+      const r = parts.ssh.refs.get(c.id);
+      if (!r) {
+        // a one-line card: its text may change (no controls in it)
+        const old = parts.ssh.wrap.querySelector(`[data-server="${CSS.escape(c.id)}"]`);
+        if (old) old.replaceWith(sshLine(c));
+        continue;
+      }
+      const top = sshTop(c);
+      r.top.replaceWith(top);
+      r.top = top;
+      const lay = r.ram && c.usage ? C.ramSegments(c.usage) : null;
+      if (lay) r.ram.update(lay, c);
+      const rest = sshRest(c);
+      r.rest.replaceWith(rest);
+      r.rest = rest;
+    }
+  }
+
+  // A server's last error in words (its name as the device).
+  const sshError = (c) => (c.last_error && c.last_error.code ? U.errorInfoText({ code: c.last_error.code, params: { device: c.label, ...(c.last_error.params || {}) } }) : '');
+
+  // Not connected: the name and the state on one line (the last error as its hover text).
+  function sshLine(c) {
+    const err = sshError(c);
+    return h('div', { class: 'rc-line ssh-line', dataset: { server: c.id }, title: err || undefined }, icon('server', { size: 15 }), h('span', { class: 'rc-line-t' }, c.label), R.stateChip(c.state));
+  }
+
+  // Connected: name, state, latency; the machine as it reports itself
+  // (GPU and its memory; driver, CUDA, vCPUs as the hover text), the agent's
+  // version and where the job files live; the CPU and GPU sparklines.
+  function sshTop(c) {
+    const m = c.machine;
+    const u = c.usage;
+    const x = c.ssh || {};
+    const gpu = m && m.gpu_name ? [m.gpu_name, m.vram_total_mb > 0 ? U.fmtMB(m.vram_total_mb) : ''].filter(Boolean).join(' · ') : '';
+    const details = m ? [m.gpu_name, m.driver, m.cuda ? 'CUDA ' + m.cuda : '', m.vcpus > 0 ? m.vcpus + ' vCPU' : ''].filter(Boolean).join(' · ') : '';
+    const storage = x.storage === 'memory' ? t('resources.remote.seg.ramdisk') : x.storage ? t('system.disk.title') : '';
+    const out = [
+      h(
+        'div',
+        { class: 'rc-head', title: details || undefined },
+        icon('server', { size: 15 }),
+        h('span', { class: 'rc-name', title: c.label }, c.label),
+        h('span', { class: 'rc-tags' }, R.stateChip(c.state), x.latency_ms > 0 ? h('span', { class: 'chip chip-quiet' }, t('resources.ssh.latency', { ms: U.fmtInt(x.latency_ms) })) : null),
+      ),
+      h('div', { class: 'rc-smi' }, [gpu, x.agent_version ? t('settings.remote.agent', { version: x.agent_version }) : '', storage].filter(Boolean).join(' · ')),
+    ];
+    if (u) {
+      const tile = (k, v, hist, title) =>
+        h('div', { class: 'tile', title: title || undefined }, h('div', { class: 'tile-k' }, k), h('div', { class: 'tile-v' }, num(v), v != null ? h('small', null, '%') : null), sparkline(hist, { lo: 0, hi: 100, label: k }));
+      out.push(h('div', { class: 'tiles' }, tile(t('resources.system.cpu'), u.cpu_pct, u.cpu_history, m && m.vcpus > 0 ? m.vcpus + ' vCPU' : ''), tile(t('resources.remote.gpu_util'), u.gpu_util_pct, u.gpu_history)));
+    }
+    return h('div', { class: 'rc-part' }, out);
+  }
+
+  // The GPU memory used, the job files on disk, the lectures running there, the last error.
+  function sshRest(c) {
+    const u = c.usage;
+    const rows = [];
+    const line = (k, v, title) => h('div', { class: 'metric-top rc-line-v', title: title || undefined }, h('span', { class: 'metric-k' }, icon('memory-stick', { size: 14 }), k), h('span', { class: 'metric-v' }, v));
+    if (u && u.vram_used_mb != null) rows.push(line(t('resources.remote.vram_used'), U.fmtMB(u.vram_used_mb), u.vram_whisper_mb != null ? t('resources.remote.seg.whisper') + ' ' + U.fmtMB(u.vram_whisper_mb) : ''));
+    if (u && u.data_disk_mb != null && u.data_disk_mb >= 0) rows.push(line(t('resources.remote.data_disk'), U.fmtMB(u.data_disk_mb)));
+    const jobs = (c.jobs || []).map((j) => {
+      const step = R.jobStepText(j.stage);
+      const title = j.lecture_title || step;
+      const p = j.progress > 0 ? U.pct(j.progress) : '';
+      const sub = [j.lecture_title ? step : '', j.eta_sec > 0 ? t('resources.remote.eta', { time: C.durText(j.eta_sec) }) : ''].filter(Boolean).join(' · ');
+      return [h('span', { class: 'rc-task' }, h('span', { class: 'rc-task-t', title }, title), p ? h('span', { class: 'rc-task-p' }, p) : null), sub ? h('span', { class: 'rc-sub' }, sub) : null];
+    });
+    if (jobs.length) rows.push(kv('audio-lines', t('resources.remote.jobs_k'), jobs));
+    else if (c.state === 'ready') rows.push(kv('audio-lines', t('resources.remote.jobs_k'), t('resources.remote.idle')));
+    const err = sshError(c);
+    if (err) rows.push(h('p', { class: 'insp-note tone-warn' }, icon('circle-alert', { size: 14 }), h('span', null, err)));
     return h('div', { class: 'rc-part' }, rows);
   }
 
@@ -819,13 +1019,44 @@ export function mountInspector(el, opts) {
 
   function systemSection() {
     parts.sysBody = systemBody();
-    return h('section', { class: 'insp-sec', 'aria-label': t('resources.system.title') }, h('div', { class: 'insp-sec-head' }, h('h3', null, t('resources.system.title'))), parts.sysBody);
+    parts.pwWait = { el: h('div', { class: 'pw-waits' }), sig: null };
+    fillPowerWait();
+    return h('section', { class: 'insp-sec', 'aria-label': t('resources.system.title') }, h('div', { class: 'insp-sec-head' }, h('h3', null, t('resources.system.title'))), parts.pwWait.el, parts.sysBody);
+  }
+
+  // The tasks the power-aware policy suspended (T24 S4): how many and why,
+  // that they go on by themselves once plugged in, and a link to the
+  // transcription devices of the settings (another device takes them
+  // without waiting). It holds a link, so it is redrawn only when its
+  // numbers change, not with every snapshot (a click must not get lost).
+  function fillPowerWait() {
+    const ref = parts.pwWait;
+    const p = policy();
+    const ac = p && p.wait_ac > 0 ? p.wait_ac : 0;
+    const none = p && p.wait_no_device > 0 ? p.wait_no_device : 0;
+    const sig = JSON.stringify([ac, none]);
+    if (sig === ref.sig) return;
+    ref.sig = sig;
+    preserveFocus(() => {
+      clear(ref.el);
+      if (ac) ref.el.append(h('p', { class: 'insp-note pw-wait tone-warn' }, icon('plug', { size: 14 }), t('resources.power.wait_ac', { n: ac })));
+      if (none) ref.el.append(h('p', { class: 'insp-note pw-wait tone-warn' }, icon('battery-low', { size: 14 }), t('resources.power.wait_no_device', { n: none })));
+      if (ac || none) {
+        ref.el.append(
+          h(
+            'p',
+            { class: 'insp-note pw-way' },
+            icon('info', { size: 14 }),
+            h('span', null, t('resources.power.wait_way_out'), ' ', h('a', { class: 'rc-link', href: '#/settings/asr', dataset: { fkey: 'insp:power:settings' } }, t('resources.power.to_settings'))),
+          ),
+        );
+      }
+    });
   }
 
   // Everything of the system section below its head (no interactive elements).
   function systemBody() {
     const y = res.system || {};
-    const p = policy();
     const memFrac = y.mem_used_mb != null && y.mem_total_mb ? y.mem_used_mb / y.mem_total_mb : null;
     const tile = (k, v, unit, spark) =>
       h('div', { class: 'tile' }, h('div', { class: 'tile-k' }, k), h('div', { class: 'tile-v' }, num(v), v != null ? h('small', null, unit) : null), spark || null);
@@ -841,8 +1072,6 @@ export function mountInspector(el, opts) {
       { class: 'sys-body' },
       powerLine(res.power),
       bgStreamLine(),
-      p && p.wait_ac > 0 ? h('p', { class: 'insp-note pw-wait tone-warn' }, icon('plug', { size: 14 }), t('resources.power.wait_ac', { n: p.wait_ac })) : null,
-      p && p.wait_no_device > 0 ? h('p', { class: 'insp-note pw-wait tone-warn' }, icon('battery-low', { size: 14 }), t('resources.power.wait_no_device', { n: p.wait_no_device })) : null,
       tiles.length ? h('div', { class: 'tiles' }, tiles) : null,
       unsupported.has('mem')
         ? null
@@ -1180,10 +1409,13 @@ export function mountInspector(el, opts) {
     sw.classList.toggle('is-on', on);
     sw.setAttribute('aria-checked', String(on));
     if (devMode()) {
-      // SPEC-v2 I8: the main switch pauses every transcription device
+      // SPEC-v2 I8: the main switch pauses every transcription device;
+      // T24 G13: on while the power-aware policy holds every task (nothing
+      // runs), it says "已挂起", not "运行中"
+      const held = on && suspendedCount() > 0 && !rows().some((d) => (d.tasks || []).some((tk) => !tk.selftest));
       sw.setAttribute('aria-label', t('resources.devices.switch'));
       sw.title = on ? t('resources.devices.pause_tip') : t('resources.devices.resume_tip');
-      sw.querySelector('.switch-label').textContent = on ? t('common.status.running') : t('devices.paused');
+      sw.querySelector('.switch-label').textContent = held ? t('resources.devices.suspended_label') : on ? t('common.status.running') : t('devices.paused');
       return;
     }
     sw.setAttribute('aria-label', t('resources.gpu.switch'));
@@ -1303,10 +1535,10 @@ export function mountInspector(el, opts) {
   const balKeyOf = (p) => JSON.stringify([p.balance, p.balance_currency, p.balance_error, p.balance_at]);
 
   function providerRow(p) {
-    const ref = { tag: null, tagSlot: h('span', { class: 'prov-tag' }), bal: balanceEl(p), balKey: balKeyOf(p), body: providerBody(p) };
+    const ref = { name: h('span', { class: 'prov-name' }, p.name), tag: null, tagSlot: h('span', { class: 'prov-tag' }), bal: balanceEl(p), balKey: balKeyOf(p), body: providerBody(p) };
     setTag(ref, p.tariff_state);
     if (parts && parts.provRows) parts.provRows.set(p.id, ref);
-    return h('div', { class: 'prov' }, h('div', { class: 'prov-head' }, h('span', { class: 'prov-name' }, p.name), ref.tagSlot, ref.bal), ref.body);
+    return h('div', { class: 'prov' }, h('div', { class: 'prov-head' }, ref.name, ref.tagSlot, ref.bal), ref.body);
   }
 
   // The peak / off-peak tag (P12.4): the element stays, its text and hover change.
@@ -1322,6 +1554,8 @@ export function mountInspector(el, opts) {
 
   function updateProviderRow(ref, p) {
     if (!ref) return;
+    // T041: a provider renamed in the settings shows its new name with the next snapshot
+    if (ref.name.textContent !== p.name) ref.name.textContent = p.name;
     setTag(ref, p.tariff_state);
     const k = balKeyOf(p);
     if (k !== ref.balKey) {
@@ -1397,10 +1631,6 @@ export function mountInspector(el, opts) {
       r[k].box.hidden = true;
       r[k].box.style.display = 'none';
     };
-    if (!g) {
-      for (const k of Object.keys(r)) hide(k);
-      return;
-    }
     const set = (k, value, title, warn = false) => {
       r[k].v.textContent = value;
       r[k].box.title = title;
@@ -1408,6 +1638,16 @@ export function mountInspector(el, opts) {
       r[k].box.hidden = false;
       r[k].box.style.display = '';
     };
+    // cut off from the service (T24 G6): no readings of before, "--" and why
+    if (offline) {
+      for (const k of ['gpu', 'temp', 'asr', 'api']) set(k, NA, t('resources.offline_tip'), true);
+      hide('colab');
+      return;
+    }
+    if (!g) {
+      for (const k of Object.keys(r)) hide(k);
+      return;
+    }
     const inflight = prov.reduce((n, p) => n + p.inflight, 0);
     const max = prov.reduce((n, p) => n + p.max, 0);
     // Without an NVIDIA card the Apple GPU's usage (its card, from ioreg) and
@@ -1436,7 +1676,12 @@ export function mountInspector(el, opts) {
   return {
     setResources,
     setError,
+    setOffline,
     render,
+    // R76 L-5: "立即关机" / "处理完当前这节后关机" from elsewhere (the
+    // workbench), and whether one is in flight
+    shutdownColab: remoteShutdown,
+    colabBusy: () => remoteBusy,
     // the system state changed (budget_hit is shown with the providers)
     systemChanged() {
       if (parts && !parts.rail && res && provKeyOf() !== parts.provKey) update();

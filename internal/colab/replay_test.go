@@ -40,7 +40,8 @@ func newEnv(t *testing.T, sample string, mods ...func(*Options)) *testEnv {
 	lg, lb := newTestLogger()
 	o := Options{KV: kv, ColabURL: rs.colabURL(), TokenURL: rs.tokenURL(), RevokeURL: rs.revokeURL(),
 		WorkerDir: workerDir(t), FFmpeg: "ffmpeg", RunFFmpeg: fakeFFmpeg(300), Logger: lg, Now: clk.Now, Sleep: clk.Sleep,
-		RunID: "run-1", AllowHTTP: true, ChunkSize: 200, ADCPath: filepath.Join(t.TempDir(), "absent.json")}
+		RunID: "run-1", AllowHTTP: true, ChunkSize: 200, ADCPath: filepath.Join(t.TempDir(), "absent.json"),
+		Retry: RetryOptions{Jitter: -1}} // exact waits
 	for _, m := range mods {
 		m(&o)
 	}
@@ -124,7 +125,7 @@ func TestReplayBorrowTranscribeRelease(t *testing.T) {
 		t.Fatalf("path %s", path)
 	}
 	got, _ := os.ReadFile(path)
-	if string(got) != e.rs.vars["result_json"] {
+	if !sameResult(got, e.rs.vars["result_json"]) {
 		t.Fatalf("result.json differs from the download")
 	}
 	// No temporary FLAC is left.
@@ -309,6 +310,7 @@ func TestReplayHashMismatch(t *testing.T) {
 	if _, serr := os.Stat(filepath.Join(e.dir, "result.json")); serr == nil {
 		t.Error("a result that failed verification was written")
 	}
+	e.b.handbacksSettled() // v3.2.x: the files and the runtime go in the background
 	if st := e.b.Status(ctx); st.State != StateReleased || st.LastRelease.Reason != ReleaseFailed || st.LastError.Code != CodeHashMismatch {
 		t.Errorf("status %+v", st)
 	}
@@ -326,6 +328,7 @@ func TestReplayContractViolation(t *testing.T) {
 	if strings.Contains(err.Error(), "Welcome") {
 		t.Error("the error quotes the offending line")
 	}
+	e.b.handbacksSettled() // v3.2.x: the files and the runtime go in the background
 	if st := e.b.Status(ctx); st.State != StateReleased {
 		t.Errorf("status %+v", st)
 	}
@@ -342,6 +345,7 @@ func TestReplayRemoteError(t *testing.T) {
 	if r, _ := codedParam(err, "reason"); r != "no_gpu" {
 		t.Errorf("reason %q", r)
 	}
+	e.b.handbacksSettled() // v3.2.x: the files and the runtime go in the background
 	e.rs.finish()
 	e.checkClean(t, err)
 }
@@ -353,6 +357,7 @@ func TestReplaySessionReclaimed(t *testing.T) {
 	if Code(err) != CodeSessionReclaimed || !IsFallback(err) {
 		t.Fatalf("err %v", err)
 	}
+	e.b.handbacksSettled() // v3.2.x: the runtime goes in the background
 	if st := e.b.Status(ctx); st.LastRelease == nil || st.LastRelease.Reason != ReleaseReclaimed {
 		t.Errorf("status %+v", st)
 	}
@@ -733,7 +738,7 @@ func TestReplayCleanupFailureReleases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Transcribe: %v", err)
 	}
-	if got, _ := os.ReadFile(path); string(got) != e.rs.vars["result_json"] {
+	if got, _ := os.ReadFile(path); !sameResult(got, e.rs.vars["result_json"]) {
 		t.Fatal("result.json differs from the download")
 	}
 	// 3.2.0: the lecture is done; its files go in the background (the

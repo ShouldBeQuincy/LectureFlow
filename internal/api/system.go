@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +30,7 @@ import (
 	"lectureflow/internal/dirperm"
 	"lectureflow/internal/hwdetect"
 	"lectureflow/internal/model"
+	"lectureflow/internal/pyenv"
 	"lectureflow/internal/settings"
 )
 
@@ -548,6 +551,7 @@ func (s *Server) checkDataDir(ctx context.Context) SystemCheck {
 	}
 	abs, _ := filepath.Abs(s.dataDir)
 	c.setDetail("check.dir_writable", map[string]any{"path": abs})
+	s.checkDataDirEntries() // what other accounts may change below it (system_datadir.go)
 	return c
 }
 
@@ -571,6 +575,13 @@ var pyVersionRe = regexp.MustCompile(`Python (\d+)\.(\d+)(?:\.(\d+))?`)
 func (s *Server) pyCmd(ctx context.Context, timeout time.Duration, python string, args ...string) (string, string, error) {
 	defer s.trackPython(python, PythonUseSelfCheck)()
 	return s.cmd(ctx, timeout, python, args...)
+}
+
+// pyScript is pyCmd for a worker script (a self-test, the cuDNN check):
+// python -s script args (pyenv.ScriptArgs; the environment of runCommand
+// is pyenv's, without PYTHONPATH and the like: security audit AUD4 L-4).
+func (s *Server) pyScript(ctx context.Context, timeout time.Duration, python, script string, args ...string) (string, string, error) {
+	return s.pyCmd(ctx, timeout, python, pyenv.ScriptArgs(script, args...)...)
 }
 
 // Reasons of RunningPython: the reason keys of components.in_use_by_task.
@@ -722,12 +733,15 @@ func (s *Server) checkPyPDF(ctx context.Context) SystemCheck {
 	return s.checkImport(ctx, python.path, "pypdf", "pypdf", s.devHint("check.hint_pip", codeHintInstallPython))
 }
 
-// checkImport runs python -c "import module". Warnings on stderr (e.g. a
+// checkImport runs python -I -c "import module". Warnings on stderr (e.g. a
 // DeprecationWarning printed on import) are ignored; the exit code
-// decides. hint is the catalog code of the fix hint.
+// decides. hint is the catalog code of the fix hint. -I (isolated): no
+// PYTHON* variables, no user site-packages, and not the service's current
+// directory on sys.path, where a pypdf.py of the folder lectureflow.exe
+// was started from would run (security audit AUD4 L-4).
 func (s *Server) checkImport(ctx context.Context, python, name, module, hint string) SystemCheck {
 	c := SystemCheck{Name: name, Status: statusOK}
-	_, errOut, err := s.pyCmd(ctx, cmdTimeout, python, "-c", "import "+module)
+	_, errOut, err := s.pyCmd(ctx, cmdTimeout, python, "-I", "-c", "import "+module)
 	if err != nil {
 		detail := lastLine(errOut)
 		if detail == "" {
@@ -853,7 +867,7 @@ func (s *Server) checkCUDA(ctx context.Context) SystemCheck {
 		total = s.sc.GPUTotalMB(ctx)
 	}
 	script := filepath.Join(s.cfg.WorkerDir, "asr.py")
-	out, errOut, err := s.pyCmd(ctx, selftestTimeout, python.path, script, "--selftest",
+	out, errOut, err := s.pyScript(ctx, selftestTimeout, python.path, script, "--selftest",
 		"--device", device, "--compute-type", config.ResolveComputeType(computeType, device, total))
 	if err != nil {
 		detail := lastLine(errOut)
@@ -873,6 +887,57 @@ func (s *Server) checkCUDA(ctx context.Context) SystemCheck {
 	return c
 }
 
+// codeHintKeyPlainHTTP: the api_key row's note on a provider address on
+// plain http to a computer off the local network (plainHTTPFar).
+const codeHintKeyPlainHTTP = "check.hint_key_plain_http"
+
+// plainHTTPFar (AUD1 I-3): a provider address on plain http to a computer
+// off the local network, so that its API key and the lecture content cross
+// the network unencrypted. The settings page's rule (web/view_settings.js
+// plainHTTPFar, WS-10; TestPlainHTTPFarSameTableAsWeb keeps the two tables
+// equal): no note for this computer (settings.IsLocal, a loopback address),
+// a private, link-local, unique-local, old site-local or carrier-grade NAT
+// address, 0.0.0.0/8 and ::, an IPv6 address carrying an IPv4 one
+// (::ffff:a.b.c.d) as that address, or a name only a local network
+// resolves (one label, .local, .home.arpa, .internal, .localhost). The page
+// reads the address as a browser does: IPv4 written in octal, hex or with
+// fewer parts is a number there and a name here, so that only this side
+// notes it (a note too many, never one too few).
+func plainHTTPFar(baseURL string) bool {
+	raw := strings.TrimSpace(baseURL)
+	u, err := url.Parse(raw)
+	if err != nil || !strings.EqualFold(u.Scheme, "http") || u.Hostname() == "" || settings.IsLocal(raw) {
+		return false
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if ip.Is4In6() {
+			ip = ip.Unmap()
+		}
+		if ip.Is4() {
+			a, b := ip.As4()[0], ip.As4()[1]
+			return !(a == 0 || a == 10 || a == 127 || a == 100 && b >= 64 && b <= 127 ||
+				a == 169 && b == 254 || a == 172 && b >= 16 && b <= 31 || a == 192 && b == 168)
+		}
+		siteLocal := netip.MustParsePrefix("fec0::/10")
+		return !(ip.IsLoopback() || ip.IsUnspecified() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || siteLocal.Contains(ip))
+	}
+	if !strings.Contains(host, ".") || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return false
+	}
+	for _, sfx := range []string{".local", ".home.arpa", ".internal"} {
+		if strings.HasSuffix(host, sfx) {
+			return false
+		}
+	}
+	return true
+}
+
+// checkAPIKey is the api_key row of a provider (no network). A provider on
+// plain http to a computer off the local network gets the note
+// codeHintKeyPlainHTTP (AUD1 I-3), the row's status unchanged; a row with a
+// hint of its own (no key) keeps that one: without a key nothing is sent,
+// and once the key is entered the row is ok and shows the note.
 func (s *Server) checkAPIKey(dp diagProvider) SystemCheck {
 	c := SystemCheck{Name: "api_key:" + dp.name, Status: statusOK}
 	if s.set != nil {
@@ -889,6 +954,9 @@ func (s *Server) checkAPIKey(dp diagProvider) SystemCheck {
 			c.Status = statusError
 			c.setDetail("check.key_missing", nil)
 			c.setHint("check.hint_key_settings", map[string]any{"provider": p.Name})
+		}
+		if ok && c.HintInfo == nil && plainHTTPFar(p.BaseURL) {
+			c.setHint(codeHintKeyPlainHTTP, nil)
 		}
 		return c
 	}
@@ -910,6 +978,9 @@ func (s *Server) checkAPIKey(dp diagProvider) SystemCheck {
 			c.setDetail("check.key_not_configured", nil)
 			c.setHint("check.hint_key_config", map[string]any{"provider": dp.id})
 		}
+	}
+	if c.HintInfo == nil && plainHTTPFar(p.BaseURL) {
+		c.setHint(codeHintKeyPlainHTTP, nil)
 	}
 	return c
 }
@@ -1220,8 +1291,8 @@ func (s *Server) checkMLXPython(ctx context.Context) SystemCheck {
 // with device_unavailable).
 const mlxImport = "import mlx.core as mx, mlx_whisper; assert mx.metal.is_available(), 'the Metal GPU is not available'"
 
-// checkMLXImport imports mlx and mlx_whisper in the MLX interpreter; not
-// checked while MLX is not installed.
+// checkMLXImport imports mlx and mlx_whisper in the MLX interpreter
+// (python -I -c, as checkImport); not checked while MLX is not installed.
 func (s *Server) checkMLXImport(ctx context.Context) SystemCheck {
 	c := SystemCheck{Name: checkMLX, Status: statusOK}
 	python := s.diagInterp(model.BackendMLX)
@@ -1230,7 +1301,7 @@ func (s *Server) checkMLXImport(ctx context.Context) SystemCheck {
 		c.setDetail("check.api_skipped", nil) // "未检查"
 		return c
 	}
-	_, errOut, err := s.pyCmd(ctx, cmdTimeout, python.path, "-c", mlxImport)
+	_, errOut, err := s.pyCmd(ctx, cmdTimeout, python.path, "-I", "-c", mlxImport)
 	if err != nil {
 		detail := lastLine(errOut)
 		if detail == "" {
@@ -1293,7 +1364,7 @@ func (s *Server) systemView(ctx context.Context) System {
 	if s.sc != nil {
 		if env.nvidiaRows() {
 			g := s.sc.GPUStatus(ctx)
-			v.GPU = GPUInfo{TotalMB: g.TotalMB, FreeMB: g.FreeMB, Paused: g.Paused, SlotsUsed: g.SlotsUsed, SlotsMax: g.SlotsMax, EstimatedJobMB: g.EstimatedJobMB}
+			v.GPU = GPUInfo{TotalMB: g.TotalMB, FreeMB: g.FreeMB, Paused: g.Paused, SlotsUsed: g.SlotsUsed, SlotsMax: g.SlotsMax, EstimatedJobMB: g.EstimatedJobMB, EstimateRaised: g.EstimateRaised}
 		} else {
 			v.GPU.Paused = s.sc.GPUPaused()
 		}
@@ -1320,12 +1391,153 @@ func (s *Server) systemView(ctx context.Context) System {
 		v.Devices, v.Power, v.OpenVINO = s.deviceViews(ctx), s.powerView(), s.openVINOInfo()
 		if !env.nvidia {
 			v.Devices = slices.DeleteFunc(v.Devices, func(d ASRDeviceView) bool { return model.DeviceKind(d.ID) == model.DeviceKindCUDA })
+		} else if env.nvidiaRows() {
+			s.vramHints(ctx, v.Devices, v.GPU)
 		}
 		if v.OpenVINO != nil && (env.mac || !s.openVINOVisible(s.dev.LastDetection(), v.OpenVINO.Python)) {
 			v.OpenVINO = nil // mac-opti M3: no OpenVINO block where the checks are hidden too
 		}
 	}
 	return v
+}
+
+// vramHints sets the VRAMHint of cuda:0 (r2 N15): the card's
+// VRAM (nvidia-smi's total of GPU 0, as the GPU card; 0 when it was not
+// read) against the device's model, with whether its files are missing
+// (devices.WorkerState: WorkerNoModel, as the scheduler's model_missing
+// wait) and whether the recommended model's are there
+// (devices.ModelAvailable); r6: a model too large for the card whose files
+// are missing gets a hint of its own (NVIDIAVRAMHint, system_vram_hint.go).
+// Not for a device the user turned off. When the
+// scheduler's per-task estimate (g.EstimatedJobMB: since T-PERF-02 the
+// estimate of cuda:0's model and precision, sched.GPUStatus) plus
+// vram_reserve_mb is more than the VRAM transcription can have on the
+// card now (vramAvail), the hint gets an extra sentence (WithVRAMQueue),
+// or is that alone: a job there would likely wait for VRAM. Only a hint:
+// nothing is changed here.
+func (s *Server) vramHints(ctx context.Context, devs []ASRDeviceView, g GPUInfo) {
+	if g.TotalMB <= 0 {
+		return
+	}
+	reserve := 0
+	if s.set != nil {
+		reserve = s.set.ASR().VRAMReserveMB
+	}
+	avail := s.vramAvail(g)
+	dataDir := s.absDataDir()
+	for i := range devs {
+		d := &devs[i]
+		if d.ID != model.DeviceCUDA0 || !d.Enabled { // the total is GPU 0's
+			continue
+		}
+		missing := devices.WorkerState(s.cfg, dataDir, d.Backend, d.Model, d.Precision) == devices.WorkerNoModel
+		installed := func(name string) bool { return devices.ModelAvailable(s.cfg, dataDir, d.Backend, name, d.Precision) }
+		d.VRAMHint = WithVRAMQueue(NVIDIAVRAMHint(g.TotalMB, d.Model, missing, installed), g.TotalMB, avail, g.EstimatedJobMB, reserve,
+			s.vramFit(ctx, g.TotalMB))
+	}
+}
+
+// vramAvail is the VRAM transcription tasks could have on the card of g
+// now (R37 M1: the hint judges as the scheduler admits a first job, free -
+// reserve >= estimate): sched.VRAMAvailMB (the free memory, or while the
+// application's tasks run the free + used memory less what was in use
+// when the earliest started; 0 when other programs took it all, R37b B2),
+// the total only when that is unknown; without a scheduler VRAMAvail(g).
+func (s *Server) vramAvail(g GPUInfo) int {
+	if s.sc != nil {
+		if mb, ok := s.sc.VRAMAvailMB(); ok {
+			return min(max(mb, 0), g.TotalMB)
+		}
+		return g.TotalMB
+	}
+	return VRAMAvail(g)
+}
+
+// VRAMAvail is vramAvail from the GPU card alone (no scheduler: the mock
+// and the examples): its free memory when no GPU task runs and it was
+// read, else the total (tasks running: their memory cannot be told from
+// the other programs' here; unread: as before R37 M1).
+func VRAMAvail(g GPUInfo) int {
+	if g.SlotsUsed == 0 && g.FreeMB > 0 {
+		return min(g.FreeMB, g.TotalMB)
+	}
+	return g.TotalMB
+}
+
+// VRAMFit is the model and precision the diagnostics suggest for a card
+// whose per-task estimate is more than the card can give (WithVRAMQueue),
+// with its own per-task estimate (MB).
+type VRAMFit struct {
+	Model, Precision string
+	MB               int
+}
+
+// vramFit is the suggestion for a card of totalMB (r2 T-PERF-02): the
+// setup guide's model for the card (hwdetect.NVIDIAModel) at the precision
+// auto resolves to there, priced as the scheduler prices a job
+// (sched.VRAMEstimate; without a scheduler, devices.VRAMBaseMB of the
+// setting).
+func (s *Server) vramFit(ctx context.Context, totalMB int) VRAMFit {
+	f := VRAMFit{Model: hwdetect.NVIDIAModel(totalMB), Precision: config.ResolveComputeType(model.PrecisionAuto, "cuda", totalMB)}
+	switch {
+	case s.sc != nil:
+		f.MB = s.sc.VRAMEstimate(ctx, f.Model, f.Precision)
+	case s.set != nil:
+		f.MB = devices.VRAMBaseMB(s.set.ASR().VRAMPerJobMB, f.Model, f.Precision)
+	default:
+		f.MB = devices.VRAMBaseMB(0, f.Model, f.Precision)
+	}
+	return f
+}
+
+// WithVRAMQueue tells about the scheduler's admission of a first job on
+// the card (free - reserve >= estimate) when perJobMB (the per-task
+// estimate in effect, > 0) + reserveMB is more than availMB, the VRAM the
+// tasks could have now (vramAvail; 0 counts as 0; < 0 = unknown, and
+// above the total: totalMB).
+// params.extra of h gets, each with avail_mb:
+//   - HintVRAMQueue when perJobMB fits availMB (lowering the reserve or
+//     closing other programs helps) {per_job_mb, reserve_mb};
+//   - HintVRAMQueueSwitch when perJobMB alone is more than availMB and fit
+//     (the card's recommended model and precision) fits with the reserve
+//     (T-PERF-02: the estimate follows the model, so switching helps)
+//     {per_job_mb, reserve_mb, suggest, suggest_precision, suggest_mb};
+//   - HintVRAMQueueEstimate when perJobMB alone is more than availMB and
+//     fit does not fit either {per_job_mb, reserve_mb}.
+//
+// Without h (the model suits the card) it is the extra of a
+// HintVRAMQueueOnly hint (vram_gb: the total). h unchanged otherwise, and
+// (R67) when HintVRAMQueue would follow HintVRAMLowMissing or
+// HintVRAMLowMissingInstall: that model is not installed, so the sentence
+// about the reserve would name the wrong cause of the wait. The two
+// sentences about the card's recommendation still follow them.
+func WithVRAMQueue(h *model.ErrorInfo, totalMB, availMB, perJobMB, reserveMB int, fit VRAMFit) *model.ErrorInfo {
+	reserveMB = max(reserveMB, 0)
+	if availMB < 0 || availMB > totalMB {
+		availMB = totalMB
+	}
+	if totalMB <= 0 || perJobMB <= 0 || perJobMB+reserveMB <= availMB {
+		return h
+	}
+	extra := model.ErrorInfo{Code: hwdetect.HintVRAMQueue, Params: map[string]any{"per_job_mb": perJobMB, "reserve_mb": reserveMB, "avail_mb": availMB}}
+	if perJobMB > availMB {
+		extra.Code = hwdetect.HintVRAMQueueEstimate
+		if fit.Model != "" && fit.Precision != "" && fit.MB > 0 && fit.MB+reserveMB <= availMB {
+			extra.Code = hwdetect.HintVRAMQueueSwitch
+			extra.Params["suggest"], extra.Params["suggest_precision"], extra.Params["suggest_mb"] = fit.Model, fit.Precision, fit.MB
+		}
+	}
+	if extra.Code == hwdetect.HintVRAMQueue && h != nil && (h.Code == HintVRAMLowMissing || h.Code == HintVRAMLowMissingInstall) {
+		// R67: the wait is for the model's files, not for VRAM, and the
+		// estimate is that missing model's: lowering the reserve does not
+		// start anything yet
+		return h
+	}
+	if h == nil {
+		h = &model.ErrorInfo{Code: hwdetect.HintVRAMQueueOnly, Params: map[string]any{"vram_gb": hwdetect.VRAMGB(totalMB)}}
+	}
+	h.Params["extra"] = []model.ErrorInfo{extra}
+	return h
 }
 
 // configView is the read-only configuration (SPEC §9.10). v1.1: the

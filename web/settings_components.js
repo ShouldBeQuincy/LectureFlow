@@ -22,7 +22,7 @@ import { icon } from './icons.js';
 import { t } from './i18n.js';
 import * as U from './util.js';
 import { api, onComponentsEvent, componentsEventFresh, DESKTOP } from './api.js';
-import { componentName, componentHint, componentPicker, planSummary, planSpaceText, sourcePicker, sourcesText, chooseSourcesDialog, taskView, taskActive } from './components_ui.js';
+import { componentName, componentHint, componentPicker, planSummary, planSpaceText, sourcePicker, sourcesText, chooseSourcesDialog, taskView, taskActive, keepChildren } from './components_ui.js';
 
 const POLL_MS = 1000;
 const PLAN_DELAY = 250;
@@ -56,6 +56,18 @@ export function createComponentsSection(ui) {
   const rowBusy = new Set(); // component ids with an update / uninstall in flight
   const rowErrors = new Map(); // component id → message of the last failed action
   const views = new Map(); // task id → taskView
+  // Round 9 WV-10 (R87 S-R1, R81 L8): what holds a task view is kept and
+  // put in place with keepChildren, never taken out and put back on a
+  // redraw (its status line and its alert stay where they are): the
+  // section's head and body, the tasks block and each task's card
+  // (task id → {el, hd, title, hide}). view_settings.js renderBlock leaves
+  // the section's shell to render (aligns).
+  const cards = new Map();
+  let headEl = null;
+  let introEl = null;
+  let bodyEl = null;
+  let tasksEl = null;
+  let tasksTitle = null;
   const actingTasks = new Set(); // task ids with an action in flight
   const seenActive = new Set(); // tasks seen running while the page was open
   const hidden = new Set(); // finished tasks the user put away
@@ -283,6 +295,8 @@ export function createComponentsSection(ui) {
     return t(tk.kind === 'update' ? 'settings.comp.task.update' : 'settings.comp.task.install', { names });
   }
 
+  // A task's card: its title and "hide" (once it ended) changed in place,
+  // its view kept (WV-10).
   function taskCard(tk) {
     let v = views.get(tk.id);
     if (!v) {
@@ -290,26 +304,28 @@ export function createComponentsSection(ui) {
       views.set(tk.id, v);
     }
     v.update(tk);
-    return h(
-      'div',
-      { class: 'comp-task', dataset: { task: tk.id } },
-      h(
-        'div',
-        { class: 'comp-task-hd' },
-        h('span', { class: 'comp-task-title' }, taskTitle(tk)),
-        taskActive(tk)
-          ? null
-          : iconBtn('x', t('settings.comp.task.hide'), {
-              size: 14,
-              fkey: `comp:task:${tk.id}:hide`,
-              onclick: () => {
-                hidden.add(tk.id);
-                redraw();
-              },
-            }),
-      ),
-      v.el,
-    );
+    let c = cards.get(tk.id);
+    if (!c) {
+      const title = h('span', { class: 'comp-task-title' });
+      const hd = h('div', { class: 'comp-task-hd' }, title);
+      c = { el: h('div', { class: 'comp-task', dataset: { task: tk.id } }, hd, v.el), hd, title, hide: null };
+      cards.set(tk.id, c);
+    }
+    const text = taskTitle(tk);
+    if (c.title.textContent !== text) c.title.textContent = text;
+    if (!taskActive(tk) && !c.hide) {
+      c.hide = iconBtn('x', t('settings.comp.task.hide'), {
+        size: 14,
+        fkey: `comp:task:${tk.id}:hide`,
+        onclick: () => {
+          hidden.add(tk.id);
+          redraw();
+        },
+      });
+    }
+    keepChildren(c.hd, [c.title, taskActive(tk) ? null : c.hide]);
+    keepChildren(c.el, [c.hd, v.el]);
+    return c.el;
   }
 
   // ---- download sources ----
@@ -505,15 +521,19 @@ export function createComponentsSection(ui) {
 
   function tasksBlock() {
     const shown = shownTasks();
-    for (const id of [...views.keys()]) if (!shown.some((x) => x.id === id)) views.delete(id);
+    for (const id of [...views.keys()]) {
+      if (!shown.some((x) => x.id === id)) {
+        views.delete(id);
+        cards.delete(id);
+      }
+    }
     if (!shown.length) return null;
-    return h(
-      'div',
-      { class: 'comp-sec comp-tasks' },
-      h('h3', { class: 'comp-sec-title' }, t('settings.comp.tasks_title')),
-      shown.map(taskCard),
-      shown.some(taskActive) ? note('info', t('settings.comp.task.background')) : null,
-    );
+    if (!tasksEl) {
+      tasksEl = h('div', { class: 'comp-sec comp-tasks' });
+      tasksTitle = h('h3', { class: 'comp-sec-title' }, t('settings.comp.tasks_title'));
+    }
+    keepChildren(tasksEl, [tasksTitle, ...shown.map(taskCard), shown.some(taskActive) ? note('info', t('settings.comp.task.background')) : null]);
+    return tasksEl;
   }
 
   function sourcesRow() {
@@ -546,23 +566,21 @@ export function createComponentsSection(ui) {
     return ui.formRow(t('settings.comp.import_label'), [ctl, webPicker.input], t('settings.comp.import_hint'));
   }
 
+  // The section in its shell, which keeps what render put there before
+  // (aligns: view_settings.js does not empty it); the parts that hold the
+  // task views are kept, the others drawn anew as before (WV-10).
   function render(shell) {
-    shell.append(ui.head('layers', t('settings.comp.title')));
+    if (!headEl) headEl = ui.head('layers', t('settings.comp.title'));
     if (!list) {
-      shell.append(h('div', { class: 'card-bd' }, error ? errorBlock(t('settings.comp.load_error', { error }), retry) : skeleton(5)));
+      keepChildren(shell, [headEl, h('div', { class: 'card-bd' }, error ? errorBlock(t('settings.comp.load_error', { error }), retry) : skeleton(5))]);
       return;
     }
-    shell.append(
-      h(
-        'div',
-        { class: 'card-bd comp-body' },
-        h('p', { class: 'comp-intro' }, t('settings.comp.intro')),
-        tasksBlock(),
-        installedBlock(),
-        addBlock(),
-        h('div', { class: 'set-form comp-form' }, sourcesRow(), importRow()),
-      ),
-    );
+    if (!bodyEl) {
+      bodyEl = h('div', { class: 'card-bd comp-body' });
+      introEl = h('p', { class: 'comp-intro' }, t('settings.comp.intro'));
+    }
+    keepChildren(bodyEl, [introEl, tasksBlock(), installedBlock(), addBlock(), h('div', { class: 'set-form comp-form' }, sourcesRow(), importRow())]);
+    keepChildren(shell, [headEl, bodyEl]);
   }
 
   function retry() {
@@ -573,6 +591,7 @@ export function createComponentsSection(ui) {
 
   return {
     render,
+    aligns: true, // WV-10: render puts its children in place itself
     load,
     destroy() {
       alive = false;

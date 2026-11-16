@@ -491,6 +491,7 @@
   "stale_lecture_count": 1,
   "patches_pending": 14,
   "running_count": 2,
+  "failed_count": 0,
   "last_activity_at": "2026-10-23T13:57:29Z",
   "course_actions": [
    "launch_drafts",
@@ -686,6 +687,7 @@
   "stale_lecture_count": 1,
   "patches_pending": 12,
   "running_count": 1,
+  "failed_count": 1,
   "last_activity_at": "2026-10-23T13:58:38Z",
   "course_actions": [
    "update_stale",
@@ -879,6 +881,7 @@
   "stale_lecture_count": 0,
   "patches_pending": 0,
   "running_count": 1,
+  "failed_count": 1,
   "last_activity_at": "2026-10-23T13:59:18Z",
   "course_actions": [
    "launch_drafts",
@@ -919,6 +922,7 @@
   "stale_lecture_count": 0,
   "patches_pending": 7,
   "running_count": 1,
+  "failed_count": 0,
   "last_activity_at": "2026-10-23T13:59:18Z",
   "course_actions": [
    "export_cite"
@@ -978,6 +982,7 @@
   "stale_lecture_count": 0,
   "patches_pending": 0,
   "running_count": 0,
+  "failed_count": 0,
   "last_activity_at": "2026-10-23T13:45:00Z",
   "course_actions": [],
   "glossary_pending": true,

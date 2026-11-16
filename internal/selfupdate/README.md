@@ -157,6 +157,188 @@ diagnostics page warns about such a data directory and offers to make it
 private (`POST /api/system/data-dir/restrict`); LectureFlow makes the data
 directories it creates or moves private from the start (internal/dirperm).
 
+The same holds for what lies below `updates/` (security audit M-3): a
+folder another account made there while it could write stays that
+account's, whatever the data directory's permissions are now. `CheckTrust`
+therefore looks at every entry below `updates/` (`dirperm.CheckTree`: the
+entry's own owner and permissions — on Windows every entry of the DACL
+that is not a deny entry counts, object and callback kinds included, and
+writing attributes is a write right —, links never followed, at most
+50 000 entries and 32 levels) and, when the desktop shell's profile lies in
+the data directory, at `electron/` and `electron/selfupdate-trust.json`
+(the shell's record of the backups' hashes). The diagnostics look at more
+(the component environments, the whole profile) and end with this very
+check, so they never call private what the update refuses. `path` is then the entry found; a
+tree that cannot be vouched for (a link on Windows, more entries than the
+bound, an entry that cannot be examined) is refused with `who` = `not
+confirmed: <why>`. "Restrict access" on the diagnostics page resets such
+entries or says which one it could not reset.
+
+Permissions say who can change the files from now on, not who wrote them.
+What a rollback believes — `applying.json`, the shell's record in
+`electron/selfupdate-trust.json`, the backups, previous.json's `backup` —
+can be prepared as a whole in a data directory that holds the shell's
+profile while other accounts can write there (security review SEC17). So
+when "Restrict access" finds that the data directory was open to change
+(before the click, or an entry below it had to be reset, or the last look
+at it had not vouched for it), the service removes exactly that state
+(`VoidRollback`: the record file, `applying.json`, `updates/backup/`,
+previous.json's `backup`) and the answer carries `"rollback_reset": true`
+(next to `"error"` too, when the request then fails for another reason).
+Nothing is followed out of the data directory: `updates/` and `electron/`
+are entered only as plain directories, through handles (`os.Root`); one
+that is a junction, a symbolic link or another reparse point is removed
+itself, never what it leads to, and so is such a link among the files or
+below `backup/`. The update's own clean-up of old version folders
+likewise removes nothing through an `updates/` that is a link, and the
+shell's pruning of backups does not follow one either. The shell then
+finds no record: it ignores an `applying.json`, rolls
+nothing back and runs nothing. An update that really was on probation
+stays installed; should it fail to start later, the error of the start is
+shown and the previous version is not put back. The next update backs the
+installation up again. A data directory that was private all along, or
+whose shell profile lies under the user's own profile folder (a moved data
+directory), keeps its rollback state. While others can change the data
+directory nothing needs removing: every rollback is refused (exit 3).
+
+### The shell's record outside the data directory (Windows)
+
+Removing the state when the user restricts the folder protects only
+against what is still visible then: an account that once could write to
+the data directory can prepare the whole rollback state, record included,
+and then remove every trace of itself, so that nothing looks wrong and the
+button never appears (security review SEC17, 中-B). On Windows the shell
+therefore keeps its record — the installation it started, the backups'
+hashes — in `%LOCALAPPDATA%\LectureFlow\selfupdate\trust.json` (installed
+and portable builds alike; not moved with the data, not affected by
+`LECTUREFLOW_DATA_DIR`), and nothing in the data directory counts without
+it.
+
+- Every `-selfupdate-verify` run of the shell names that folder
+  (`-selfupdate-trust-dir`). `CheckTrustDir` makes it privately when it is
+  missing and refuses it (exit 3, like an untrusted data directory) when
+  it lies in the data directory or the data directory lies in it (also
+  with links resolved), when it is a link, or when another account can
+  change it or anything in it. `-selfupdate-trust-check` checks only that
+  (`ok trusted`).
+- Taking over the profile's record of an older version happens once:
+  `migrated.json` in the new folder (never a mark in the profile) is
+  written first, and the profile is never read again. Only the
+  installation now on probation is taken over (applying.json "installing"
+  of the running version, not started yet — `tries` 0 or missing, as the
+  older shell writes it — the same versions and target as the old record,
+  the target being this installation, the service program vouching for
+  both folders); the record of its backup with it when the profile does
+  not lie in the data directory, or when the data directory is the default
+  one, `%APPDATA%\LectureFlow` of this account (`APPDATA` an absolute path
+  with a drive letter; compared without regard to case or a final
+  separator), with the profile in it and no link, short name or
+  substituted drive on the way (SEC17 中-H, option b, approved by the user
+  2026-11-11: otherwise the first update after the move could not go back
+  for most users). A backup record taken over is used like any other: the
+  service program is asked about the previous version, the backup is
+  copied into a folder it made, and the copy is used only with the
+  recorded hash. Anywhere else the worst a prepared old record can do is a
+  rollback to a previous version's package verified with the built-in key
+  (an older signed version); no backup from the data directory is used.
+  Known limitation: in the default data directory, an account that could
+  write there before this version's first start and removed every trace
+  of itself (so the check passes) can have its own program installed in
+  place of LectureFlow and started, as the user, if the new version then
+  fails to start twice (the checks use the hash in that account's own
+  record, so they do not stop it); this one move only, accepted by the
+  user.
+- The shell drops its record of an installation when there is no
+  applying.json (a crash, or "Restrict access" removed it), so that a
+  later applying.json cannot match it.
+- `VoidRollback` keeps acting as above (defence in depth): it removes the
+  profile's old record, never the new one.
+- The NSIS uninstaller removes the folder, except during an update.
+- macOS keeps the record in the profile (there is no Mac to test a move
+  on): a known limitation. Linux has no in-app update.
+
+### The installation directory (Windows)
+
+The installer installs per user, without administrator rights, wherever
+the user chooses (security audit M-4). The default,
+`%LOCALAPPDATA%\Programs\lectureflow`, admits only the user, SYSTEM and
+the administrators; outside the user's profile and `%LOCALAPPDATA%` the
+installer gives the folder the same private permissions
+(`desktop/packaging/installer.nsh`, `icacls … /inheritance:r /grant:r`).
+A folder whose permissions let other accounts change it all the same (made
+by an older version in `D:\`, changed since, on FAT / exFAT, or below a
+folder others may rename) is not repaired by the app; it is refused:
+
+- The shell names the installation directory only for the Windows
+  installation set up by the installer (`updatefiles.installDirOf`):
+  development runs, the portable build and macOS have none, and nothing is
+  checked for them.
+- `CheckInstallDir` (installdir.go) refuses it as
+  `selfupdate.untrusted_install_dir {path, who}` when it is not absolute or
+  is a link, when another account owns it or may change it
+  (`dirperm.Check`), may remove or rename it or a folder above it
+  (`dirperm.CheckAbove`: DELETE, FILE_DELETE_CHILD or the rights to give
+  itself those, on entries that apply to that folder itself; the root of
+  the drive only for what lets others remove its entries), or owns or may
+  change an entry below it (`dirperm.CheckTree`, at most 20 000 entries and
+  32 levels, links never followed; `who` = `not confirmed: <why>` when the
+  walk cannot vouch for everything). SYSTEM, the administrators and
+  TrustedInstaller count as the user (Program Files passes); reading
+  counts for nothing, and `who` names only accounts that may change
+  something. A folder on the way that is a link (junction, symbolic link)
+  is not vouched for (`not confirmed`), and the path the system really
+  opens (`dirperm.FinalPath`: subst and mapped drive letters, links) is
+  walked up as well. A check that fails (the folder cannot be read) is
+  `not confirmed` too: refused like the rest (security review SEC20).
+- The service gets it as `-install-dir`: download and import answer 409
+  `selfupdate.untrusted_install_dir` (after the data directory's
+  `untrusted_dir`); the diagnostics show the `install_dir` row (a warning
+  with a hint that fits where the problem lies: the folder itself, a folder
+  above it, or the default place inside the profile, where reinstalling
+  does not help; no button).
+- Every `-selfupdate-verify` run of the shell names it
+  (`-selfupdate-install-dir`), checked after the data directory and the
+  trust folder, in every mode: exit 3 with the line
+  `untrusted_install_dir: …`. Nothing is installed or rolled back;
+  `pending.json` is kept, so the update installs once the folder is fixed.
+- After a rollback from a backup (`_replaceDir`: the failed installation
+  renamed away, the backup copied into a new folder of the same name) the
+  restore program asks for `-selfupdate-trust-check` with
+  `-selfupdate-install-dir` set to the installation it restored (applying.json's
+  `target`, not its own folder) and adds what it does not vouch for to the
+  rollback's reason (`…; after going back: …`); the rollback and the start
+  of the restored version are not affected (SEC20 中-1, 低-A).
+- An installation "for all users" (an administrator running the installer,
+  or `/allusers`: Program Files) keeps its permissions (SEC20 中-3).
+
+Known limitations (SEC20 中-2): the installer tightens the folder only
+after the files were unpacked, and during an in-app update the old
+version's uninstaller removes the folder and the new installer makes it
+again — with its parent's permissions until it is tightened. Another
+account that watches the path at that moment can change files while they
+are written (the check afterwards sees the user's files with private
+permissions) or take the folder's name first (then it is its owner, which
+the check does report). Closing this needs the installer to make the
+folder privately before unpacking and the update to keep it
+(electron-builder's `customUnInstallCheck` / `customRemoveFiles`); not done
+without a way to run the installer here. A folder of that name another
+account made before the first installation falls under the same
+limitation: the installer tightens it only after unpacking into it. After
+a failed update is rolled back, the installation folder is made anew and
+takes its permissions from the folder above it: outside the default place
+the private permissions do not come back by themselves — the app checks
+the folder and says so, and the user installs again or tightens it. In
+that case, while the rollback copies the files (after the failed folder
+is renamed away and before the copy is complete), the folder and the
+files being copied can be changed by the other accounts that may change
+the folder above; the check afterwards sees wrong permissions, not
+changes made in that time. The
+check runs the service
+program from the installation folder itself: it reports a folder that is
+open to others, not one whose programs others already replaced.
+electron-updater (builds without the update key) does not go through it.
+macOS is not checked (no Mac to test on).
+
 ## Sources and mirrors
 
 update.json is asked from every source below at the same time; of the
@@ -229,7 +411,10 @@ aria2c (internal/fetch); `HTTPDownloader` is the net/http fallback. Contract
 - write to the given path (`updates/<version>/<name>.part`), resuming what is
   there; helper files must start with that path (`….part.aria2`) and are
   removed when done;
-- the URLs are mirrors of one file, best first;
+- the URLs are mirrors of one file, best first; `UserURLs` names those that
+  come from the user's own sources (a directory or a `{url}` template), whose
+  hosts alone may be on this computer or the local network (the aria2c
+  downloader's guard proxy judges every other URL like a recording's);
 - send only `User-Agent: LectureFlow`;
 - return nil once the file has the expected size; the updater then hashes it,
   deletes it on a mismatch (`selfupdate.checksum`), and renames it to
@@ -337,12 +522,31 @@ one was restored) or `failed` (nothing was changed); `error`: optional short
 English reason (shown under "查看详情"). Go only reads it (status
 `last_result`).
 
+**A failed installation is remembered.** When result.json says `rolled_back`
+or `failed` for a version newer than the running one and there is no
+pending update of it (Electron keeps `pending.json` when it only could not
+check the package at this start: no failure), its `from` is the running
+version and `updates/<version>/` holds that version's update.json with a
+signature that verifies with the built-in key (a planted or stale
+result.json cannot hold back an update), Go records it at its start in
+kv `selfupdate.failed_install` (`{version, at, outcome, error, retry}`; `at`
+is result.json's, so the same result is recorded once). Until a strictly
+newer version appears (offered by a check, pending, or the running version
+itself), that version is not offered again (status `install_failed`) and its
+`updates/<version>/` directory is removed by the start's clean-up (an entry
+of the updates directory whose name is a version; never a path taken from a
+JSON file). Downloading it again, or an offline update of it, is the user's
+"try again": the record gets `retry` (no longer in effect, and the same
+result.json is not recorded again); a new failure is recorded again.
+
 ### What Electron does at start (before starting the service)
 
 1. Read `pending.json`. Ignore it (and delete it) unless `schema` is 1,
    `platform` and `kind` are this installation's, `version` is newer than the
    running version, and the file at `file` has `size` bytes and the SHA-256
-   `sha256` (hash it again: the file may have been damaged since).
+   `sha256` (hash it again: the file may have been damaged since). One that
+   is another copy's is ignored but **not** deleted or reported ("Copies
+   sharing one data directory" below).
    Then run the installed (old) service program to check it all again with
    its built-in public key, signature included, and to copy the package
    where nothing else can change it:
@@ -361,16 +565,32 @@ English reason (shown under "查看详情"). Go only reads it (status
    `pending.json`); 2 `not_configured: …` (a build without a public key:
    nothing can have been verified, do not install); 3 `untrusted_dir: …`
    (other accounts can change the data directory: do not install, keep
-   `pending.json` for a start after the permissions were tightened). Without
+   `pending.json` for a start after the permissions were tightened), or 3
+   `untrusted_install_dir: …` (with `-selfupdate-install-dir`: other
+   accounts can change the installation directory; the same, the user
+   installs the new version by hand). Without
    `-selfupdate-copy` it writes nothing and the ok line has no `copy=`.
 2. When previous.json has no `file`, back up the installation into
    `backup/<running version>/` (Windows portable: the executable; macOS: move
    the `.app`; Windows installed: the installation directory) and record it as
-   `backup`. The desktop shell also records the SHA-256 of the backup's
-   whole tree in its own profile (outside the data directory), and later
-   uses only a backup that still has it.
+   `backup`. The desktop shell also records the SHA-256 of the whole tree in
+   its own record (on Windows `trust.json` in
+   `%LOCALAPPDATA%\LectureFlow\selfupdate`, see "The shell's record outside
+   the data directory"; on macOS still the profile's
+   `electron/selfupdate-trust.json`, which `CheckTrust` covers while the
+   profile lies in the data directory). The hash is taken from
+   the installation itself, before it is copied or moved, and the backup
+   must have it once it lies in `backup/` (security audit M-3): a backup
+   that differs is not recorded, and on Windows the update is not installed
+   without one. Later only a backup that still has that hash is used. A
+   backup of the running version that is already there serves again only
+   while its recorded hash is the hash of the installation as it is now;
+   any other backup or record of that version is removed before the update
+   is installed (a backup and a record prepared together in a data
+   directory that was once writable for others agree with each other, not
+   with what is installed), and a new one is made where one is needed.
 3. Record the installation (versions and the installation's place) in the
-   shell's profile, rename `pending.json` to `applying.json` (so a crash
+   shell's record (see above for where it lies), rename `pending.json` to `applying.json` (so a crash
    during the installation is noticed), then install:
    - `installer`: run it silently (NSIS `/S`), then start the installed app;
    - `portable`: replace the portable executable (`PORTABLE_EXECUTABLE_FILE`)
@@ -391,14 +611,181 @@ English reason (shown under "查看详情"). Go only reads it (status
    (previous.json's `file`: the signature of `<version>/update.json`, the
    version binding, older than the running version, size and SHA-256; the
    same exit codes; exit 1 `selfupdate.not_available` when previous.json
-   names no package), and run from its copy; a backup only when its tree
-   still has the recorded hash. Exit 3 (or no answer at all): no rollback.
+   names no package), and run from its copy. Exit 3 (or no answer at all):
+   no rollback.
+   A backup is never run or restored from where it lies (security audit
+   M-3). The shell asks the service program for an empty directory only
+   this account can use,
+   `lectureflow -selfupdate-verify <updates directory> -app-version <running
+   version> -selfupdate-private -selfupdate-copy <temporary directory>`
+   (exit 0 `ok private=<temporary directory>/lectureflow-update-<n>`; 1
+   `invalid …` when it cannot be made; 3 `untrusted_dir: …`; no public key
+   is involved), copies the backup into `<that directory>/app` — after
+   checking, without reading a file, that the backup holds no more files
+   and bytes than were recorded — and hashes the copy: only a copy with the
+   recorded hash is used, and only the copy. Windows portable: the copy
+   replaces the executable; macOS: the copy is swapped in; Windows
+   installed: a copy of the failed version itself (`<that
+   directory>/helper`, the program that is running, started with
+   `--lf-restore`) waits for the app to quit, checks the hash of `app`
+   again and puts it into the installation directory. The shell's profile
+   records that directory and the hash with the installation
+   (`install.restore {dir, tree}`); the restore program does nothing from
+   anywhere else. The directory is removed when done, or by a later start
+   (copies older than ten minutes).
 
 Go drops a `pending.json` whose version is not newer than the running version
 (the update was installed), never reads or writes `applying.json`, and removes
 at start: offline-update staging directories and version directories that are
-neither the running version, the pending one, previous.json's, nor the
-available one being downloaded. Other names (`backup/`) are left alone.
+neither the running version, the pending one, another copy's pending one
+(below), previous.json's, nor the available one being downloaded (unless its
+installation failed, see result.json). Other names (`backup/`) are left
+alone. The one exception to both: "Restrict access" on a data directory that
+was open to change removes the rollback state, `applying.json` and `backup/`
+included (see the end of "Signature (minisign)").
+
+### Copies sharing one data directory
+
+The copy set up by the installer, the portable copy and an unpacked folder
+of one account all use `%APPDATA%\LectureFlow` unless told otherwise, and
+`pending.json`, `previous.json` and `applying.json` have one slot each. A
+copy leaves alone what belongs to another one (r6; security review SEC29
+section 6, case 6); it used to remove it and report a failure:
+
+- **`applying.json` naming another place** (`target` is an absolute path
+  that is not this installation's): the other copy's update on probation or
+  rolling back. Electron leaves it, the backups, the database snapshot and
+  previous.json exactly as they are and writes no result. (One naming this
+  place without a matching record, no place or a relative one is dropped as
+  before.)
+- **`pending.json` of the other kind** (this platform, `kind` installer for
+  the portable copy and the other way round), whatever its version:
+  Electron neither installs, removes nor reports it. Go does not take it
+  for its own (`Status.pending` stays empty, `DELETE
+  /api/selfupdate/pending` leaves it), keeps its package directory, and
+  starts no update of this copy meanwhile, because a download or an offline
+  update ends by replacing previous.json and pending.json:
+  `POST /api/selfupdate/download` and `POST /api/selfupdate/import` answer
+  409 `selfupdate.other_copy_pending {version, kind}` before anything is
+  fetched or staged (`kind` is a coded text, `{"code":
+  "selfupdate.copy_installer"}` or `copy_portable`: the page puts that
+  code's text, the name of the copy, into the sentence). A check still runs and the newer version is still
+  shown as available; the refusal tells the user to start the other copy
+  first. It ends when the other copy installs its update (its Electron
+  renames pending.json; the file is read again at every attempt). Only a
+  pending.json whose package is gone is removed, by either copy's Go.
+  The other copy may be gone for good, so the wait has an end: **14 days**
+  after `verified_at` (`OtherPendingMaxDays`) the download or offline
+  update is no longer refused and takes the slot as it always did. The old
+  pending.json is still not shown as this copy's and not removed for its
+  age, by Go or by Electron. One whose `verified_at` lies more than a day
+  ahead of this computer's clock (made while the clock was set far ahead)
+  is given up as well, or it would hold this copy back until that day; a
+  clock that is a little off is no reason. One without a readable
+  `verified_at` is never given up.
+- **A copy that cannot update itself** (an unpacked or copied folder):
+  Electron leaves every readable `pending.json` as it is and writes no
+  result (it used to remove it with "install the new version by hand").
+  Electron tells the service: `-no-self-update` (`Options.NoInstall`). Go
+  then takes no package for this copy's: a pending.json it finds is another
+  copy's whatever its platform, kind or version (not shown, not removed,
+  its package kept); a check still finds a newer version, shown without a
+  package (`available.file` empty: the page says to download it from the
+  releases page and install it by hand, and offers no download);
+  `POST /api/selfupdate/download` and `/import` answer 409
+  `selfupdate.no_package`. So such a copy never writes pending.json, and
+  the by-hand hint comes before a download instead of after a restart.
+
+Both sides decide by one rule whose a pending.json is (Go `otherCopys`,
+Electron `otherCopysPending`; the same table is in both tests), and Go is
+told the kind Electron decided: `-portable` for the portable build (the
+variable `PORTABLE_EXECUTABLE_FILE` is dropped from the environment where
+Electron does not accept it), `-no-self-update` for a copy that cannot
+update itself, neither for the installer's installation and the Mac app.
+
+Not covered (the slots stay single): two copies on probation at the same
+time, and a copy that installs its own update while another copy's
+`applying.json` lies there (it replaces it).
+
+A rollback keeps the database it replaces: before the snapshot is put
+back, `lectureflow.db`, `-wal` and `-shm` in the data directory are copied
+to `lectureflow.db.lf-before-rollback` (`-wal` and `-shm` after that name),
+one generation; a failure of this step is logged and the rollback goes on.
+The database never leaves its name for it (a copy, not a rename): whatever
+fails, or wherever the process dies, the data directory holds the database
+or the snapshot. `applying.json` records the decision (`db_kept`) before
+anything is replaced, so a rollback that starts over after a kill does not
+keep again what by then may be the snapshot; and when the snapshot does
+not get into the database's place at all, the copy is removed again.
+
+Putting the snapshot back never leaves a database beside the log of
+another one (reviews AUD2 L1, SEC40b PB-2: SQLite applies a stray `-wal`
+to whatever database lies beside it). The steps (`_restoreDb` in
+selfupdate.js), each retried like a rename while a file is in use:
+
+1. copy the snapshot's files beside the database (`<name>.lf-restore`);
+2. keep the database as it is now (above; after 1, so that on a nearly
+   full disk the snapshot gets the room, not the kept copy);
+3. rename the `-wal` and `-shm` that lie there aside (`<name>.lf-aside`);
+4. the snapshot's database takes the place of `lectureflow.db`;
+5. the snapshot's `-wal` / `-shm`, if it has them, follow;
+6. remove what was moved aside.
+
+| Step | When it fails | When the process is killed after it |
+|---|---|---|
+| 1 copy | database and log as they were → A | as they were, temporary files → R |
+| 2 keep | as they were, nothing kept; goes on with 3 | as they were → R |
+| 3 aside | moved back: as they were → A | the database without its last log; the log aside → R |
+| 4 swap | log moved back: as they were → A | the snapshot's database, no log beside it → R |
+| 5 follow | the snapshot's database without its log → B | the whole snapshot, stray aside files → R |
+| 6 remove | the whole snapshot; a stray `.lf-aside` file, logged | the whole snapshot → R |
+| undo of 3 / 4 fails too | the database without its last log (it lies beside it as `.lf-aside`) → B | |
+
+- **A**: nothing of the snapshot is in place, this run's kept copy is
+  removed. The rollback of the program goes on as it always did when the
+  snapshot was not put back; the rollback's error in result.json now says
+  that the database is as the new version left it, and why.
+- **B** (two faults in a row): the database is a valid one that lacks its
+  last log, never one with another's; the kept copy has it whole. The
+  rollback stops, result.json says `failed` with the files' names, and
+  `applying.json` stays, which makes the next start R.
+- **R**: the next start of this installation runs the rollback again
+  before it starts the service (`applying.json` still says `installing`
+  with the tries used up). Every step can be done again from any of these
+  states and ends with the whole snapshot.
+
+In every state `lectureflow.db` exists and is a database of its own.
+
+Nothing in LectureFlow opens the kept database. It holds the credentials
+the database held: after a data directory move the one left in the old
+directory is scrubbed like the old database (`relocate.ScrubOldDataDir`).
+
+Known limitations (review AUD2 L2; low, left to a later round):
+
+- **The kept database keeps its credentials.** They are the sealed values
+  the database held at the rollback (the data key lies in the same data
+  directory, protected by the account). A key the user removes or replaces
+  afterwards is still in `lectureflow.db.lf-before-rollback` (and its
+  `-wal`), until the next rollback replaces the kept copy, the data
+  directory is moved (the old directory's copy is scrubbed) or the user
+  deletes the files. The clean-up after a credential is replaced or removed
+  (`internal/db` secure writes, `secrets.scrub_pending`,
+  `check.credentials_scrub_pending`) does not touch it, on purpose: that
+  path works on a database handle and knows no data directory; it also
+  runs for writes nobody asked for (the Colab authorisation renewing
+  itself, the sealing at a start, relocate's scrubs of other databases),
+  so removing the files there would make the copy vanish at arbitrary
+  times, and removing them at all gives up what the copy is for. The
+  smaller and safer way is to scrub it like the databases imports replaced
+  (`scrubImportBackupsOnce` at start: credentials removed, the rest stays
+  readable), once per kept copy; not done yet.
+- **The update's own snapshot** (`updates/backup/<version>/db`, made when
+  an update is installed and removed when it is finished, so normally
+  there only while the new version starts for the first time) holds the
+  same credentials and is outside every clean-up: a move of the data
+  directory during that time copies it and leaves the old directory's
+  copy unscrubbed, and a rollback puts back a key that was removed
+  during that time.
 
 ## HTTP API
 
@@ -406,9 +793,9 @@ available one being downloaded. Other names (`backup/`) are left alone.
 |---|---|
 | `GET /api/selfupdate` | `Status` |
 | `POST /api/selfupdate/check` | 200 `Status` after the check; a failed check is `error` (`selfupdate.signature_invalid`, `version_mismatch`, `manifest_invalid`, `no_manifest` (the release has no update.json or signature: HTTP 404), `unreachable`, the most telling of all sources; `detail` lists every source's answer, one line each) and `state: "error"` unless an update can still be installed (see below); 409 `not_configured`, `busy` |
-| `POST /api/selfupdate/download` | 202 `Status` (`downloading`); 409 `not_configured`, `busy`, `not_available`, `too_old`, `no_package`, `untrusted_dir {path, who}` |
+| `POST /api/selfupdate/download` | 202 `Status` (`downloading`; for the version of `install_failed`: trying it again); 409 `not_configured`, `busy`, `not_available`, `too_old`, `no_package`, `untrusted_dir {path, who}`, `untrusted_install_dir {path, who}`, `other_copy_pending {version, kind}` |
 | `DELETE /api/selfupdate/download` | 200 `Status`: the download is cancelled (the partial file stays) |
-| `POST /api/selfupdate/import` | Desktop mode JSON `{"paths": [...]}` (or `{"path"}`), else multipart with one to three `file` parts. 200 `Status` (`pending`); 400 `signature_invalid`, `version_mismatch`, `manifest_invalid`, `checksum`, `import_incomplete {missing}`, `import_invalid {file}`; 409 `not_newer`, `too_old`, `no_package`, `not_configured`, `busy`, `untrusted_dir {path, who}`; the upload and path codes of the other upload endpoints |
+| `POST /api/selfupdate/import` | Desktop mode JSON `{"paths": [...]}` (or `{"path"}`), else multipart with one to three `file` parts. 200 `Status` (`pending`); 400 `signature_invalid`, `version_mismatch`, `manifest_invalid`, `checksum`, `import_incomplete {missing}`, `import_invalid {file}`; 409 `not_newer`, `too_old`, `no_package`, `not_configured`, `busy`, `untrusted_dir {path, who}`, `untrusted_install_dir {path, who}`, `other_copy_pending {version, kind}`; the upload and path codes of the other upload endpoints |
 | `DELETE /api/selfupdate/pending` | 200 `Status`: the pending update is dropped, with its files (`pending.json` and `updates/<version>/`; the running version's files and `backup/` stay) |
 | `GET /api/selfupdate/settings` | `{"auto_check": true, "sources": []}` |
 | `PATCH /api/selfupdate/settings` | `{"auto_check"?, "sources"?}` → 200 settings; 400 `selfupdate.sources_invalid {index}` |
@@ -420,7 +807,7 @@ progress at most once a second).
 
 ```
 state            not_configured | idle | checking | up_to_date | available |
-                 downloading | importing | pending | error
+                 downloading | importing | pending | error | install_failed
 reason           not_configured: no_public_key | web_mode | dev_build |
                  unsupported_platform | no_source
 current_version, channel (stable | beta), platform, kind, auto_check, last_check
@@ -431,6 +818,8 @@ progress         {bytes_done, bytes_total}       while downloading
 pending          {version, file, size, origin, verified_at}
 rollback         {version, package}   previous.json; package: a package or backup exists
 last_result      result.json
+install_failed   {version, at, outcome, error}   installing that newer version did
+                 not work: not offered again until a newer one appears
 error            {code, params, detail}          the last check or download failed
 ```
 
@@ -443,6 +832,10 @@ failure in `error` (a note). `state: "error"` is a failed download of the
 available version (`download_failed`, `checksum`, `io_failed`;
 `IsDownloadError`), or a failed check when nothing can be installed. A
 successful offline update clears the error.
+
+`install_failed` is the state while that version is the newest one known
+(`available` is then absent or that version, which may be downloaded again:
+"try again") and nothing is pending; a failed check is a note (`error`).
 
 ## Releasing
 

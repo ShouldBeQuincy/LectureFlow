@@ -327,14 +327,109 @@ func VerifyPrevious(dir string, o VerifyOptions) (Vouched, error) {
 	return v, nil
 }
 
+// PrivateDir makes a new, empty directory in parent that only this account
+// can use (named like the directory of a private copy: CopyPrefix and
+// digits) and returns its absolute path. The desktop shell copies a backup
+// of the installation into it and checks the copy's hash there before a
+// rollback uses it (security audit M-3). The directory is created with its
+// permissions (dirperm) and looked at once more: one that is not this
+// account's alone is removed and an error. Errors: CodeIO.
+func PrivateDir(parent string) (string, error) {
+	if parent == "" {
+		return "", ioErr(errors.New("no directory to make the private directory in"))
+	}
+	abs, err := filepath.Abs(parent)
+	if err != nil {
+		return "", ioErr(err)
+	}
+	dir, err := dirperm.MkdirTempPrivate(abs, CopyPrefix+"*")
+	if err != nil {
+		return "", ioErr(err)
+	}
+	rep, err := dirperm.CheckTree(dir, dirperm.TreeOptions{})
+	if err == nil && !rep.OK() {
+		p, who := rep.Problem()
+		err = fmt.Errorf("the new directory %s is not this account's alone (%s)", strings.TrimSpace(dir+" "+p), who)
+	}
+	if err != nil {
+		os.Remove(dir)
+		return "", ioErr(err)
+	}
+	return dir, nil
+}
+
+// Where the desktop shell keeps its record of the installation it started
+// and of the hashes of the backups it made (desktop/src/main/lib:
+// datadir.js SHELL_PROFILE_DIR, updatefiles.js TRUST_FILE): in its profile,
+// which lies in the data directory unless the data was moved elsewhere
+// (then it stays under the user's own profile folder). On Windows the
+// shell keeps it outside the data directory instead (trustdir.go,
+// CheckTrustDir) and reads the profile's file only once, when it takes a
+// record over from an older version; CheckTrust still looks at the
+// profile's file, which that one look relies on.
+const (
+	ShellProfileDir = "electron"
+	TrustRecordFile = "selfupdate-trust.json"
+)
+
+// updatesTree bounds the walk of the updates directory (CheckTrust): a few
+// versions' packages and one backup of the installation, some thousand
+// entries at most. A variable for the tests.
+var updatesTree = dirperm.TreeOptions{MaxEntries: 50000, MaxDepth: 32}
+
+// trustRecordScope narrows the walk of the shell's profile to the folder
+// itself and the record in it (the browser's own files are not the
+// update's business).
+func trustRecordScope(rel string) dirperm.Scope {
+	switch {
+	case rel == "":
+		return dirperm.ScopeAll
+	case strings.EqualFold(rel, TrustRecordFile):
+		return dirperm.ScopeSelf
+	}
+	return dirperm.ScopeSkip
+}
+
+// junctionAboveTop is where CheckTrust stops looking at the folders above
+// a data directory that is a junction and above the folder it leads to (""
+// = the root of the drive; tests stop at a folder of their own).
+var junctionAboveTop = ""
+
 // CheckTrust reports selfupdate.untrusted_dir {path, who} when another
-// account of this computer may change the data directory holding the
-// updates directory dir, or dir itself (dirperm.Check): then nothing in it
-// is installed or rolled back (sec-update M2). A missing updates directory
-// counts as its data directory. Other errors: CodeIO.
+// account of this computer may change what the in-app update relies on in
+// the data directory: then nothing in it is installed or rolled back
+// (sec-update M2, security audit M-3). Looked at:
+//
+//   - the data directory holding the updates directory dir, and dir itself
+//     (dirperm.Check); a data directory that is a junction is the folder
+//     it leads to, and one nobody can vouch for is refused
+//     (dirperm.ResolveJunction, who "not confirmed: …");
+//   - every entry below dir (dirperm.CheckTree: the packages, the JSON
+//     files, the backups of the installation): a folder another account
+//     made there while it could keeps that account as its owner, whatever
+//     the data directory's permissions are now;
+//   - the shell's profile folder and its record of the backups' hashes,
+//     when they lie in the data directory.
+//
+// path is the first entry found, who the accounts — or, when the walk
+// could not vouch for everything (a link, more entries than expected, an
+// entry that cannot be examined), "not confirmed: …". A missing updates
+// directory counts as its data directory. Other errors: CodeIO.
 func CheckTrust(dir string) error {
 	dir = filepath.Clean(dir)
-	for _, d := range []string{filepath.Dir(dir), dir} {
+	// A data directory that is a junction (security review SEC30, 低-3):
+	// the link's own permissions are not the folder's. The folder it
+	// leads to is checked instead when nobody else can have chosen it;
+	// otherwise nothing is vouched for — as the diagnostics' row "cannot
+	// be confirmed" (dirperm.ResolveJunction). Anything else: as it is.
+	data := filepath.Dir(dir)
+	root, _, doubt := dirperm.ResolveJunction(data, junctionAboveTop)
+	if doubt != "" {
+		who := dirperm.NotConfirmed + doubt
+		return cerr(CodeUntrustedDir, map[string]any{"path": data, "who": who},
+			fmt.Errorf("%s cannot be confirmed to be this account's alone (%s)", data, who))
+	}
+	for _, d := range []string{root, dir} {
 		e, err := dirperm.Check(d)
 		if err != nil {
 			if d == dir && isNotExist(err) {
@@ -347,6 +442,32 @@ func CheckTrust(dir string) error {
 			return cerr(CodeUntrustedDir, map[string]any{"path": d, "who": who},
 				fmt.Errorf("other accounts of this computer can change %s (%s)", d, who))
 		}
+	}
+	for _, t := range []struct {
+		root string
+		o    dirperm.TreeOptions
+	}{
+		{dir, updatesTree},
+		{filepath.Join(filepath.Dir(dir), ShellProfileDir), dirperm.TreeOptions{Scope: trustRecordScope}},
+	} {
+		rep, err := dirperm.CheckTree(t.root, t.o)
+		if err != nil {
+			if isNotExist(err) {
+				continue
+			}
+			return ioErr(err)
+		}
+		if rep.OK() {
+			continue
+		}
+		p, who := rep.Problem()
+		if p == "" {
+			// unconfirmed: who says why and names the entry
+			return cerr(CodeUntrustedDir, map[string]any{"path": t.root, "who": who},
+				fmt.Errorf("%s cannot be confirmed to be this account's alone (%s)", t.root, who))
+		}
+		return cerr(CodeUntrustedDir, map[string]any{"path": p, "who": who},
+			fmt.Errorf("other accounts of this computer can change %s (%s)", p, who))
 	}
 	return nil
 }

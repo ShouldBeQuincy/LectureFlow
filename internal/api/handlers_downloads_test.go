@@ -340,6 +340,7 @@ func TestImportLocalUserPathChecks(t *testing.T) {
 	// a user's path inside the data directory is refused (the app's own
 	// files only go through ImportDownload)
 	inside := writeDownload(t, e, "x")
+	e.grant(inside) // as if the user had picked it (T-SEC-08)
 	_, err := e.srv.copyFromPath(ctx, pathRequest{path: inside}, filepath.Join(e.cfg.DataDir, "tmpdir"), "media", nil)
 	if he, ok := err.(*httpError); !ok || he.info.Code != "upload.path_in_data_dir" {
 		t.Fatalf("inside: %v", err)
@@ -348,6 +349,7 @@ func TestImportLocalUserPathChecks(t *testing.T) {
 	if err := os.WriteFile(outside, []byte("abc"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	e.grant(outside)
 	res, err := e.srv.copyFromPath(ctx, pathRequest{path: outside, fields: map[string]string{"title": "T"}}, filepath.Join(e.root(), "dst"), "media", nil)
 	if err != nil || res.filename != "Lecture.MP4" || filepath.Base(res.path) != "media.mp4" || res.size != 3 || res.fields["title"] != "T" {
 		t.Fatalf("copy %+v %v", res, err)

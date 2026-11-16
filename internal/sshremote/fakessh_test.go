@@ -28,6 +28,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -46,6 +47,8 @@ type fakeRemote struct {
 	commands   []string
 	agentRuns  int
 	refuse     bool // refuse new TCP connections (closes them at once)
+	forward    bool // a jump host: "direct-tcpip" channels are forwarded
+	authTries  int  // public keys offered for authentication
 }
 
 // newFakeRemote starts a server playing a machine of uname (e.g.
@@ -140,6 +143,7 @@ func (f *fakeRemote) handle(c net.Conn, host ssh.Signer) {
 	cfg := &ssh.ServerConfig{
 		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			f.mu.Lock()
+			f.authTries++
 			ok := f.authorized[string(key.Marshal())]
 			f.mu.Unlock()
 			if ok {
@@ -157,6 +161,10 @@ func (f *fakeRemote) handle(c net.Conn, host ssh.Signer) {
 	defer sc.Close()
 	go ssh.DiscardRequests(reqs)
 	for nc := range chans {
+		if nc.ChannelType() == "direct-tcpip" && f.forwards() {
+			go forwardChannel(nc)
+			continue
+		}
 		if nc.ChannelType() != "session" {
 			_ = nc.Reject(ssh.UnknownChannelType, "only sessions")
 			continue
@@ -167,6 +175,60 @@ func (f *fakeRemote) handle(c net.Conn, host ssh.Signer) {
 		}
 		go f.session(ch, creqs)
 	}
+}
+
+// setForward makes the server a jump host (it forwards "direct-tcpip").
+func (f *fakeRemote) setForward(v bool) {
+	f.mu.Lock()
+	f.forward = v
+	f.mu.Unlock()
+}
+
+func (f *fakeRemote) forwards() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.forward
+}
+
+// authAttempts is how many public keys clients offered so far (a client
+// that stops at the host key offers none).
+func (f *fakeRemote) authAttempts() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.authTries
+}
+
+// forwardChannel serves one "direct-tcpip" channel (RFC 4254 §7.2): it
+// connects to the asked address and copies both ways until one side ends.
+func forwardChannel(nc ssh.NewChannel) {
+	var p struct {
+		Host     string
+		Port     uint32
+		OrigHost string
+		OrigPort uint32
+	}
+	if err := ssh.Unmarshal(nc.ExtraData(), &p); err != nil {
+		_ = nc.Reject(ssh.ConnectionFailed, "bad direct-tcpip request")
+		return
+	}
+	d := net.Dialer{Timeout: 5 * time.Second}
+	out, err := d.Dial("tcp", net.JoinHostPort(p.Host, fmt.Sprint(p.Port)))
+	if err != nil {
+		_ = nc.Reject(ssh.ConnectionFailed, "cannot connect")
+		return
+	}
+	ch, reqs, err := nc.Accept()
+	if err != nil {
+		out.Close()
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(out, ch); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(ch, out); done <- struct{}{} }()
+	<-done
+	out.Close()
+	ch.Close()
 }
 
 func (f *fakeRemote) session(ch ssh.Channel, reqs <-chan *ssh.Request) {

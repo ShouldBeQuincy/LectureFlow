@@ -39,6 +39,12 @@ type DesktopOptions struct {
 	// v3-brief §3): written when the user moves the data dir (V1.3); ""
 	// when the data dir was given by LECTUREFLOW_DATA_DIR (no move then).
 	LocationFile string
+	// InstallDir is the installation directory the desktop shell names
+	// (-install-dir: the Windows installation set up by the installer; ""
+	// = none: development, the portable build, macOS). The diagnostics'
+	// install_dir row says whether other accounts can change it
+	// (system_installdir.go).
+	InstallDir string
 }
 
 // TokenHeader is the request header carrying the desktop access token.
@@ -71,10 +77,16 @@ const maxOnboardingBytes = 64 << 10
 // (security review L6). In desktop mode it checks the token of every /api/
 // request; the static front end needs no token: the window loads it before
 // any script runs, and the main process injects the header into the API
-// requests (fetch, EventSource, <video>). In both modes a request that
-// changes something (not GET, HEAD or OPTIONS) and that another site's
-// page sent is refused (crossOrigin: a form post or a no-cors fetch needs
-// no CORS preflight; security review L6).
+// requests (fetch, EventSource, <video>). In both modes an /api/ request
+// the browser marks as sent by another site's page is refused whatever
+// its method (crossSiteFetch; final security audit AUD1 L-3: web mode has
+// no token, and some GET requests change something — the event stream,
+// /api/colab, the media request, cite.json), and so is a request that
+// changes something (not GET, HEAD or OPTIONS) another site's page sent
+// according to its Origin when the browser sends no Fetch Metadata
+// (crossOrigin: a form post or a no-cors fetch needs no CORS preflight;
+// security review L6). The static front end stays open to a link from
+// another site.
 func (s *Server) secure(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hd := w.Header()
@@ -91,6 +103,10 @@ func (s *Server) secure(next http.Handler) http.Handler {
 			}
 		} else if !webHostAllowed(r) {
 			writeError(w, http.StatusForbidden, "auth.bad_host", nil)
+			return
+		}
+		if (r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/")) && crossSiteFetch(r) {
+			writeError(w, http.StatusForbidden, "app.cross_site", nil)
 			return
 		}
 		if !safeMethod(r.Method) && s.crossOrigin(r) {
@@ -130,6 +146,22 @@ func webHostAllowed(r *http.Request) bool {
 
 func safeMethod(m string) bool {
 	return m == http.MethodGet || m == http.MethodHead || m == http.MethodOptions
+}
+
+// crossSiteFetch reports a request the browser's Fetch Metadata marks as
+// sent by another site's page: Sec-Fetch-Site cross-site, same-site
+// (another port of localhost) or a value this server does not know.
+// LectureFlow's own pages send same-origin (fetch, EventSource, <video>
+// and <audio>, a download link), an address typed or opened by the
+// desktop shell or a bookmark sends none; a client that is no browser
+// (the desktop shell's main process, curl) and an older browser send no
+// such header, and the Origin and Host checks apply to them as before.
+func crossSiteFetch(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "same-origin", "none":
+		return false
+	}
+	return true
 }
 
 // crossOrigin reports a request another page than LectureFlow's own sent.

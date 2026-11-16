@@ -207,7 +207,14 @@ func TestGlossaryReviewDirtyAfterFinalFailure(t *testing.T) {
 // retried run, which is followed by one more run.
 func TestGlossaryReviewDirtyKeptDuringRetryBackoff(t *testing.T) {
 	rs := newReviewStage()
-	e := newEnvOpts(t, nil, func(o *Options) { o.RetryBackoff = []time.Duration{400 * time.Millisecond} }, rs)
+	// The scheduler's clock stands still until the test moves it: the
+	// backoff lasts until the test has looked at it (a 400 ms state polled
+	// on a loaded machine can be over before it is seen).
+	clk := &gpuTestClock{t: time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)}
+	e := newEnvOpts(t, nil, func(o *Options) {
+		o.RetryBackoff = []time.Duration{400 * time.Millisecond}
+		o.Now = clk.Now
+	}, rs)
 	e.configureJanitor()
 	e.enqueueReview()
 	e.start()
@@ -215,17 +222,21 @@ func TestGlossaryReviewDirtyKeptDuringRetryBackoff(t *testing.T) {
 	first := e.review()
 	e.enqueueReview()
 	rs.finish(t, errors.New("HTTP 503"))
-	j := e.waitReview("requeued", func(j model.Job) bool { return j.Status == model.StatusQueued })
+	// The waiting reason is the scan's: wait for the scan that saw the job.
+	j := e.waitReview("requeued in backoff", func(j model.Job) bool {
+		return j.Status == model.StatusQueued && strings.HasPrefix(e.s.WaitingFor(j), model.WaitRetryBackoffPrefix)
+	})
 	if j.ID != first.ID || j.Attempt != 1 {
 		t.Fatalf("auto retry: %+v", j)
-	}
-	if w := e.s.WaitingFor(j); !strings.HasPrefix(w, model.WaitRetryBackoffPrefix) {
-		t.Fatalf("waiting_for = %q", w)
 	}
 	if e.dirty() != "1" {
 		t.Fatalf("dirty consumed during the backoff: %q", e.dirty())
 	}
-	rs.waitStarted(t) // the retry
+	if n := rs.runs.Load(); n != 1 {
+		t.Fatalf("runs during the backoff = %d", n)
+	}
+	clk.Advance(400 * time.Millisecond) // the backoff ends
+	rs.waitStarted(t)                   // the retry
 	if j := e.review(); j.ID != first.ID {
 		t.Fatal("the retry must reuse the job")
 	}

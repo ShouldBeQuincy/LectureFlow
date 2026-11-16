@@ -46,8 +46,29 @@ import { createAboutSection } from './settings_about.js';
 import { createComponentsSection } from './settings_components.js';
 import { createDownloadsSection } from './settings_downloads.js';
 import { createColabSection } from './settings_colab.js';
+import { createRemoteSection, sshEnabled, onServersChange } from './settings_remote.js';
 import { createASRModeRow } from './settings_asrmode.js';
-import { MAX_CONCURRENCY, MAX_RPM, DEEPSEEK_LIMITS, hasOldLimits, sameOrigin, endpointParts } from './provider_rules.js';
+import {
+  MAX_CONCURRENCY,
+  MAX_RPM,
+  DEEPSEEK_LIMITS,
+  hasOldLimits,
+  sameOrigin,
+  endpointParts,
+  limitsPrefill,
+  ANTHROPIC_RATE_LIMITS_URL,
+  MAX_TOKENS_LIMIT,
+  MAX_BATCH,
+  DEFAULT_IDLE_TIMEOUT_S,
+  MIN_IDLE_TIMEOUT_S,
+  MAX_IDLE_TIMEOUT_S,
+  thinkingFloorsAtLow,
+  defaultBatch,
+} from './provider_rules.js';
+import { openExternal, obApi, setErrorHandler as setObErrorHandler, errorHandler as obErrorHandler } from './onboarding_api.js';
+import { providersStep } from './onboarding_providers.js';
+import { createLimitsHint, limitsBanner } from './provider_limits.js';
+import { serverKind, parseMaxTokens } from './retry_model.js';
 
 const typeName = (type) => (has(`settings.provider.type.${type}`) ? t(`settings.provider.type.${type}`) : type);
 const roleHint = (role) => (has(`settings.role_hint.${role}`) ? t(`settings.role_hint.${role}`) : '');
@@ -95,6 +116,9 @@ function langName(code) {
   }
 }
 const CURRENCIES = ['CNY', 'USD', 'EUR', 'GBP', 'JPY'];
+// "Use for the roles…": confirmations in a row while the settings keep
+// changing elsewhere (R81 N1)
+const MAX_ROUNDS = 5;
 const MANUAL = '__manual__';
 const AUTO = 'auto'; // ASRSettings.device_mode "自动（电源感知）" (model.ASRDeviceModeAuto)
 const MANUAL_MODE = 'manual'; // "手动指定" with manual_devices (model.ASRDeviceModeManual)
@@ -105,6 +129,9 @@ const BLOCKS = [
   ['asr', 'mic', 'settings.block.asr'],
   // SPEC-v3 V14.2, V14.4 (settings_colab.js): own data and loading
   ['colab', 'zap', 'settings.colab.title'],
+  // ssh-1b (settings_remote.js): the SSH inference servers; own data, and
+  // only while the back end has them switched on (sshEnabled)
+  ['remote', 'plug', 'settings.remote.title'],
   ['general', 'sliders-horizontal', 'settings.block.general'],
   ['kinds', 'tag', 'settings.kinds.title'],
   ['holidays', 'calendar', 'settings.holidays.title'],
@@ -117,7 +144,9 @@ const BLOCKS = [
   ['about', 'info', 'settings.about.title'],
 ];
 // Blocks that load their own data (not GET /api/settings).
-const SELF_LOADED = new Set(['components', 'app', 'about', 'colab', 'downloads']);
+const SELF_LOADED = new Set(['components', 'app', 'about', 'colab', 'remote', 'downloads']);
+// Blocks shown only when their back end has them (ssh-1b: the SSH servers).
+const shownBlock = (b) => b[0] !== 'remote' || sshEnabled();
 const blockTitle = (b) => t(b[2]);
 
 // Kept for the whole page session: unsaved edits, the last connection test
@@ -132,14 +161,12 @@ const num = (v) => {
 };
 const isInt = (n) => Number.isInteger(n);
 
-// Local servers may run without a key (same rule as settings.IsLocal).
+// Local servers may run without a key (settings.IsLocal). The same reading
+// as the retry dialog's (retry_model.js serverKind, C3): 127.0.0.0/8 mapped
+// into IPv6 ([::ffff:127.0.0.1]) is local too; an address the browser and
+// the back end may read differently is not taken for local.
 function isLocal(baseURL) {
-  try {
-    const host = new URL(baseURL).hostname.toLowerCase().replace(/^\[|\]$/g, '');
-    return host === 'localhost' || host.endsWith('.localhost') || host === '::1' || /^127\./.test(host);
-  } catch {
-    return false;
-  }
+  return serverKind(baseURL) === 'local';
 }
 
 function hostOf(baseURL) {
@@ -148,6 +175,41 @@ function hostOf(baseURL) {
   } catch {
     return '';
   }
+}
+
+// AUD1 I-3: a provider's address on plain http to a computer off the local
+// network: its API key and the lecture content cross the network
+// unencrypted. A note only (the back end takes any http(s) address, and a
+// gateway on the local network commonly runs on plain http). No note for
+// this computer (isLocal, or a loopback address as the browser reads it),
+// a private, link-local, unique-local or carrier-grade NAT address (an IPv6
+// address carrying an IPv4 one as that address), or a name only a local
+// network resolves (one label, .local, .home.arpa, .internal).
+function plainHTTPFar(baseURL) {
+  let u;
+  try {
+    u = new URL(String(baseURL == null ? '' : baseURL).trim());
+  } catch {
+    return false;
+  }
+  if (u.protocol !== 'http:' || !u.hostname || isLocal(baseURL)) return false;
+  let host = u.hostname.toLowerCase().replace(/\.$/, '');
+  if (host.startsWith('[')) {
+    const ip6 = host.slice(1, -1);
+    const v4in6 = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(ip6);
+    // ::1, ::, fc00::/7, fe80::/10, fec0::/10
+    if (!v4in6) return !(ip6 === '::1' || ip6 === '::' || /^f[cd][0-9a-f]{2}:/.test(ip6) || /^fe[89a-f][0-9a-f]:/.test(ip6));
+    const hi = parseInt(v4in6[1], 16);
+    const lo = parseInt(v4in6[2], 16);
+    host = [hi >> 8, hi & 255, lo >> 8, lo & 255].join('.');
+  }
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(host);
+  if (v4) {
+    const a = Number(v4[1]);
+    const b = Number(v4[2]);
+    return !(a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168));
+  }
+  return host.includes('.') && !/\.(local|home\.arpa|internal)$/.test(host) && host !== 'localhost' && !host.endsWith('.localhost');
 }
 
 function needsKey(p) {
@@ -169,6 +231,12 @@ export function mountSettings(root, ctx, route) {
   const saving = new Set(); // blocks being saved
   const blockErrors = {}; // block → back-end error of the last failed save
   const rowErrors = {}; // role → error of the last failed save / validation
+  // v3.2.x: the field a role's error is about (max_tokens, batch), marked
+  // aria-invalid next to the message; the general block's idle-timeout error
+  // shown under its field
+  const rowErrorFields = {};
+  const fieldErrors = {};
+  const batchOpen = new Set(); // roles whose folded batch field is open (kept across re-renders)
   const manualRoles = new Set(); // roles whose model is typed by hand
   // the device list (asr_devices.js); its requests return device views that
   // replace data.devices
@@ -192,6 +260,7 @@ export function mountSettings(root, ctx, route) {
   let allPausedShown = !!(ctx.resources() && ctx.resources().gpu && ctx.resources().gpu.paused);
   let batteryShown = U.batteryMachine(ctx.resources());
   let pendingJump = route && route.section ? route : null;
+  let presetOpen = false; // "add from a preset" is open
   const foots = {};
   let balanceKey = '';
 
@@ -219,23 +288,34 @@ export function mountSettings(root, ctx, route) {
   const aboutUI = createAboutSection(sectionUI('about'));
   const compUI = createComponentsSection(sectionUI('components'));
   const colabUI = createColabSection(sectionUI('colab'));
+  const remoteUI = createRemoteSection(sectionUI('remote'));
   const dlUI = createDownloadsSection(sectionUI('downloads'));
-  const selfUI = { components: compUI, app: appUI, about: aboutUI, colab: colabUI, downloads: dlUI };
+  const selfUI = { components: compUI, app: appUI, about: aboutUI, colab: colabUI, remote: remoteUI, downloads: dlUI };
+  // ssh-1b: the section (and its TOC entry) appears once the back end
+  // answered with a server list; a jump to #/settings/remote waits for it
+  const remoteUnsub = onServersChange(() => {
+    renderBlock('remote');
+    if (data) devUI.render(); // an SSH server's row shows its state
+    jumpPending();
+  });
 
   // ---- data ----
 
+  // → whether the settings were read
   async function load() {
     try {
       const s = await api.settings();
-      if (!alive) return;
+      if (!alive) return false;
       error = '';
       setData(s);
+      return true;
     } catch (e) {
-      if (!alive) return;
+      if (!alive) return false;
       if (!data) {
         error = e.message || t('common.load_failed');
         render();
       }
+      return false;
     }
   }
 
@@ -276,12 +356,24 @@ export function mountSettings(root, ctx, route) {
   }
 
   // #/settings/asr/{device}: the block, then the device's test button (the
-  // workbench prompt "test now", SPEC-v2 I9)
+  // workbench prompt "test now", SPEC-v2 I9). Round 8 F4:
+  // #/settings/providers/preset opens "add from a preset" (the focus on the
+  // section's own entry once it is closed), #/settings/providers/{id} goes
+  // to that provider's row. Each address is handled once: the page drawn
+  // again does not repeat it.
   function jumpPending() {
     if (!pendingJump || !data) return;
     const r = pendingJump;
     pendingJump = null;
     if (!shells[r.section]) return;
+    if (r.section === 'remote' && !sshEnabled()) {
+      pendingJump = r; // the server list has not come yet
+      return;
+    }
+    if (r.section === 'providers' && r.device) {
+      jumpProvider(r.device);
+      return;
+    }
     jump(r.section);
     if (r.device) {
       const b = shells[r.section].querySelector(`[data-fkey="${CSS.escape(`set:dev:${r.device}:test`)}"]`);
@@ -291,6 +383,32 @@ export function mountSettings(root, ctx, route) {
         if (row) row.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'center' });
       }
     }
+  }
+
+  // F4: "preset", or a provider's id (one that is not there: the section's top)
+  function jumpProvider(dev) {
+    const shell = shells.providers;
+    if (dev === 'preset') {
+      jump('providers');
+      // the dialog gives the focus back to what had it: the section's entry
+      const entry = shell.querySelector('[data-fkey="set:prov:preset"]');
+      if (entry) entry.focus({ preventScroll: true });
+      presetDialog();
+      return;
+    }
+    const edit = shell.querySelector(`[data-fkey="${CSS.escape(`set:prov:${dev}:edit`)}"]`);
+    const row = edit && edit.closest('.pv-row');
+    if (!row) {
+      jump('providers');
+      return;
+    }
+    current = 'providers';
+    renderToc();
+    row.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'center' });
+    edit.focus({ preventScroll: true });
+    // a brief highlight (style.css .pv-row.flash; none where it is not styled)
+    row.classList.remove('flash');
+    row.classList.add('flash');
   }
 
   function retry() {
@@ -328,13 +446,37 @@ export function mountSettings(root, ctx, route) {
   }
 
   function serverRole(r) {
-    return { provider_id: r.provider_id || '', model: r.model || '', temperature: String(r.temperature), window: r.window != null ? String(r.window) : '', thinking: r.thinking || 'off' };
+    return {
+      provider_id: r.provider_id || '',
+      model: r.model || '',
+      temperature: String(r.temperature),
+      window: r.window != null ? String(r.window) : '',
+      thinking: r.thinking || 'off',
+      // v3.2.x: "" = automatic (max_tokens) / the provider's and model's
+      // default (batch, translate only: defaultBatch, 10 for Claude on Anthropic, else 1)
+      max_tokens: r.max_tokens != null ? String(r.max_tokens) : '',
+      batch: r.batch != null ? String(r.batch) : '',
+    };
   }
   function roleVal(r) {
     return drafts.roles[r.role] || serverRole(r);
   }
+  // An optional number field: both empty, or the same number.
+  function sameOpt(a, b) {
+    const x = String(a == null ? '' : a).trim();
+    const y = String(b == null ? '' : b).trim();
+    return x === y || (x !== '' && y !== '' && Number(x) === Number(y));
+  }
   function sameRole(a, b) {
-    return a.provider_id === b.provider_id && a.model.trim() === b.model.trim() && num(a.temperature) === num(b.temperature) && num(a.window) === num(b.window) && thinkingOf(a) === thinkingOf(b);
+    return (
+      a.provider_id === b.provider_id &&
+      a.model.trim() === b.model.trim() &&
+      num(a.temperature) === num(b.temperature) &&
+      num(a.window) === num(b.window) &&
+      thinkingOf(a) === thinkingOf(b) &&
+      sameOpt(a.max_tokens, b.max_tokens) &&
+      sameOpt(a.batch, b.batch)
+    );
   }
   // The thinking level a role value means: off on a provider without
   // thinking (settings.SupportsThinking; the select is disabled there).
@@ -381,13 +523,26 @@ export function mountSettings(root, ctx, route) {
 
   function serverGeneral() {
     const g = data.general;
-    return { keep_original_media: g.keep_original_media, notifications: g.notifications, daily_budget: String(g.daily_budget) };
+    return {
+      keep_original_media: g.keep_original_media,
+      notifications: g.notifications,
+      daily_budget: String(g.daily_budget),
+      // v3.2.x: absent = on; absent idle timeout = the default ("" here)
+      auto_chapters: g.auto_chapters !== false,
+      llm_idle_timeout_s: g.llm_idle_timeout_s != null ? String(g.llm_idle_timeout_s) : '',
+    };
   }
   function generalVal() {
     return drafts.general || serverGeneral();
   }
   function sameGeneral(a, b) {
-    return a.keep_original_media === b.keep_original_media && a.notifications === b.notifications && num(a.daily_budget) === num(b.daily_budget);
+    return (
+      a.keep_original_media === b.keep_original_media &&
+      a.notifications === b.notifications &&
+      num(a.daily_budget) === num(b.daily_budget) &&
+      a.auto_chapters === b.auto_chapters &&
+      sameOpt(a.llm_idle_timeout_s, b.llm_idle_timeout_s)
+    );
   }
 
   function dirty(block) {
@@ -413,6 +568,7 @@ export function mountSettings(root, ctx, route) {
     if (sameRole(next, serverRole(r))) delete drafts.roles[r.role];
     else drafts.roles[r.role] = next;
     delete rowErrors[r.role];
+    delete rowErrorFields[r.role];
     delete blockErrors.roles;
     if (rerender) {
       renderBlock('roles');
@@ -420,7 +576,136 @@ export function mountSettings(root, ctx, route) {
     }
     const row = shells.roles.querySelector(`.rl-row[data-role="${r.role}"]`);
     if (row) row.classList.toggle('is-dirty', roleDirty(r));
+    if (row && r.role === 'translate') syncBatch(row, r);
+    if (row) syncMaxTokens(row, r);
+    if (row) syncThinkFloor(row, r);
     syncFoot('roles');
+  }
+  // v3.2.x: claude-opus-5-5 (and the Fable and Mythos families, W4c) cannot
+  // switch thinking off; "off" runs at the lowest level (effort low). The
+  // short note in the thinking cell, the full one under the row, which
+  // describes the thinking select.
+  // Only an Anthropic provider runs the model so (C3, R42: internal/llm's
+  // anthropicAlwaysThinks is the Anthropic client's); an OpenAI-compatible
+  // one sends "off" as it is.
+  function floorNoteOf(v) {
+    const thinkVal = thinkingOf(v);
+    const p = providerOf(v.provider_id);
+    return !!p && p.type === 'anthropic' && thinkVal === 'off' && thinkingFloorsAtLow(v.model) ? t('settings.roles.thinking_floor_note', { model: v.model.trim() }) : '';
+  }
+  const floorId = (r) => `rl-${r.role}-think_floor-hint`;
+  const floorShort = (r, note) => h('span', { class: 'rl-sub rl-think-floor', title: note, dataset: { fkey: `set:role:${r.role}:think_floor` } }, icon('info', { size: 12 }), ' ', t('settings.roles.thinking_floor_short'));
+  const floorMsg = (r, note) => h('p', { class: 'rl-msg rl-floor-msg', id: floorId(r) }, icon('info', { size: 13 }), note);
+  // A model picked from the list or typed, or a thinking level picked, does
+  // not re-render the row: the notes follow in place (T11 general 4).
+  function syncThinkFloor(row, r) {
+    const note = floorNoteOf(roleVal(r));
+    const short = row.querySelector('.rl-think-floor');
+    const msg = row.querySelector('.rl-floor-msg');
+    if ((short ? short.getAttribute('title') : '') === note && !!msg === !!note) return;
+    if (short) short.remove();
+    if (msg) {
+      const box = msg.parentNode;
+      msg.remove();
+      if (box && !box.children.length) box.remove();
+    }
+    const sel = row.querySelector(`[data-fkey="set:role:${r.role}:thinking"]`);
+    if (sel) {
+      if (note) sel.setAttribute('aria-describedby', floorId(r));
+      else sel.removeAttribute('aria-describedby');
+    }
+    if (!note) return;
+    const cell = row.querySelector('.rl-think');
+    if (cell) cell.append(floorShort(r, note));
+    let box = row.querySelector('.rl-notes');
+    if (!box) {
+      box = h('div', { class: 'rl-notes' });
+      row.append(box);
+    }
+    box.append(floorMsg(r, note));
+  }
+  // The translate row's batch default (defaultBatch: the role's provider and
+  // current model) and the chips of its folded summary. Typing a model name
+  // or a batch does not re-render the row, so syncBatch updates them in place.
+  function batchView(v) {
+    const defBatch = defaultBatch(providerOf(v.provider_id), v.model);
+    let setBatch = String(v.batch == null ? '' : v.batch).trim();
+    // round 2 (T6 #9): a value outside 1–MAX_BATCH or not a whole number
+    // gets no chip at all ("Set to 25" read as if it were saved); the
+    // validation error says what is wrong
+    const bad = setBatch !== '' && (!isInt(num(setBatch)) || num(setBatch) < 1 || num(setBatch) > MAX_BATCH);
+    // a valid value as the number it is and is saved as ("1.0", "01": 1;
+    // C3, R28 A6: the chip said "Set to 1.0")
+    if (setBatch !== '' && !bad) setBatch = String(num(setBatch));
+    return {
+      defBatch,
+      setBatch,
+      bad,
+      // empty: the default, as a chip when it is above 1
+      showDefault: setBatch === '' && defBatch > 1,
+      // a valid value: as set; 1 only where the default is not 1
+      showValue: !bad && setBatch !== '' && (setBatch !== '1' || defBatch !== 1),
+    };
+  }
+  function syncBatch(row, r) {
+    const b = batchView(roleVal(r));
+    const q = (x) => row.querySelector(`[data-fkey="set:role:${r.role}:${x}"]`);
+    const inp = q('batch');
+    const def = q('batch_default');
+    const dchip = q('batch_default_chip');
+    const vchip = q('batch_value_chip');
+    if (inp) inp.placeholder = String(b.defBatch);
+    if (def) def.textContent = t('settings.roles.batch_default', { n: b.defBatch });
+    if (dchip) {
+      dchip.textContent = t('settings.roles.batch_default', { n: b.defBatch });
+      dchip.hidden = !b.showDefault;
+    }
+    if (vchip) {
+      vchip.textContent = t('settings.roles.batch_value_chip', { value: b.setBatch });
+      vchip.hidden = !b.showValue;
+    }
+    // round 2 (T6 #9): the error of the last save stays while the value is
+    // still invalid and goes as soon as it is valid (empty included),
+    // without a re-render (the field keeps the focus and the caret)
+    if (inp && inp.getAttribute('aria-invalid') === 'true') {
+      if (b.bad) {
+        rowErrors[r.role] = t('errors.settings.batch_invalid', { min: 1, max: MAX_BATCH });
+        rowErrorFields[r.role] = 'batch';
+      } else {
+        inp.removeAttribute('aria-invalid');
+        dropErrRef(inp, r.role);
+        const msg = row.querySelector('.rl-msg.is-err[role="alert"]');
+        if (msg) msg.remove();
+        row.classList.remove('is-error');
+      }
+    }
+  }
+  // C3 (R28 A5): the output limit's error, as the batch's (syncBatch): it
+  // stays while the value is still invalid and goes as soon as it is valid
+  // (empty included), without a re-render
+  function syncMaxTokens(row, r) {
+    const inp = row.querySelector(`[data-fkey="set:role:${r.role}:max_tokens"]`);
+    if (!inp || inp.getAttribute('aria-invalid') !== 'true') return;
+    if (maxTokensBad(roleVal(r), r)) {
+      rowErrors[r.role] = t('errors.settings.max_tokens_invalid', { min: 1, max: MAX_TOKENS_LIMIT });
+      rowErrorFields[r.role] = 'max_tokens';
+      return;
+    }
+    inp.removeAttribute('aria-invalid');
+    dropErrRef(inp, r.role);
+    const msg = row.querySelector('.rl-msg.is-err[role="alert"]');
+    if (msg) msg.remove();
+    row.classList.remove('is-error');
+  }
+  // T18: a role row's error line (its id), which describes the field it is
+  // about (aria-describedby) until the value is valid again
+  function roleErrId(role) {
+    return `rl-${role}-err`;
+  }
+  function dropErrRef(inp, role) {
+    const ids = (inp.getAttribute('aria-describedby') || '').split(' ').filter((x) => x && x !== roleErrId(role));
+    if (ids.length) inp.setAttribute('aria-describedby', ids.join(' '));
+    else inp.removeAttribute('aria-describedby');
   }
   function setASRDraft(patch, rerender = false) {
     const next = { ...asrVal(), ...patch };
@@ -433,6 +718,10 @@ export function mountSettings(root, ctx, route) {
     const next = { ...generalVal(), ...patch };
     drafts.general = sameGeneral(next, serverGeneral()) ? null : next;
     delete blockErrors.general;
+    if ('llm_idle_timeout_s' in patch && fieldErrors.idle) {
+      delete fieldErrors.idle;
+      rerender = true;
+    }
     if (rerender) renderBlock('general');
     else syncFoot('general');
   }
@@ -441,11 +730,13 @@ export function mountSettings(root, ctx, route) {
     if (block === 'roles') {
       drafts.roles = {};
       for (const k of Object.keys(rowErrors)) delete rowErrors[k];
+      for (const k of Object.keys(rowErrorFields)) delete rowErrorFields[k];
       manualRoles.clear();
     } else if (block === 'asr') {
       drafts.asr = null;
     } else if (block === 'general') {
       drafts.general = null;
+      delete fieldErrors.idle;
     }
     delete blockErrors[block];
     renderBlock(block);
@@ -463,7 +754,11 @@ export function mountSettings(root, ctx, route) {
     const shell = shells[name];
     if (SELF_LOADED.has(name)) {
       preserveFocus(() => {
-        clear(shell);
+        // round 9 WV-10 (R87 S-R1): a block that puts its own children in
+        // place (aligns: the components and Colab sections, with
+        // components_ui.js keepChildren) is not emptied first, so a task's
+        // view stays where it is; the other blocks are drawn anew as before
+        if (!selfUI[name].aligns) clear(shell);
         selfUI[name].render(shell);
       });
       renderToc();
@@ -503,9 +798,35 @@ export function mountSettings(root, ctx, route) {
     );
   }
 
+  // r7 (T22 G10): a setup guide left before its end (started, not done:
+  // GET /api/onboarding) is continued from here, where it left off; the
+  // guide's "leave setup" says so. A state never started (the default,
+  // e.g. an install from before the guide) asks for nothing. The rule is
+  // util.js guideLeft, which the workbench's entry shares (round 8 F3).
+  let guide = null;
+  obApi
+    .onboarding({ quiet: true })
+    .then((st) => {
+      if (!alive) return;
+      guide = st;
+      preserveFocus(renderAlerts);
+    })
+    .catch(() => {});
+
   function renderAlerts() {
     clear(alerts);
     if (!data) return;
+    if (U.guideLeft(guide)) {
+      alerts.append(
+        h(
+          'div',
+          { class: 'banner banner-info set-banner' },
+          icon('graduation-cap', { size: 16 }),
+          h('span', { class: 'set-banner-text' }, t('settings.alert.guide_left')),
+          btn(t('settings.alert.guide_continue'), { size: 'sm', onclick: () => (location.hash = '#/onboarding'), fkey: 'set:alert:guide' }),
+        ),
+      );
+    }
     if (transcribeOnly(data.roles)) {
       alerts.append(
         h(
@@ -513,7 +834,9 @@ export function mountSettings(root, ctx, route) {
           { class: 'banner banner-info set-banner' },
           icon('info', { size: 16 }),
           h('span', { class: 'set-banner-text' }, t('settings.alert.transcribe_only')),
-          btn(t('settings.alert.add_provider'), { size: 'sm', onclick: () => jump('providers'), fkey: 'set:alert:transcribe_only' }),
+          // r7 (T22 S6): the cost plans and how to get a key, not the bare form
+          // gone once a service is added: the focus goes to the section's own entry (R75 L3)
+          btn(t('settings.alert.add_provider'), { size: 'sm', onclick: presetDialog, fkey: 'set:alert:transcribe_only', fnext: 'set:prov:preset' }),
         ),
       );
     }
@@ -554,7 +877,8 @@ export function mountSettings(root, ctx, route) {
   // every keystroke through syncFoot).
   let tocKey = '';
   function renderToc() {
-    const marks = BLOCKS.map(([name]) => {
+    const blocks = BLOCKS.filter(shownBlock);
+    const marks = blocks.map(([name]) => {
       if (dirty(name)) return 'dirty';
       if (data && name === 'roles' && data.roles.some(roleBroken)) return 'err';
       if (data && name === 'providers' && data.providers.some((p) => needsKey(p) && p.used_by_roles.length)) return 'warn';
@@ -588,7 +912,7 @@ export function mountSettings(root, ctx, route) {
     };
     preserveFocus(() => {
       clear(toc);
-      toc.append(h('ul', { class: 'set-toc-list' }, BLOCKS.map(item)));
+      toc.append(h('ul', { class: 'set-toc-list' }, blocks.map(item)));
     });
   }
 
@@ -646,7 +970,18 @@ export function mountSettings(root, ctx, route) {
       f.status.append(h('span', { class: 'set-dirty-dot', 'aria-hidden': 'true' }), n > 1 ? t('settings.foot.dirty_roles', { n }) : t('settings.unsaved'));
     } else f.status.append(icon('check', { size: 14 }), t('settings.foot.saved'));
     f.undoBtn.hidden = !d || busy;
-    f.saveBtn.disabled = !d || busy;
+    // T23 serious 3: a "save" that has the focus (it was just pressed) is
+    // not disabled while it saves and once there is nothing left to save:
+    // the focus would fall to the page. It is aria-disabled instead, as
+    // "test connection" while it runs, and keeps the focus through the
+    // block's redraw (preserveFocus by its data-fkey); a press then does
+    // nothing (saveRoles / saveASR / saveGeneral return without changes or
+    // while saving). Without the focus it is disabled as before.
+    const off = !d || busy;
+    const keep = off && document.activeElement === f.saveBtn;
+    f.saveBtn.disabled = off && !keep;
+    if (keep) f.saveBtn.setAttribute('aria-disabled', 'true');
+    else f.saveBtn.removeAttribute('aria-disabled');
     const lbl = f.saveBtn.querySelector('.btn-label');
     if (lbl) lbl.textContent = busy ? t('settings.saving') : t('common.save');
     renderToc();
@@ -654,10 +989,290 @@ export function mountSettings(root, ctx, route) {
 
   // ---- providers ----
 
+  // r7 (T22 S6): "add from a preset" — the setup guide's step "translation
+  // and repair" (onboarding_providers.js) in a dialog: the cost plans, then
+  // for each service of the plan how to get an API key (steps, sign-up,
+  // key and price pages), the key and "test connection". A key saved there
+  // adds the service at once (POST /api/providers with the preset's
+  // address and limits); that is all the dialog does by itself. Nothing of
+  // the guide's own state is touched (save is a no-op here). Its requests
+  // that are not quiet report their errors as toasts while it is open.
+  // R75 M1: unlike the guide (nothing set up yet), the roles here are the
+  // user's own. "Use this plan for the roles…" is a step of its own: a
+  // confirmation lists each role that would change (now → then), the
+  // parameters each role keeps (temperature, thinking, output limit, the
+  // translation's window and batch: only the provider and the model
+  // change; thinking goes off where the new service has none, said there),
+  // the zero-cost plan's night window for free services that have no
+  // tariff yet (one they have is kept, said there), and unsaved edits of
+  // those roles that are dropped.
+  async function presetDialog() {
+    if (presetOpen) return; // one at a time (F4: the address may ask while it is open)
+    presetOpen = true;
+    let step = null;
+    // the last roles step: {n changed, total confirmed, told}; its writes
+    // while they run (R81 L1: Esc or the backdrop may close the dialog then)
+    let result = null;
+    let writing = null;
+    // R81b L10: roles this dialog changed that the page's settings may not
+    // show yet (stopped half way, and the settings could not be read again)
+    let ownUnseen = false;
+    const before = new Set(((data && data.providers) || []).map((p) => p.id)); // the services before
+    const onErr = (err) => toast(err.message, err.status >= 500 || err.status === 0 ? 'error' : 'warn');
+    setObErrorHandler(onErr);
+    try {
+      await openDialog(
+        t('settings.provider.preset_title'),
+        (close, busy) => {
+          const box = h('div', { class: 'set-preset-body' });
+          const actions = h('div', { class: 'dlg-actions' });
+          let applying = false;
+          const env = {
+            inSettings: true,
+            cache: {},
+            data: { tier: '' },
+            alive: () => alive && !!step,
+            rerender: draw,
+            save: async () => {},
+            setData: async (patch) => void Object.assign(env.data, patch),
+            next() {}, // the guide's "use this plan" (apply) is not offered here
+          };
+          function draw() {
+            if (!step) return;
+            preserveFocus(() => {
+              clear(box);
+              box.append(...[step.body()].flat(Infinity).filter(Boolean));
+              clear(actions);
+              const plan = step.plan();
+              actions.append(
+                // R81 N1: what changes is worked out when it is pressed, not here
+                btn(t('settings.provider.preset_roles'), { icon: 'bot', disabled: applying || !plan, onclick: useForRoles, fkey: 'set:preset:roles' }),
+                btn(t('common.close'), { kind: 'primary', disabled: applying, onclick: () => close(null), fkey: 'set:preset:close' }),
+              );
+            });
+          }
+          // R81 N1: the changes are worked out from the settings as the page
+          // has them when the button is pressed (kept fresh by the event
+          // stream); once confirmed, the settings are read again: the same
+          // changes are written, else (changed elsewhere meanwhile) they are
+          // worked out again and shown again, saying so, never written over
+          // nor dropped unseen. Bounded: settings changing on every read
+          // give up after MAX_ROUNDS confirmations, with a word.
+          async function useForRoles() {
+            if (!step) return;
+            let ch = roleChanges(step.plan());
+            let changed = '';
+            // a confirmation shown again may be about this dialog's own
+            // writes then: said without naming where the change came from
+            const mine = ownUnseen;
+            for (let round = 0; ; round++) {
+              // R75 M2: nothing that could change (no key yet, or the roles
+              // already use these): said, and no confirmation to nothing
+              if (!ch.rows.length) {
+                toast(t(ch.missing.length ? 'settings.provider.preset_roles_nokey' : 'settings.provider.preset_roles_same'), 'info');
+                return;
+              }
+              if (round >= MAX_ROUNDS) {
+                toast(t('settings.provider.preset_roles_moving'), 'warn');
+                return;
+              }
+              if (!(await confirmRoleChanges(ch, changed)) || !step) return;
+              let fresh = null;
+              try {
+                fresh = await api.settings();
+              } catch {
+                return; // shown by the API layer; nothing written
+              }
+              if (!step) return;
+              ownUnseen = false;
+              const again = roleChanges(step.plan(), fresh);
+              if (changesKey(again) === changesKey(ch)) {
+                ch = again;
+                break;
+              }
+              ch = again;
+              changed = mine ? 'any' : 'elsewhere';
+            }
+            applying = true;
+            draw();
+            writing = busy(applyRoleChanges(ch));
+            const n = await writing;
+            writing = null;
+            result = { n, total: ch.rows.length, told: false };
+            if (n === ch.rows.length) {
+              applying = false;
+              close(true);
+              return;
+            }
+            // R81 L2: stopped half way (the error is told by the API layer):
+            // what changed and what not; the dialog stays, the button lists
+            // the rest
+            if (n > 0) {
+              toast(t('settings.provider.preset_roles_partial', { n: U.count(n), total: U.count(ch.rows.length) }), 'warn');
+              result.told = true;
+              // R81b L10: the settings as they are after these writes before
+              // the button is offered again (the event stream that would
+              // bring them may be late, or down): pressed again at once, it
+              // lists the rest only
+              ownUnseen = !(await load());
+              if (!step) return;
+            }
+            applying = false;
+            draw();
+          }
+          step = providersStep(env);
+          draw();
+          // R75 L2: a key saved here is stored as in the plain form, in the clear when the credential store is not available: said as there
+          const store = data && data.credentials_error_info ? h('p', { class: 'dlg-hint tone-warn', role: 'status' }, icon('lock-open', { size: 12 }), ' ', U.errorInfoText(data.credentials_error_info)) : null;
+          return h('div', { class: 'set-preset' }, h('p', { class: 'dlg-msg' }, t('settings.provider.preset_intro')), store, box, actions);
+        },
+        { wide: true },
+      );
+      // closed while the confirmed writes run (Esc, the backdrop): they go
+      // on; their outcome is said once they end (R81 L1)
+      if (writing) {
+        await writing;
+        await null; // the roles step's own ending runs first
+      }
+    } finally {
+      presetOpen = false;
+      step = null;
+      // R75 L3: only its own (a route to the guide meanwhile set the guide's)
+      if (obErrorHandler() === onErr) setObErrorHandler(null);
+    }
+    if (!alive) return;
+    // the services (and roles) as they are now
+    await load();
+    if (!alive) return;
+    // R75 M2: what happened, and nothing more: roles changed, or services
+    // added with the roles as they were, or nothing at all
+    if (result && result.n === result.total) toast(t('settings.provider.preset_applied', { n: U.count(result.n) }), 'success');
+    else if (result && result.n > 0 && !result.told) toast(t('settings.provider.preset_roles_partial', { n: U.count(result.n), total: U.count(result.total) }), 'warn');
+    else if (!result || !result.n) {
+      const added = ((data && data.providers) || []).filter((p) => !before.has(p.id));
+      if (added.length) toast(t('settings.provider.preset_added', { names: U.listJoin(added.map((p) => quote(p.name))) }), 'success');
+    }
+  }
+
+  // What a plan (providersStep plan()) would change in the saved roles:
+  // rows {r, provider, model, from, to, thinkingOff}; missing: roles whose
+  // service has no key yet; night / nightKept: free services that get the
+  // night window / keep their own tariff — by the tariff they have in s
+  // (R81b L9: the plan's list is the guide step's, read when the dialog
+  // opened or a key was saved; a tariff set elsewhere since then is kept).
+  // s: the settings to compare with (the page's, or a fresh read; R81 N1).
+  // Rows in the order of the Roles section (R81 L3); each with the params
+  // it is written with: the role's own, thinking off where the new
+  // provider has none.
+  function roleChanges(plan, s = data) {
+    const out = { plan, rows: [], missing: [], night: [], nightKept: [] };
+    if (!plan || !s) return out;
+    const label = (pid, model) => {
+      const p = (s.providers || []).find((x) => x.id === pid);
+      return p && model ? `${p.name} · ${model}` : t('settings.not_configured');
+    };
+    const byRole = new Map(plan.roles.map((x) => [x.role, x]));
+    for (const r of s.roles || []) {
+      const x = byRole.get(r.role);
+      if (!x) continue;
+      if (!x.provider) {
+        out.missing.push(r);
+        continue;
+      }
+      if (r.configured && r.provider_id === x.provider.id && r.model === x.model) continue;
+      const thinkingOff = (r.thinking || 'off') !== 'off' && !x.provider.supports_thinking;
+      const params = { thinking: thinkingOff ? 'off' : r.thinking || 'off' };
+      if (r.temperature != null) params.temperature = r.temperature;
+      if (r.role === 'translate' && r.window != null) params.window = r.window;
+      if (r.max_tokens != null) params.max_tokens = r.max_tokens;
+      if (r.role === 'translate' && r.batch != null) params.batch = r.batch;
+      out.rows.push({ r, provider: x.provider, model: x.model, params, from: r.configured ? label(r.provider_id, r.model) : t('settings.not_configured'), to: `${x.provider.name} · ${x.model}`, thinkingOff });
+    }
+    for (const p0 of plan.night) {
+      const p = (s.providers || []).find((x) => x.id === p0.id) || p0;
+      (p.tariff ? out.nightKept : out.night).push(p);
+    }
+    return out;
+  }
+
+  // Everything a confirmation of roleChanges shows or writes (R81 N1),
+  // with whether each free service has a tariff (R81b L9).
+  function changesKey(ch) {
+    return JSON.stringify([
+      ch.rows.map((x) => [x.r.role, x.r.configured, x.r.provider_id, x.r.model, x.provider.id, x.model, x.params, x.from, x.to]),
+      ch.missing.map((r) => r.role),
+      ch.night.map((p) => [p.id, !!p.tariff]),
+      ch.nightKept.map((p) => [p.id, !!p.tariff]),
+    ]);
+  }
+
+  // changed: shown again because the settings changed meanwhile (R81 N1):
+  // 'elsewhere', or 'any' when this dialog's own writes may be the change
+  // (R81b L10: the page could not read the settings after them)
+  function confirmRoleChanges(ch, changed = '') {
+    const names = (rows) => U.listJoin(rows.map((x) => quote(roleNameOf(x.r || x))));
+    const off = ch.rows.filter((x) => x.thinkingOff);
+    const drafts_ = ch.rows.filter((x) => drafts.roles[x.r.role]);
+    const note = (ic, text) => h('li', null, icon(ic, { size: 14 }), h('span', null, text));
+    const notes = [
+      off.length ? note('triangle-alert', t('settings.provider.preset_roles_thinking', { roles: names(off) })) : null,
+      ch.missing.length ? note('info', t('settings.provider.preset_roles_missing', { roles: names(ch.missing) })) : null,
+      ch.night.length ? note('clock', t('settings.provider.preset_roles_night', { names: U.listJoin(ch.night.map((p) => quote(p.name))), from: ch.plan.nightFrom, to: ch.plan.nightTo })) : null,
+      ch.nightKept.length ? note('clock', t('settings.provider.preset_roles_night_kept', { names: U.listJoin(ch.nightKept.map((p) => quote(p.name))) })) : null,
+      drafts_.length ? note('triangle-alert', t('settings.provider.preset_roles_drafts', { roles: names(drafts_) })) : null,
+    ].filter(Boolean);
+    return confirmDialog({
+      title: t('settings.provider.preset_roles_title', { plan: ch.plan.name }),
+      message: t('settings.provider.preset_roles_message'),
+      okText: t('settings.provider.preset_roles_ok'),
+      focusCancel: true,
+      body: h(
+        'div',
+        { class: 'set-preset-roles' },
+        changed ? h('p', { class: 'dlg-hint tone-warn', role: 'alert' }, icon('triangle-alert', { size: 13 }), ' ', t(changed === 'any' ? 'settings.provider.preset_roles_changed_any' : 'settings.provider.preset_roles_changed')) : null,
+        h('ul', { class: 'app-move-points' }, ch.rows.map((x) => note('arrow-right', t('settings.provider.preset_roles_row', { role: roleNameOf(x.r), from: x.from, to: x.to })))),
+        // R81 I8: no empty list when there is nothing more to note
+        notes.length ? h('ul', { class: 'app-move-points' }, notes) : null,
+      ),
+    });
+  }
+
+  // Sets each role to its new provider and model with the parameters it
+  // has (thinking off where the new provider has none); the night window
+  // for free services without a tariff. → the number of roles changed.
+  async function applyRoleChanges(ch) {
+    let n = 0;
+    for (const x of ch.rows) {
+      const r = x.r;
+      try {
+        await api.setRole(r.role, x.provider.id, x.model, x.params);
+        delete drafts.roles[r.role];
+        n++;
+      } catch {
+        break; // shown by the API layer; the roles changed so far stay
+      }
+    }
+    if (n === ch.rows.length) {
+      for (const p of ch.night) {
+        try {
+          await obApi.patchProvider(p.id, { tariff: ch.plan.nightTariff, offpeak_only: true });
+        } catch {
+          break; // shown by the dialog's error handler
+        }
+      }
+    }
+    return n;
+  }
+
   function providersBlock(shell) {
     const ps = data.providers;
+    // fnext: the empty state's entry is gone once a service is added (R75 L3)
+    const presetBtn = (fkey, kind, fnext) => btn(t('settings.provider.add_preset'), { size: kind ? undefined : 'sm', kind, icon: 'sparkles', title: t('settings.provider.add_preset_tip'), onclick: presetDialog, fkey, fnext });
     shell.append(
-      head('server', t('settings.block.providers'), ps.length ? h('span', { class: 'card-count' }, String(ps.length)) : null, btn(t('settings.provider.add'), { size: 'sm', icon: 'plus', onclick: () => providerDialog(null), fkey: 'set:prov:add' })),
+      head('server', t('settings.block.providers'), ps.length ? h('span', { class: 'card-count' }, String(ps.length)) : null, [
+        presetBtn('set:prov:preset'),
+        btn(t('settings.provider.add'), { size: 'sm', icon: 'plus', onclick: () => providerDialog(null), fkey: 'set:prov:add' }),
+      ]),
       h(
         'div',
         { class: 'card-bd set-prov-bd' },
@@ -668,7 +1283,8 @@ export function mountSettings(root, ctx, route) {
               { class: 'set-empty' },
               h('div', { class: 'set-empty-icon' }, icon('server', { size: 22 })),
               h('div', null, h('strong', null, t('settings.provider.empty_title')), h('p', null, t('settings.provider.empty_text'))),
-              btn(t('settings.provider.add'), { kind: 'primary', icon: 'plus', onclick: () => providerDialog(null), fkey: 'set:prov:add2' }),
+              presetBtn('set:prov:preset2', 'primary', 'set:prov:preset'),
+              btn(t('settings.provider.add'), { icon: 'plus', onclick: () => providerDialog(null), fkey: 'set:prov:add2' }),
             ),
       ),
     );
@@ -737,11 +1353,29 @@ export function mountSettings(root, ctx, route) {
   function providerRow(p) {
     const test = tests.get(p.id);
     const price = priceText(p);
+    // round 2 (T6 #7): while a test runs the button is aria-disabled and
+    // aria-busy instead of disabled, so the re-renders before and after it
+    // (preserveFocus by fkey) keep the keyboard focus on it; testProvider
+    // ignores a click while one runs
+    const testing = !!test && test.state === 'running';
+    const testBtn = btn(testing ? t('settings.provider.testing') : t('settings.provider.test'), { size: 'sm', icon: 'plug', onclick: () => testProvider(p), fkey: `set:prov:${p.id}:test` });
+    if (testing) {
+      testBtn.setAttribute('aria-disabled', 'true');
+      testBtn.setAttribute('aria-busy', 'true');
+    }
+    // the same for "probe models" (R28 A3); probe() ignores a click while
+    // one runs
+    const probingNow = probing.has(p.id);
+    const probeBtn = btn(probingNow ? t('settings.provider.probing') : t('settings.provider.probe'), { size: 'sm', icon: 'scan-search', onclick: () => probe(p), fkey: `set:prov:${p.id}:probe` });
+    if (probingNow) {
+      probeBtn.setAttribute('aria-disabled', 'true');
+      probeBtn.setAttribute('aria-busy', 'true');
+    }
     const actions = h(
       'div',
       { class: 'pv-actions' },
-      btn(test && test.state === 'running' ? t('settings.provider.testing') : t('settings.provider.test'), { size: 'sm', icon: 'plug', disabled: test && test.state === 'running', onclick: () => testProvider(p), fkey: `set:prov:${p.id}:test` }),
-      btn(probing.has(p.id) ? t('settings.provider.probing') : t('settings.provider.probe'), { size: 'sm', icon: 'scan-search', disabled: probing.has(p.id), onclick: () => probe(p), fkey: `set:prov:${p.id}:probe` }),
+      testBtn,
+      probeBtn,
       iconBtn('pencil', t('settings.provider.edit_named', { name: p.name }), { onclick: () => providerDialog(p), fkey: `set:prov:${p.id}:edit` }),
       menuButton(iconBtn('ellipsis', t('settings.provider.more_named', { name: p.name }), { menu: true, fkey: `set:prov:${p.id}:menu` }), () => providerItems(p)),
     );
@@ -762,6 +1396,8 @@ export function mountSettings(root, ctx, route) {
           p.key_unprotected ? h('span', { class: 'chip chip-warn', title: keyProblem(p) }, icon('lock-open', { size: 11 }), t('settings.provider.key_unprotected_chip')) : null,
         ),
         h('div', { class: 'pv-url mono', title: p.base_url }, p.base_url),
+        // AUD1 I-3: plain http to a computer off the local network
+        plainHTTPFar(p.base_url) ? h('p', { class: 'set-note pv-plain-http' }, icon('lock-open', { size: 14 }), h('span', null, t('settings.provider.plain_http_note'))) : null,
         h(
           'div',
           { class: 'pv-facts' },
@@ -789,6 +1425,9 @@ export function mountSettings(root, ctx, route) {
         modelsLine(p),
         testLine(p, test),
         limitsHint(p),
+        // T-PERF-03: the account's observed limits, when the settings are
+        // clearly below them; the button only fills the dialog's fields
+        limitsBanner(p, () => providerDialog(p, { fillLimits: true })),
       ),
       actions,
     );
@@ -954,12 +1593,35 @@ export function mountSettings(root, ctx, route) {
 
   // New (p = null) or edit. The key is never shown: on edit an empty field
   // keeps the stored key (A5.2).
-  function providerDialog(p) {
+  // fillLimits (T-PERF-03): open with the suggestion from the observed
+  // account limits filled into the concurrency and per-minute fields (not
+  // saved until the user saves).
+  // Round 9 WV-06 (T28 suggestion 5): Esc, a click on the backdrop and
+  // "取消" ask "放弃修改？" first when a field differs from what the dialog
+  // opened with (dom.js openDialog confirmCancel, round 9 F1); unchanged, or
+  // while the save runs, they close at once. What it opened with is read
+  // once the dialog is built, so the prefilled values (a new provider's
+  // type limits and address, fillLimits' suggestion) are no change of the
+  // user's; "填入建议值" pressed in the dialog is. The key counts only as
+  // typed or not: its text is kept nowhere.
+  function providerDialog(p, { fillLimits = false } = {}) {
     const isNew = !p;
     const defaults = data.default_base_urls || {};
+    let edited = () => false; // set by the content once built
+    let saving = () => false;
+    const mayClose = () =>
+      saving() || !edited()
+        ? true
+        : confirmDialog({
+            title: t('settings.provider.discard_title'),
+            message: t('settings.provider.discard_message'),
+            okText: t('wizard.close.discard'),
+            cancelText: t('wizard.close.keep'),
+            danger: true,
+          });
     return openDialog(
       isNew ? t('settings.provider.add') : t('settings.provider.edit_title', { name: p.name }),
-      (close) => {
+      (close, busy) => {
         let type = p ? p.type : 'openai';
         let balanceTouched = !isNew;
         const field = (label, control, hint, cls = '') => h('label', { class: 'dlg-field ' + cls }, h('span', { class: 'dlg-label' }, label), control, hint ? h('span', { class: 'dlg-hint' }, hint) : null);
@@ -972,8 +1634,38 @@ export function mountSettings(root, ctx, route) {
           spellcheck: 'false',
           placeholder: p ? (p.key_unreadable ? t('settings.provider.key_unreadable') : p.key_hint ? t('settings.provider.key_keep', { hint: p.key_hint }) : t('settings.provider.key_keep_none')) : 'sk-…',
         });
-        const conc = h('input', { class: 'input input-num', type: 'number', min: '1', max: String(MAX_CONCURRENCY), step: '1', value: String(p ? p.max_concurrency : 4) });
-        const rpm = h('input', { class: 'input input-num', type: 'number', min: '0', max: String(MAX_RPM), step: '1', value: String(p ? p.rpm : 60) });
+        // v3.2.x: a new provider starts with its type's limits
+        // (limitsPrefill: Anthropic 4 / no per-minute limit, others 4 / 60);
+        // switching the type follows them until the user edits a field. An
+        // existing provider keeps its own.
+        const pre = limitsPrefill(type);
+        const conc = h('input', { class: 'input input-num', type: 'number', min: '1', max: String(MAX_CONCURRENCY), step: '1', value: String(p ? p.max_concurrency : pre.max_concurrency) });
+        const rpm = h('input', { class: 'input input-num', type: 'number', min: '0', max: String(MAX_RPM), step: '1', value: String(p ? p.rpm : pre.rpm) });
+        const limitsTouched = { conc: !isNew, rpm: !isNew };
+        conc.addEventListener('input', () => (limitsTouched.conc = true));
+        rpm.addEventListener('input', () => (limitsTouched.rpm = true));
+        // Anthropic: the account's tier decides the usable limits (no
+        // numbers here; the official page, when it opens)
+        const limitsNote = h('span', { class: 'dlg-hint span-2 set-limits-note', dataset: { fkey: 'set:prov:limits_note' } });
+        // T-PERF-03: what the account's answers reported, the suggestion
+        // and "填入建议值" (fills the two fields only); described fields
+        const observed = createLimitsHint(p, conc, rpm, { filled: fillLimits });
+        const syncLimitsNote = () => {
+          // a new key typed in: its account's limits are not known yet (R38 S6)
+          observed.sync(type, !!key.value.trim(), base.value);
+          limitsNote.hidden = type !== 'anthropic';
+          limitsNote.replaceChildren(
+            ...(type === 'anthropic'
+              ? [
+                  icon('info', { size: 12 }),
+                  ' ',
+                  t('settings.provider.anthropic_limits_note'),
+                  ' ',
+                  h('button', { type: 'button', class: 'set-link', dataset: { fkey: 'set:prov:limits_link' }, onclick: () => openExternal(ANTHROPIC_RATE_LIMITS_URL) }, t('settings.provider.anthropic_limits_link'), ' ', icon('external-link', { size: 12 })),
+                ]
+              : []),
+          );
+        };
         const balance = h(
           'select',
           { class: 'select', value: p ? p.balance_api : 'none', onchange: () => (balanceTouched = true) },
@@ -998,22 +1690,59 @@ export function mountSettings(root, ctx, route) {
         const autoBalance = () => {
           if (!balanceTouched) balance.value = hostOf(base.value.trim()) === 'api.deepseek.com' ? 'deepseek' : 'none';
         };
+        // AUD1 I-3: plain http to a computer off the local network (a note;
+        // saving is not blocked), following the address typed
+        const plainNote = h('span', { class: 'dlg-hint span-2 pv-plain-http', role: 'status', id: 'pv-url-plain' });
+        // round 9 WV-07 (R87 S-L2): a live region, so it changes only when
+        // the address goes near or far (not on every key typed: a screen
+        // reader could read the same sentence again each time)
+        let plainFar = null;
+        const syncPlainNote = () => {
+          const far = !!plainHTTPFar(base.value);
+          if (far === plainFar) return;
+          plainFar = far;
+          plainNote.hidden = !far;
+          plainNote.replaceChildren(...(far ? [icon('lock-open', { size: 12 }), ' ', t('settings.provider.plain_http_note')] : []));
+          if (far) base.setAttribute('aria-describedby', 'pv-url-plain');
+          else base.removeAttribute('aria-describedby');
+        };
+        syncPlainNote();
         base.addEventListener('input', () => {
           autoBalance();
           syncKeyHint();
+          syncPlainNote();
           trf.sync();
           typeNote.replaceChildren(...endpointNote(type));
+          syncLimitsNote(); // R38b N1: the limits only for Anthropic's own host
         });
-        key.addEventListener('input', () => syncKeyHint());
-        const keyHint = h('span', { class: 'dlg-hint' });
+        key.addEventListener('input', () => {
+          syncKeyHint();
+          syncLimitsNote();
+        });
+        const keyHint = h('span', { class: 'dlg-hint', id: 'pv-key-hint' });
         // sec2-app L2: moving an existing provider to another host clears
         // its stored key on save (the back end never sends it there)
-        const movedHint = h('span', { class: 'dlg-hint tone-warn', role: 'status' });
+        const movedHint = h('span', { class: 'dlg-hint tone-warn', role: 'status', id: 'pv-key-moved' });
         // sec3 L2: no data key now, so a key entered here is stored in the clear
-        const storeHint = data && data.credentials_error_info ? h('span', { class: 'dlg-hint tone-warn', role: 'status' }, icon('lock-open', { size: 12 }), ' ', U.errorInfoText(data.credentials_error_info)) : null;
+        const storeHint = data && data.credentials_error_info ? h('span', { class: 'dlg-hint tone-warn', role: 'status', id: 'pv-key-store' }, icon('lock-open', { size: 12 }), ' ', U.errorInfoText(data.credentials_error_info)) : null;
+        // round 2 (R28 S3, N35): the saved key cannot be decrypted; say so
+        // where the key is re-entered, with "check the address first",
+        // visible (not only a tooltip) and read with the key field
+        const unreadHint = p && p.key_unreadable ? h('span', { class: 'dlg-hint tone-warn', id: 'pv-key-unreadable' }, icon('key-round', { size: 12 }), ' ', t('errors.settings.provider_key_unreadable', { provider: p.name })) : null;
+        // round 2 W4 (R28): the key field is named by its label alone and
+        // described by the hints under it, which sit outside the label: in
+        // it they were part of the name, the unreadable key's a second time
+        // as the description
+        key.setAttribute('id', 'pv-key');
+        key.setAttribute('aria-describedby', [unreadHint, keyHint, movedHint, storeHint].filter(Boolean).map((x) => x.getAttribute('id')).join(' '));
+        // WV-07: the texts change only when they do (movedHint is a live region)
+        let movedNow = null;
         const syncKeyHint = () => {
-          keyHint.textContent = isLocal(base.value.trim()) ? t('settings.provider.key_hint_local') : t('settings.provider.key_hint');
+          const hint = isLocal(base.value.trim()) ? t('settings.provider.key_hint_local') : t('settings.provider.key_hint');
+          if (keyHint.textContent !== hint) keyHint.textContent = hint;
           const moved = !!(p && p.key_hint && !key.value.trim() && !sameOrigin(p.base_url, base.value.trim()));
+          if (moved === movedNow) return;
+          movedNow = moved;
           movedHint.hidden = !moved;
           movedHint.textContent = moved ? t('settings.provider.key_moved_hint') : '';
         };
@@ -1033,16 +1762,22 @@ export function mountSettings(root, ctx, route) {
           (v) => {
             const prevDefault = defaults[type] || '';
             type = v;
+            const lim = limitsPrefill(v);
+            if (!limitsTouched.conc) conc.value = String(lim.max_concurrency);
+            if (!limitsTouched.rpm) rpm.value = String(lim.rpm);
             // Prefill the usual address unless the user typed their own (A5.3).
             const now = base.value.trim().replace(/\/+$/, '');
             if (!now || now === prevDefault.replace(/\/+$/, '')) base.value = defaults[v] || '';
             autoBalance();
             syncKeyHint();
+            // after the address: back on Anthropic's it shows the limits again (T11)
+            syncLimitsNote();
             typeNote.replaceChildren(...endpointNote(v));
           },
           t('settings.provider.type_label'),
         );
         const typeNote = h('span', { class: 'dlg-hint' }, endpointNote(type));
+        syncLimitsNote();
 
         const fail = (msg, input) => {
           err.textContent = msg;
@@ -1089,13 +1824,29 @@ export function mountSettings(root, ctx, route) {
           submit.disabled = true;
           submit.textContent = isNew ? t('settings.provider.creating') : t('settings.saving');
           try {
-            const res = isNew ? await api.createProvider(body) : await api.patchProvider(p.id, body);
+            const res = await busy(isNew ? api.createProvider(body) : api.patchProvider(p.id, body));
             key.value = '';
             close(res || true);
           } catch (ex) {
             submit.disabled = false;
             submit.textContent = submitText();
             fail(ex.message || t('settings.save_failed'));
+          }
+        };
+
+        // WV-06: what the dialog opened with (prefills included)
+        const fieldsNow = () => JSON.stringify([name.value, base.value, key.value !== '', type, conc.value, rpm.value, pIn.value, pHit.value, pOut.value, cur.value, balance.value, trf.value()]);
+        const opened = fieldsNow();
+        edited = () => fieldsNow() !== opened;
+        saving = () => submit.disabled;
+        let asking = false;
+        const cancel = async () => {
+          if (asking) return;
+          asking = true;
+          try {
+            if (await mayClose()) close(null);
+          } finally {
+            asking = false;
           }
         };
 
@@ -1108,13 +1859,16 @@ export function mountSettings(root, ctx, route) {
             field(t('settings.provider.name'), name, null, 'span-2'),
             h('div', { class: 'dlg-field span-2' }, h('span', { class: 'dlg-label', id: 'dlg-ptype-l' }, t('settings.provider.type')), typeSeg, typeNote),
             field('base_url', base, t('settings.provider.base_url_hint'), 'span-2'),
+            plainNote,
           ),
           h(
             'div',
             { class: 'set-dlg-grid' },
-            h('label', { class: 'dlg-field span-2' }, h('span', { class: 'dlg-label' }, icon('key-round', { size: 13 }), ' ', t('settings.provider.key')), key, keyHint, movedHint, storeHint),
+            h('div', { class: 'dlg-field span-2' }, h('label', { class: 'dlg-label', for: 'pv-key' }, icon('key-round', { size: 13 }), ' ', t('settings.provider.key')), key, unreadHint, keyHint, movedHint, storeHint),
             field(t('settings.provider.max_concurrency'), conc, `1–${MAX_CONCURRENCY}`),
             field(t('settings.provider.rpm_field'), rpm, t('settings.provider.rpm_range_hint', { max: MAX_RPM })),
+            observed.el,
+            limitsNote,
             field(t('settings.provider.balance_api'), balance, t('settings.provider.balance_api_hint'), 'span-2'),
           ),
           h(
@@ -1134,10 +1888,10 @@ export function mountSettings(root, ctx, route) {
           ),
           trf.el,
           err,
-          h('div', { class: 'dlg-actions' }, h('button', { type: 'button', class: 'btn', onclick: () => close(null) }, t('common.cancel')), submit),
+          h('div', { class: 'dlg-actions' }, h('button', { type: 'button', class: 'btn', onclick: cancel }, t('common.cancel')), submit),
         );
       },
-      { wide: true, className: 'dlg-provider' },
+      { wide: true, className: 'dlg-provider', confirmCancel: mayClose },
     ).then((res) => {
       if (!res || !alive) return;
       if (res.key_unprotected) toast(keyProblem(res), 'warn'); // sec3 L2
@@ -1175,18 +1929,6 @@ export function mountSettings(root, ctx, route) {
       ),
       foot('roles', saveRoles),
     );
-  }
-
-  // Whether a model is in a provider's probed list: by name, or as an alias
-  // of a dated name ("claude-sonnet-4-5" for "claude-sonnet-4-5-20250929",
-  // "-latest"). The same rule as modelListed in internal/api/role_models.go
-  // (the diagnostics' check.role_model_unlisted).
-  function modelListed(name, list) {
-    const m = name.trim().toLowerCase();
-    const ids = list.map((x) => String(x).toLowerCase());
-    if (ids.includes(m)) return true;
-    const base = m.endsWith('-latest') ? m.slice(0, -'-latest'.length) : m;
-    return ids.some((id) => id.startsWith(base + '-') && /^[0-9]{6,8}$/.test(id.slice(base.length + 1)));
   }
 
   function roleRow(r) {
@@ -1228,8 +1970,11 @@ export function mountSettings(root, ctx, route) {
     const models = prov ? prov.models : [];
     const inList = models.includes(v.model.trim());
     // a model the provider no longer lists may have been retired (deepseek-chat):
-    // a light warning on the row; nothing is said while the list is empty or not probed
-    const unlisted = !!prov && models.length > 0 && v.model.trim() !== '' && !modelListed(v.model, models);
+    // a light warning on the row; nothing is said while the list is empty or not probed.
+    // Listed: by name, or as an alias of a dated name ("claude-sonnet-4-5"
+    // for "claude-sonnet-4-5-20250929", "-latest"): util.js modelListed, the
+    // lecture page's rule and the back end's (R79 L12: one copy)
+    const unlisted = !!prov && models.length > 0 && v.model.trim() !== '' && !U.modelListed(v.model, models);
     const unlistedTip = unlisted ? t('settings.roles.model_unlisted', { provider: prov.name, model: v.model.trim() }) : '';
     const manual = manualRoles.has(r.role) || !models.length || (v.model.trim() !== '' && !inList);
     let modelCtl;
@@ -1341,6 +2086,8 @@ export function mountSettings(root, ctx, route) {
     const canThink = !!prov && prov.supports_thinking;
     const thinkVal = thinkingOf(v);
     const thinkOffTip = canThink ? '' : prov ? t('settings.roles.thinking_unsupported', { provider: prov.name }) : t('settings.roles.thinking_no_provider');
+    // "cannot switch thinking off" (syncThinkFloor keeps it current)
+    const floorNote = floorNoteOf(v);
     const thinkSel = h(
       'select',
       {
@@ -1348,6 +2095,8 @@ export function mountSettings(root, ctx, route) {
         disabled: !canThink,
         'aria-label': t('settings.roles.thinking_label', { role: name }),
         'aria-description': thinkOffTip || undefined,
+        // the full note under the row (T11 detail 6: it was only a tooltip here)
+        'aria-describedby': floorNote ? floorId(r) : undefined,
         dataset: { ...fk('thinking'), level: thinkVal },
         onchange: (e) => chooseThinking(r, e.target),
       },
@@ -1358,7 +2107,101 @@ export function mountSettings(root, ctx, route) {
       { class: 'rl-cell rl-think' },
       h('span', { class: 'rl-cap' }, t('settings.roles.col.thinking')),
       h('span', { class: 'rl-think-ctl' + (canThink ? '' : ' tip is-off'), 'data-tip': thinkOffTip || undefined }, thinkSel),
+      floorNote ? floorShort(r, floorNote) : null,
     );
+
+    // v3.2.x D1: the output limit; empty = automatic (by role and thinking level)
+    const errField = rowErrorFields[r.role];
+    // round 2 W4 (T6 #9): the long explanations under the output limit and
+    // the batch size describe their fields (aria-describedby). The fields
+    // are named by aria-label, so a hint inside the label is not part of
+    // the name: each explanation is heard once, as the description.
+    const hintId = (what) => `rl-${r.role}-${what}-hint`;
+    // T18: the row's error describes the field it is about, first
+    const errFirst = (field, ids) => (rowErr && errField === field ? `${roleErrId(r.role)} ${ids}` : ids);
+    const maxIn = h('input', {
+      type: 'number',
+      class: 'input input-num rl-max-in',
+      min: '1',
+      max: String(MAX_TOKENS_LIMIT),
+      step: '1',
+      value: v.max_tokens,
+      placeholder: t('settings.roles.max_tokens_auto'),
+      'aria-label': t('settings.roles.max_tokens_label', { role: name }),
+      'aria-describedby': errFirst('max_tokens', hintId('max_tokens')),
+      'aria-invalid': errField === 'max_tokens' ? 'true' : undefined,
+      dataset: fk('max_tokens'),
+      oninput: (e) => setRoleDraft(r, { max_tokens: e.target.value }),
+    });
+    const extras = [
+      h(
+        'label',
+        { class: 'rl-extra-field' },
+        h('span', { class: 'rl-extra-title' }, t('settings.roles.max_tokens')),
+        maxIn,
+        h('span', { class: 'rl-sub', id: hintId('max_tokens') }, t('settings.roles.max_tokens_hint')),
+      ),
+    ];
+    // v3.2.x P2: sentences per translate request. It is new and sits folded
+    // away with an "experimental" chip (the value is kept and saved with the
+    // role). Empty means the default of the provider and model
+    // (defaultBatch: 10 for a Claude model on an Anthropic provider since
+    // 2026-11-11, 1 otherwise, one request per sentence as before). The
+    // empty field holds the number only (a 72px field cuts longer text,
+    // review R24); "Default N" stands next to it and, when above 1, as a
+    // chip on the folded summary (syncBatch keeps them current).
+    if (r.role === 'translate') {
+      const bv = batchView(v);
+      const defBatch = bv.defBatch;
+      const batchIn = h('input', {
+        type: 'number',
+        class: 'input input-num rl-batch-in',
+        min: '1',
+        max: String(MAX_BATCH),
+        step: '1',
+        value: v.batch,
+        placeholder: String(defBatch),
+        'aria-label': t('settings.roles.batch_label'),
+        // the default ("Default 10", kept current by syncBatch) and the explanation
+        'aria-describedby': errFirst('batch', `${hintId('batch_default')} ${hintId('batch')}`),
+        'aria-invalid': errField === 'batch' ? 'true' : undefined,
+        dataset: fk('batch'),
+        oninput: (e) => setRoleDraft(r, { batch: e.target.value }),
+      });
+      extras.push(
+        h(
+          'details',
+          {
+            class: 'rl-batch',
+            open: errField === 'batch' || batchOpen.has(r.role) || undefined,
+            dataset: fk('batch_box'),
+            ontoggle: (e) => (e.target.open ? batchOpen.add(r.role) : batchOpen.delete(r.role)),
+          },
+          h(
+            'summary',
+            { class: 'rl-extra-title' },
+            t('settings.roles.batch_summary'),
+            ' ',
+            h('span', { class: 'chip chip-quiet' }, t('settings.roles.batch_experimental')),
+            h('span', { class: 'chip chip-quiet', hidden: !bv.showDefault, dataset: fk('batch_default_chip') }, t('settings.roles.batch_default', { n: defBatch })),
+            h('span', { class: 'chip chip-quiet', hidden: !bv.showValue, dataset: fk('batch_value_chip') }, t('settings.roles.batch_value_chip', { value: bv.setBatch })),
+          ),
+          h(
+            'div',
+            { class: 'rl-batch-body' },
+            h(
+              'span',
+              { class: 'rl-batch-ctl' },
+              batchIn,
+              h('span', { class: 'dim' }, `1–${MAX_BATCH}`),
+              h('span', { class: 'dim', id: hintId('batch_default'), dataset: fk('batch_default') }, t('settings.roles.batch_default', { n: defBatch })),
+            ),
+            h('span', { class: 'rl-sub', id: hintId('batch') }, t('settings.roles.batch_hint')),
+          ),
+        ),
+      );
+    }
+    const extraCell = h('div', { class: 'rl-extra' }, extras);
 
     const winCell =
       r.role === 'translate'
@@ -1389,12 +2232,13 @@ export function mountSettings(root, ctx, route) {
     // the back end's advice line (G3.1), from the catalog when it has one
     const advice = r.hint ? (has(`settings.role_advice.${r.role}`) ? t(`settings.role_advice.${r.role}`) : r.hint) : '';
     const notes = [];
-    if (rowErr) notes.push(h('p', { class: 'rl-msg is-err', role: 'alert' }, icon('circle-alert', { size: 13 }), rowErr));
+    if (rowErr) notes.push(h('p', { class: 'rl-msg is-err', role: 'alert', id: roleErrId(r.role) }, icon('circle-alert', { size: 13 }), rowErr));
     else if (serverErr) notes.push(h('p', { class: 'rl-msg is-err' }, icon('circle-alert', { size: 13 }), serverErr));
     else if (fallback) notes.push(h('p', { class: 'rl-msg' + (v.provider_id ? ' is-warn' : '') }, icon(v.provider_id ? 'triangle-alert' : 'info', { size: 13 }), v.provider_id && !prov ? t('settings.roles.provider_deleted_note', { note: optionalNote(r.role) }) : optionalNote(r.role)));
     if (advice) notes.push(h('p', { class: 'rl-msg rl-hint' }, icon('sparkles', { size: 13 }), advice));
     if (prov && needsKey(prov)) notes.push(h('p', { class: 'rl-msg is-warn' }, icon('key-round', { size: 13 }), t('settings.roles.provider_no_key', { name: prov.name })));
     if (anthropic) notes.push(h('p', { class: 'rl-msg' }, icon('info', { size: 13 }), t('settings.roles.anthropic_temp_note')));
+    if (floorNote) notes.push(floorMsg(r, floorNote));
 
     return h(
       'div',
@@ -1419,6 +2263,7 @@ export function mountSettings(root, ctx, route) {
       h('div', { class: 'rl-cell rl-temp' }, h('span', { class: 'rl-cap' }, t('settings.roles.col.temperature')), h('span', { class: 'rl-temp-ctl' }, range, tNum)),
       thinkCell,
       winCell,
+      extraCell,
       notes.length ? h('div', { class: 'rl-notes' }, notes) : null,
     );
   }
@@ -1454,7 +2299,21 @@ export function mountSettings(root, ctx, route) {
       const w = num(d.window);
       if (!isInt(w) || w < 0 || w > 10) return t('settings.roles.err.window');
     }
-    return '';
+    return validateRoleLimits(r, d).msg;
+  }
+  // v3.2.x: max_tokens empty or 1–MAX_TOKENS_LIMIT; batch (translate) empty
+  // or 1–MAX_BATCH. {msg, field}
+  // T18 M4: the retry dialog's rule (parseMaxTokens), with the field's
+  // badInput when the row is on the page ("12e" reads as empty)
+  function maxTokensBad(d, r) {
+    const inp = r && shells.roles ? shells.roles.querySelector(`[data-fkey="set:role:${r.role}:max_tokens"]`) : null;
+    return Number.isNaN(parseMaxTokens(d.max_tokens, !!(inp && inp.validity && inp.validity.badInput)));
+  }
+  function validateRoleLimits(r, d) {
+    if (maxTokensBad(d, r)) return { msg: t('errors.settings.max_tokens_invalid', { min: 1, max: MAX_TOKENS_LIMIT }), field: 'max_tokens' };
+    const b = String(d.batch || '').trim();
+    if (r.role === 'translate' && b !== '' && (!isInt(num(b)) || num(b) < 1 || num(b) > MAX_BATCH)) return { msg: t('errors.settings.batch_invalid', { min: 1, max: MAX_BATCH }), field: 'batch' };
+    return { msg: '', field: '' };
   }
 
   async function saveRoles() {
@@ -1465,6 +2324,8 @@ export function mountSettings(root, ctx, route) {
       const msg = validateRole(r, drafts.roles[r.role]);
       if (msg) {
         rowErrors[r.role] = msg;
+        const lim = validateRoleLimits(r, drafts.roles[r.role]);
+        if (lim.msg === msg) rowErrorFields[r.role] = lim.field;
         renderBlock('roles');
         return;
       }
@@ -1477,6 +2338,9 @@ export function mountSettings(root, ctx, route) {
       if (!d) continue;
       const params = { temperature: num(d.temperature), thinking: thinkingOf(d) };
       if (r.role === 'translate') params.window = num(d.window);
+      // v3.2.x: an empty field is left out, which clears the value
+      if (String(d.max_tokens || '').trim() !== '') params.max_tokens = num(d.max_tokens);
+      if (r.role === 'translate' && String(d.batch || '').trim() !== '') params.batch = num(d.batch);
       try {
         const s = await api.setRole(r.role, d.provider_id, d.model.trim(), params);
         delete drafts.roles[r.role];
@@ -1487,6 +2351,8 @@ export function mountSettings(root, ctx, route) {
         }
       } catch (e) {
         rowErrors[r.role] = e.message;
+        if (e.code === 'settings.max_tokens_invalid') rowErrorFields[r.role] = 'max_tokens';
+        else if (e.code === 'settings.batch_invalid') rowErrorFields[r.role] = 'batch';
         blockErrors.roles = t('settings.roles.save_failed', { role: roleNameOf(r), error: e.message });
         failed = true;
         break;
@@ -1732,6 +2598,25 @@ export function mountSettings(root, ctx, route) {
     );
   }
 
+  // T23 general 19: the switch shows what is in effect, as the navigation's
+  // does (app.js notifyToggle): without browser notifications it is off and
+  // cannot be turned on; while the browser blocks them it is off, says
+  // "blocked by the browser", and a press says how to allow them instead of
+  // changing the setting. The note below (permissionLine) has the details.
+  function notifySwitch(g) {
+    const label = t('settings.general.notifications');
+    const supported = 'Notification' in window;
+    const denied = supported && Notification.permission === 'denied';
+    if (supported && !denied) return switchBtn(g.notifications, label, () => setGeneralDraft({ notifications: !g.notifications }, true), 'set:gen:notify');
+    const sw = switchBtn(false, label, () => (denied ? toast(t('nav.notify.denied_toast'), 'warn') : null), 'set:gen:notify');
+    if (!supported) sw.disabled = true;
+    else {
+      const text = sw.querySelector('.set-switch-text');
+      if (text) text.textContent = t('settings.general.notify_blocked');
+    }
+    return sw;
+  }
+
   function permissionLine() {
     if (!('Notification' in window)) return h('p', { class: 'set-note' }, icon('info', { size: 13 }), t('settings.general.notify_unsupported'));
     const perm = Notification.permission;
@@ -1777,6 +2662,8 @@ export function mountSettings(root, ctx, route) {
     const spentText = Object.entries(spent)
       .map(([c, v]) => U.fmtMoney(v, c))
       .join(' · ');
+    const chaptersRole = data.roles.find((r) => r.role === 'chapters');
+    const chaptersReady = !!(chaptersRole && chaptersRole.configured);
 
     shell.append(
       head('sliders-horizontal', t('settings.block.general')),
@@ -1791,7 +2678,7 @@ export function mountSettings(root, ctx, route) {
         ),
         formRow(
           t('settings.general.notifications'),
-          switchBtn(g.notifications, t('settings.general.notifications'), () => setGeneralDraft({ notifications: !g.notifications }, true), 'set:gen:notify'),
+          notifySwitch(g),
           t('settings.general.notifications_hint'),
           permissionLine(),
         ),
@@ -1811,6 +2698,39 @@ export function mountSettings(root, ctx, route) {
             spentText ? h('p', { class: 'set-note' }, icon('coins', { size: 13 }), t('settings.general.spent_today', { amount: spentText })) : null,
           ],
         ),
+        // v3.2.x P3: chapters after the first export (absent = on)
+        formRow(
+          t('settings.general.auto_chapters'),
+          switchBtn(g.auto_chapters, t('settings.general.auto_chapters'), () => setGeneralDraft({ auto_chapters: !g.auto_chapters }, true), 'set:gen:chapters'),
+          t('settings.general.auto_chapters_hint'),
+          g.auto_chapters && !chaptersReady ? h('p', { class: 'set-note is-warn' }, icon('triangle-alert', { size: 13 }), t('settings.general.auto_chapters_no_role')) : null,
+        ),
+        // v3.2.x P1-c: idle timeout of an LLM request; empty = default, 0 = off,
+        // else MIN_IDLE_TIMEOUT_S..MAX_IDLE_TIMEOUT_S (SEC5 N4)
+        formRow(
+          t('settings.general.idle_timeout'),
+          h(
+            'div',
+            { class: 'set-inline' },
+            h('input', {
+              class: 'input input-num set-w-sm',
+              type: 'number',
+              min: '0',
+              max: String(MAX_IDLE_TIMEOUT_S),
+              step: '1',
+              value: g.llm_idle_timeout_s,
+              placeholder: t('settings.general.idle_timeout_default', { n: DEFAULT_IDLE_TIMEOUT_S }),
+              'aria-label': t('settings.general.idle_timeout'),
+              'aria-invalid': fieldErrors.idle ? 'true' : undefined,
+              dataset: { fkey: 'set:gen:idle' },
+              oninput: (e) => setGeneralDraft({ llm_idle_timeout_s: e.target.value }),
+            }),
+            h('span', { class: 'dim small' }, t('settings.general.idle_timeout_unit')),
+            String(g.llm_idle_timeout_s).trim() !== '' && num(g.llm_idle_timeout_s) === 0 ? h('span', { class: 'chip chip-quiet' }, t('settings.general.idle_timeout_off')) : null,
+          ),
+          t('settings.general.idle_timeout_hint', { n: DEFAULT_IDLE_TIMEOUT_S, min: MIN_IDLE_TIMEOUT_S, max: MAX_IDLE_TIMEOUT_S }),
+          fieldErrors.idle ? h('p', { class: 'set-note is-err', role: 'alert' }, icon('circle-alert', { size: 13 }), fieldErrors.idle) : null,
+        ),
       ),
       foot('general', saveGeneral),
     );
@@ -1825,11 +2745,28 @@ export function mountSettings(root, ctx, route) {
       syncFoot('general');
       return;
     }
+    const idle = String(g.llm_idle_timeout_s).trim();
+    if (idle !== '' && (!isInt(num(idle)) || (num(idle) !== 0 && (num(idle) < MIN_IDLE_TIMEOUT_S || num(idle) > MAX_IDLE_TIMEOUT_S)))) {
+      fieldErrors.idle = t('errors.settings.idle_timeout_invalid', { min: MIN_IDLE_TIMEOUT_S, max: MAX_IDLE_TIMEOUT_S });
+      blockErrors.general = fieldErrors.idle;
+      renderBlock('general');
+      return;
+    }
+    // PUT /api/settings/general merges (v3.2.x): only the changed fields;
+    // null puts an optional one back to its default
+    const was = serverGeneral();
+    const body = {};
+    if (g.keep_original_media !== was.keep_original_media) body.keep_original_media = g.keep_original_media;
+    if (g.notifications !== was.notifications) body.notifications = g.notifications;
+    if (b !== num(was.daily_budget)) body.daily_budget = b;
+    if (g.auto_chapters !== was.auto_chapters) body.auto_chapters = g.auto_chapters;
+    if (!sameOpt(idle, was.llm_idle_timeout_s)) body.llm_idle_timeout_s = idle === '' ? null : num(idle);
     saving.add('general');
     syncFoot('general');
     try {
-      const s = await api.setGeneral({ keep_original_media: g.keep_original_media, notifications: g.notifications, daily_budget: b });
+      const s = await api.setGeneral(body);
       drafts.general = null;
+      delete fieldErrors.idle;
       saving.delete('general');
       if (!alive) return;
       if (s) {
@@ -1842,7 +2779,10 @@ export function mountSettings(root, ctx, route) {
     } catch (e) {
       saving.delete('general');
       blockErrors.general = e.message;
-      if (alive) syncFoot('general');
+      if (e.code === 'settings.idle_timeout_invalid') {
+        fieldErrors.idle = e.message;
+        if (alive) renderBlock('general');
+      } else if (alive) syncFoot('general');
     }
   }
 
@@ -1980,7 +2920,7 @@ export function mountSettings(root, ctx, route) {
 
   // Add (k null) or edit a custom kind: name (never translated), code and group.
   function kindDialog(k) {
-    return openDialog(k ? t('settings.kinds.edit_title') : t('settings.kinds.add_title'), (close) => {
+    return openDialog(k ? t('settings.kinds.edit_title') : t('settings.kinds.add_title'), (close, busy) => {
       let group = k ? k.group : 'session';
       const name = h('input', { class: 'input', value: k ? k.name || '' : '', autofocus: true, maxlength: '40', 'aria-describedby': 'kind-name-hint kind-name-clash', dataset: { fkey: 'kind:name' } });
       // the same name as a built-in kind in this language: a note only (still saved)
@@ -2019,7 +2959,7 @@ export function mountSettings(root, ctx, route) {
         ok.disabled = true;
         const input = { name: name.value.trim(), code: code.value, group };
         try {
-          const saved = k ? await api.patchKind(k.id, input, { quiet: true }) : await api.createKind(input, { quiet: true });
+          const saved = await busy(k ? api.patchKind(k.id, input, { quiet: true }) : api.createKind(input, { quiet: true }));
           close(saved);
         } catch (ex) {
           err.textContent = ex.message;
@@ -2200,6 +3140,7 @@ export function mountSettings(root, ctx, route) {
   dlUI.load();
   aboutUI.load();
   colabUI.load();
+  remoteUI.load();
   modeUI.load();
   return {
     refresh: () => (loadHolidays(), load()),
@@ -2215,6 +3156,7 @@ export function mountSettings(root, ctx, route) {
       if (ev.kind === 'devices') loadSoon(); // SPEC-v2 I6-I9: rows, pauses, tests, power
       appUI.onChanged(ev); // SPEC-v3 V8: "changed update" (the update status by the channel)
       colabUI.onChanged(ev); // 3.1.0: "changed colab" (the in-app Google sign-in)
+      remoteUI.onChanged(ev); // ssh-1b: "changed devices" (a server's state)
     },
     // #/settings/asr/{device} while the page is open: jump there
     update(r) {
@@ -2256,6 +3198,8 @@ export function mountSettings(root, ctx, route) {
       dlUI.destroy();
       aboutUI.destroy();
       colabUI.destroy();
+      remoteUI.destroy();
+      remoteUnsub();
       modeUI.destroy();
       if (spy) spy.disconnect();
       window.removeEventListener('beforeunload', beforeUnload);

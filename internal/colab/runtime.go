@@ -37,7 +37,15 @@ const (
 	// uploadChunk: bytes per Contents API PUT (JupyterLab's chunked
 	// upload protocol: chunk 1, 2, …, -1 for the last).
 	defaultChunkSize = 4 << 20
-	maxDownload      = 256 << 20
+	// smallAnswerMax bounds the answer of the small requests (requestWith:
+	// the kernel list and start, mkdir, delete, the Contents API's answer
+	// to an upload's PUT, which is the file's model without its content).
+	// Real answers are a few hundred bytes to a few KB; 4 MiB is far above
+	// any of them and keeps a runtime from making each such request read
+	// hundreds of megabytes (SEC41 L1). The result's download has its own
+	// limit (maxResultAnswer), the resource readings theirs
+	// (resourcesMaxBytes).
+	smallAnswerMax = 4 << 20
 )
 
 // runtimeClient talks to one runtime's Jupyter server.
@@ -56,6 +64,17 @@ type runtimeClient struct {
 	// longer: the method and the endpoint name only (colab-batch
 	// diagnostics: the runtime proxy sometimes stalls for tens of seconds).
 	slow func(method, endpoint string, took time.Duration)
+	// timeout of a small request (0 = runtimeTimeout; Options.RuntimeTimeout)
+	timeout time.Duration
+}
+
+// to is the time limit of a small request (an audio chunk and a download
+// get three times as long).
+func (r *runtimeClient) to() time.Duration {
+	if r.timeout > 0 {
+		return r.timeout
+	}
+	return runtimeTimeout
 }
 
 // slowRequest: a runtime request this long is logged.
@@ -80,8 +99,11 @@ func (r *runtimeClient) request(ctx context.Context, method, path string, q url.
 // bulkBody: a request body this large is an audio chunk (the upload client).
 const bulkBody = 1 << 20
 
+// requestWith is request on hc; the answer is read up to smallAnswerMax
+// (a longer one is errAnswerTooLarge). A request whose answer may be
+// larger uses requestLimit with its own limit.
 func (r *runtimeClient) requestWith(hc *http.Client, ctx context.Context, method, path string, q url.Values, hdr http.Header, body []byte, timeout time.Duration) (int, []byte, error) {
-	return r.requestLimit(hc, ctx, method, path, q, hdr, body, timeout, maxDownload*2)
+	return r.requestLimit(hc, ctx, method, path, q, hdr, body, timeout, smallAnswerMax)
 }
 
 // errAnswerTooLarge: an answer longer than requestLimit's limit (nothing of
@@ -92,7 +114,7 @@ var errAnswerTooLarge = errors.New("the answer is larger than allowed")
 // a longer one is errAnswerTooLarge.
 func (r *runtimeClient) requestLimit(hc *http.Client, ctx context.Context, method, path string, q url.Values, hdr http.Header, body []byte,
 	timeout time.Duration, limit int64) (int, []byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithTimeout(runtimeRequestContext(ctx), timeout)
 	defer cancel()
 	var rd io.Reader
 	if body != nil {
@@ -118,6 +140,11 @@ func (r *runtimeClient) requestLimit(hc *http.Client, ctx context.Context, metho
 		if c := context.Cause(ctx); errors.Is(c, context.Canceled) {
 			return 0, nil, c
 		}
+		var rr *redirectRefused
+		if errors.As(err, &rr) {
+			// not transient: the same request is redirected the same way
+			return 0, nil, apiChanged(endpointName(path), rr.Error())
+		}
 		return 0, nil, netError{text: fmt.Sprintf("%s %s: %s", method, endpointName(path), netErrText(err))}
 	}
 	defer resp.Body.Close()
@@ -125,7 +152,9 @@ func (r *runtimeClient) requestLimit(hc *http.Client, ctx context.Context, metho
 	if err != nil {
 		return 0, nil, netError{text: fmt.Sprintf("%s %s: reading the answer: %s", method, endpointName(path), netErrText(err))}
 	}
-	if int64(len(b)) > limit && limit < maxDownload*2 {
+	if int64(len(b)) > limit {
+		// the default limit too: a truncated answer is never passed on
+		// (security audit AUD4 L-1)
 		return resp.StatusCode, nil, fmt.Errorf("%s %s: %w (%d bytes)", method, endpointName(path), errAnswerTooLarge, limit)
 	}
 	return resp.StatusCode, b, nil
@@ -170,7 +199,7 @@ func (r *runtimeClient) kernelHeaders() http.Header {
 // listKernels is GET /api/kernels: the readiness probe while booting.
 func (r *runtimeClient) listKernels(ctx context.Context) ([]string, error) {
 	const ep = "api/kernels"
-	st, b, err := r.request(ctx, http.MethodGet, "/api/kernels", nil, r.kernelHeaders(), nil, runtimeTimeout)
+	st, b, err := r.request(ctx, http.MethodGet, "/api/kernels", nil, r.kernelHeaders(), nil, r.to())
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +225,7 @@ func (r *runtimeClient) listKernels(ctx context.Context) ([]string, error) {
 // (jupyter-kernel-client KernelClient.start default name).
 func (r *runtimeClient) startKernel(ctx context.Context) (string, error) {
 	const ep = "api/kernels"
-	st, b, err := r.request(ctx, http.MethodPost, "/api/kernels", nil, r.kernelHeaders(), []byte(`{"name":"python3","path":null}`), runtimeTimeout)
+	st, b, err := r.request(ctx, http.MethodPost, "/api/kernels", nil, r.kernelHeaders(), []byte(`{"name":"python3","path":null}`), r.to())
 	if err != nil {
 		return "", err
 	}
@@ -219,7 +248,7 @@ func (r *runtimeClient) startKernel(ctx context.Context) (string, error) {
 
 // deleteKernel is DELETE /api/kernels/{id}; 404/410 count as done.
 func (r *runtimeClient) deleteKernel(ctx context.Context, id string) error {
-	st, _, err := r.request(ctx, http.MethodDelete, "/api/kernels/"+url.PathEscape(id), nil, r.kernelHeaders(), nil, runtimeTimeout)
+	st, _, err := r.request(ctx, http.MethodDelete, "/api/kernels/"+url.PathEscape(id), nil, r.kernelHeaders(), nil, r.to())
 	if err != nil {
 		return err
 	}
@@ -254,7 +283,7 @@ var jsonHeader = http.Header{"Content-Type": {"application/json"}}
 func (r *runtimeClient) mkdir(ctx context.Context, path string) error {
 	const ep = "api/contents"
 	body, _ := json.Marshal(map[string]any{"type": "directory"})
-	st, _, err := r.request(ctx, http.MethodPut, contentsPath(path), r.contentsQuery(nil), jsonHeader, body, runtimeTimeout)
+	st, _, err := r.request(ctx, http.MethodPut, contentsPath(path), r.contentsQuery(nil), jsonHeader, body, r.to())
 	if err != nil {
 		return err
 	}
@@ -290,7 +319,7 @@ func (r *runtimeClient) upload(ctx context.Context, path string, data []byte, ch
 		if r.up != nil && len(body) >= bulkBody {
 			hc = r.up
 		}
-		st, _, err := r.requestWith(hc, ctx, http.MethodPut, contentsPath(path), r.contentsQuery(nil), jsonHeader, body, 3*runtimeTimeout)
+		st, _, err := r.requestWith(hc, ctx, http.MethodPut, contentsPath(path), r.contentsQuery(nil), jsonHeader, body, 3*r.to())
 		if err != nil {
 			return err
 		}
@@ -306,11 +335,12 @@ func (r *runtimeClient) upload(ctx context.Context, path string, data []byte, ch
 
 // download reads a file (GET ?content=1, as upstream ContentsClient.download;
 // format=base64&type=file asks for the exact bytes, a text answer is
-// accepted too).
+// accepted too). It is only used for a result.json: an answer longer than
+// maxResultAnswer is errAnswerTooLarge.
 func (r *runtimeClient) download(ctx context.Context, path string) ([]byte, error) {
 	const ep = "api/contents"
 	q := r.contentsQuery(url.Values{"content": {"1"}, "format": {"base64"}, "type": {"file"}})
-	st, b, err := r.request(ctx, http.MethodGet, contentsPath(path), q, nil, nil, 3*runtimeTimeout)
+	st, b, err := r.requestLimit(r.hc, ctx, http.MethodGet, contentsPath(path), q, nil, nil, 3*r.to(), maxResultAnswer)
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +382,7 @@ func (r *runtimeClient) download(ctx context.Context, path string) ([]byte, erro
 
 // remove deletes a file or an empty directory; a missing one is fine.
 func (r *runtimeClient) remove(ctx context.Context, path string) error {
-	st, _, err := r.request(ctx, http.MethodDelete, contentsPath(path), r.contentsQuery(nil), nil, nil, runtimeTimeout)
+	st, _, err := r.request(ctx, http.MethodDelete, contentsPath(path), r.contentsQuery(nil), nil, nil, r.to())
 	if err != nil {
 		return err
 	}
@@ -429,26 +459,67 @@ type execOutcome struct {
 // kernelExec runs code in kernel kid and passes every stdout stream chunk
 // to onStdout. started (may be nil) is called once the request has been
 // sent (colab-batch R1: the audio uploads while the cell runs). It returns
-// when the execute_reply and the idle status for the request have arrived. A connection that breaks is reopened with the
-// same session id up to three times (the Jupyter server replays what it
-// buffered for the session). Outputs other than stdout and stderr streams
-// (display data, execute results) are CodeContractViolation: the cell
-// LectureFlow runs prints only through the worker's stdout.
-func (r *runtimeClient) kernelExec(ctx context.Context, kid, code string, onStdout func(string) error, sleep func(context.Context, time.Duration) error, started func()) (execOutcome, error) {
+// when the execute_reply and the idle status for the request have arrived.
+// A connection that breaks is reopened with the same session id (the
+// Jupyter server replays what it buffered for the session) after the waits
+// of rc (retry.go: 5 s, 15 s, 30 s, within 60 s of the break — the same
+// parameters as a failed request; it was 2 s, 4 s, 8 s before v3.2.x); a
+// message of the request arriving again ends that sequence, so a later
+// break gets its own. The first connection is retried the same way after a
+// transient failure (nothing was sent yet). Outputs other than stdout and
+// stderr streams (display data, execute results) are CodeContractViolation:
+// the cell LectureFlow runs prints only through the worker's stdout.
+//
+// Every connection uses r's proxy token; execCell takes a new one for each.
+func (r *runtimeClient) kernelExec(ctx context.Context, kid, code string, onStdout func(string) error, rc *reconnector, started func()) (execOutcome, error) {
+	return execCell(ctx, func(context.Context) (*runtimeClient, error) { return r, nil }, kid, code, onStdout, rc, started)
+}
+
+// clientSource returns the runtime client to connect with, its proxy token
+// valid now (Backend.clientOf: Backend.runtime of the session). Its error
+// is fetching that token's.
+type clientSource func(ctx context.Context) (*runtimeClient, error)
+
+// execCell is kernelExec with the client of every connection from src, so
+// a connection that breaks after the token it was opened with has ended
+// reconnects with a current one (review R65 M1: a lecture runs longer than
+// a token lasts, and the runtime refuses an ended token as if it were
+// gone). A transient failure of the token's refresh (retryable) counts as
+// one failed connection: the same waits, attempts and window. Any other
+// failure of it (the runtime no longer assigned, the credential refused or
+// gone) ends the cell at once, as a refused connection does.
+func execCell(ctx context.Context, src clientSource, kid, code string, onStdout func(string) error, rc *reconnector, started func()) (execOutcome, error) {
 	session := newUUID()
-	dialOnce := func() (MessageConn, error) {
+	// refresh: the error is src's, not the connection's
+	dialOnce := func() (conn MessageConn, refresh bool, err error) {
+		r, err := src(ctx)
+		if err != nil {
+			return nil, true, err
+		}
 		q := url.Values{"session_id": {session}, "token": {r.token}}
 		u := r.url("/api/kernels/"+url.PathEscape(kid)+"/channels", q)
 		u = "ws" + strings.TrimPrefix(u, "http")
-		return r.dial(ctx, u, http.Header{
+		conn, err = r.dial(ctx, u, http.Header{
 			"X-Colab-Client-Agent":        {r.agent},
 			"X-Colab-Runtime-Proxy-Token": {r.token},
 		})
+		return conn, false, err
 	}
-	conn, err := dialOnce()
-	if err != nil {
-		return execOutcome{}, err
+	conn, refresh, err := dialOnce()
+	for err != nil {
+		if ctx.Err() != nil {
+			return execOutcome{}, ctx.Err()
+		}
+		if !retryable(err, refresh) || !rc.next(ctx) {
+			rc.reset()
+			if ctx.Err() != nil {
+				return execOutcome{}, ctx.Err()
+			}
+			return execOutcome{}, err
+		}
+		conn, refresh, err = dialOnce()
 	}
+	rc.reset()
 	defer func() { conn.Close() }()
 	msgID := newUUID()
 	content, _ := json.Marshal(map[string]any{
@@ -473,30 +544,37 @@ func (r *runtimeClient) kernelExec(ctx context.Context, kid, code string, onStdo
 	}
 	var out execOutcome
 	gotReply, gotIdle := false, false
-	redials := 0
+	defer rc.reset()
 	for !(gotReply && gotIdle) {
 		bin, data, err := conn.ReadMessage(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return out, ctx.Err()
 			}
-			if redials >= 3 {
-				return out, fallbackErr(CodeConnectionLost, nil, fmt.Errorf("kernel channels: %s", netErrText(err)))
-			}
-			redials++
 			conn.Close()
-			if err := sleep(ctx, time.Duration(1<<redials)*time.Second); err != nil {
-				return out, err
-			}
-			if conn, err = dialOnce(); err != nil {
+			conn = closedConn{}
+			// The wait before the next connection; none left (or the window
+			// used up): the connection is lost.
+			if !rc.next(ctx) {
 				if ctx.Err() != nil {
 					return out, ctx.Err()
 				}
-				if redials >= 3 {
-					return out, fallbackErr(CodeConnectionLost, nil, fmt.Errorf("kernel channels: %s", netErrText(err)))
-				}
-				conn = closedConn{}
+				return out, fallbackErr(CodeConnectionLost, nil, fmt.Errorf("kernel channels: %s", netErrText(err)))
 			}
+			if c2, refresh, derr := dialOnce(); derr == nil {
+				conn = c2
+			} else if ctx.Err() != nil {
+				return out, ctx.Err()
+			} else if !retryable(derr, refresh) {
+				// The runtime is gone or refuses us (401, 403, 404, 410, ...),
+				// or so does the token's refresh: as for the first connection
+				// and every other request, no waiting it out (SEC2 L2);
+				// failedErr maps the runtime's 401/403/404/410 to
+				// session_reclaimed.
+				return out, derr
+			}
+			// a failed connection: the next read fails at once and the
+			// loop waits again (or gives up)
 			continue
 		}
 		m, err := decodeKernelMsg(bin, data)
@@ -506,6 +584,7 @@ func (r *runtimeClient) kernelExec(ctx context.Context, kid, code string, onStdo
 		if m.parentID() != msgID {
 			continue
 		}
+		rc.reset() // the request's messages arrive (again): the break is over
 		var c map[string]json.RawMessage
 		_ = json.Unmarshal(m.Content, &c)
 		co := obj{endpoint: "api/kernels/channels", m: c}

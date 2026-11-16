@@ -20,14 +20,18 @@
 // Inside a frame's own scan, a same-origin child document (scanned with
 // its parent, src/content/scan.js) that is blocked, or below one, drops
 // out the same way. The webRequest route drops the requests of blocked
-// frames, and those whose initiator (Chrome: the origin of the frame that
-// made them) is a blocked origin; src/background/requests.js already
-// skipped those a browser tied to a blocked document or ancestor.
+// frames, and those whose initiator (the origin of the document that made
+// them: Chrome's initiator, Firefox's documentUrl) is a blocked origin;
+// src/background/requests.js already skipped those a browser tied to a
+// blocked document or ancestor, and those of documents the scan did not
+// read.
 //
 // The extra fields of the scan (docs, ancestors, doc, initiator) are
-// removed here: they never reach detection, the report or a fixture. Pure.
+// removed here (doc, on request, right after boundScan): they never reach
+// detection, the report or a fixture. Pure.
 
 import { blockedCategory, originCategory } from './blocklist.js';
+import { urlKey } from './url.js';
 
 const MAX_HISTORY = 50;
 
@@ -76,8 +80,11 @@ export function contextCategory({ frameUrl = '', topUrl = '', ancestors = null }
  * the frames and requests left, without the screening fields; the ids of
  * the frames taken out; the categories of what was taken out; and
  * frameCategory(frameId), the category of a frame that was taken out ('').
+ * keepDoc: entries keep their `doc` (which document of the frame's scan
+ * holds them), for boundScan's turns only; the caller removes it right
+ * after (src/background/detector.js).
  */
-export function screenScan({ frames = [], webRequests = [] } = {}) {
+export function screenScan({ frames = [], webRequests = [] } = {}, { keepDoc = false } = {}) {
   const blockedOrigins = new Map(); // origin → category
   const addOrigin = (raw, category) => {
     const o = originOf(raw);
@@ -138,7 +145,7 @@ export function screenScan({ frames = [], webRequests = [] } = {}) {
     }
   }
 
-  const strip = ({ doc: _d, ...rest }) => rest;
+  const strip = keepDoc ? (x) => x : ({ doc: _d, ...rest }) => rest;
   const kept = [];
   for (const f of frames) {
     if (frameCat.has(f.frameId)) continue;
@@ -171,4 +178,22 @@ export function screenScan({ frames = [], webRequests = [] } = {}) {
     categories: [...categories],
     frameCategory: (frameId) => frameCat.get(frameId) || '',
   };
+}
+
+/**
+ * The title a frame gave (src/content/scan.js frameTitle: { url, title,
+ * history, ancestors }) when it may be used: the frame still shows the
+ * document the screened scan saw (scannedUrl, compared without the
+ * fragment), and neither its address, the addresses its document showed,
+ * the tab's top-level address (topUrl, when known) nor an origin it sits
+ * inside is a do-not-handle site. '' otherwise: a blocked site's title is
+ * never used.
+ */
+export function titleOfFrame(read, { scannedUrl = '', topUrl = '' } = {}) {
+  if (!read || typeof read !== 'object' || typeof read.title !== 'string' || typeof read.url !== 'string') return '';
+  const now = urlKey(read.url);
+  if (!now || now !== urlKey(scannedUrl)) return '';
+  if (documentCategory({ url: read.url, history: read.history })) return '';
+  if (contextCategory({ frameUrl: read.url, topUrl, ancestors: Array.isArray(read.ancestors) ? read.ancestors : null })) return '';
+  return read.title;
 }

@@ -169,3 +169,100 @@ func TestRemovalLeftoverReleasesWhenIdle(t *testing.T) {
 		t.Fatalf("status %+v (last release %+v)", st, st.LastRelease)
 	}
 }
+
+// T051: a directory stays busy until its deletion ends with every file
+// gone; meanwhile each attempt takes a suffixed directory of its own.
+func TestJobDirForBusyDirectory(t *testing.T) {
+	b := &Backend{}
+	s := &liveSession{}
+	j := &jobState{id: "a", key: "a"}
+	if d := b.jobDirFor(s, "base", j); d != "base/jobs/a" || j.id != "a" {
+		t.Fatalf("free: %q (id %q)", d, j.id)
+	}
+	b.markBusyDir(s, "base/jobs/a")
+	d := b.jobDirFor(s, "base", j)
+	if !strings.HasPrefix(d, "base/jobs/a-") || d != "base/jobs/"+j.id || len(j.id) != len("a-")+6 {
+		t.Fatalf("busy: %q (id %q)", d, j.id)
+	}
+	b.settleBusyDir(s, "base/jobs/a", false) // a file was left: still busy
+	if j2 := (&jobState{id: "a", key: "a"}); b.jobDirFor(s, "base", j2) == "base/jobs/a" {
+		t.Fatal("a directory that kept a file was reused")
+	}
+	b.settleBusyDir(s, "base/jobs/a", true)
+	if j3 := (&jobState{id: "a", key: "a"}); b.jobDirFor(s, "base", j3) != "base/jobs/a" {
+		t.Fatal("a removed directory was not reused")
+	}
+}
+
+// T051 (R3): the same lecture dispatched again to the runtime while its
+// previous directory is still being removed in the background. The new
+// attempt gets a directory of its own: the removal still under way cannot
+// delete its upload or its job.json, the transcription succeeds, and the
+// previous directory is removed in the end.
+func TestRetryWhileRemovalRunsUsesItsOwnDirectory(t *testing.T) {
+	ctx := context.Background()
+	e := newFakeEnv(t, t4())
+	gate, started := make(chan struct{}), make(chan struct{})
+	e.f.mu.Lock()
+	e.f.removeGate, e.f.removing = gate, started
+	e.f.mu.Unlock()
+	a := e.lecture(t, "a")
+	if _, err := e.b.Transcribe(ctx, a, nil); err != nil {
+		t.Fatalf("first attempt: %v", err)
+	}
+	first := "content/lectureflow/jobs/" + e.transcribingNow(t)
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no removal cell")
+	}
+	e.f.mu.Lock()
+	e.f.removing = nil // the next removal cells do not report
+	e.f.mu.Unlock()
+
+	// The second attempt is held in its transcription (its job.json and
+	// directory in place) while the first removal goes on.
+	e.f.hold("*")
+	done := make(chan error, 1)
+	go func() { _, err := e.b.Transcribe(ctx, a, nil); done <- err }()
+	var name string
+	select {
+	case name = <-e.f.transcribing:
+	case err := <-done:
+		t.Fatalf("second attempt ended before its transcription: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the second attempt did not start transcribing")
+	}
+	second := "content/lectureflow/jobs/" + name
+	if second == first || !strings.HasPrefix(name, "a-") {
+		t.Errorf("the second attempt uses %q (the first %q)", second, first)
+	}
+	close(gate)
+	e.waitFor(t, "the first removal", func() bool {
+		e.f.mu.Lock()
+		defer e.f.mu.Unlock()
+		return slices.Contains(e.f.removed, first)
+	})
+	if !e.f.has(second + "/job.json") {
+		t.Error("the first removal deleted the second attempt's job.json")
+	}
+	e.f.release("*")
+	if err := <-done; err != nil {
+		t.Fatalf("second attempt: %v", err)
+	}
+	e.b.removalsSettled()
+	if e.f.hasDir(first) || e.f.hasDir(second) {
+		t.Errorf("left on the runtime: dirs %v, files %v", e.f.dirs, e.f.files)
+	}
+	e.f.mu.Lock()
+	removed := slices.Clone(e.f.removed)
+	e.f.mu.Unlock()
+	if !slices.Contains(removed, first) || !slices.Contains(removed, second) {
+		t.Errorf("removed %v", removed)
+	}
+	if st := e.b.Status(ctx); st.State != StateRunning {
+		t.Errorf("the runtime went: %+v", st)
+	}
+	_ = e.b.QueueDrained(ctx)
+	e.checkSecrets(t)
+}

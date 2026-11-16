@@ -401,8 +401,9 @@ func TestUploadFailureEndsTheCell(t *testing.T) {
 	if Code(err) != CodeUploadFailed || !IsFallback(err) {
 		t.Fatalf("err %v", err)
 	}
-	if e.f.hasDir(base+"/jobs/a") || !e.f.released {
-		t.Errorf("job directory left (%v) or runtime kept (released %v)", e.f.hasDir(base+"/jobs/a"), e.f.released)
+	e.b.handbacksSettled() // v3.2.x: the files and the runtime go in the background
+	if e.f.hasDir(base+"/jobs/a") || !e.f.wasReleased() {
+		t.Errorf("job directory left (%v) or runtime kept (released %v)", e.f.hasDir(base+"/jobs/a"), e.f.wasReleased())
 	}
 	if n := e.f.count(func() int { return e.f.running }); n != 0 {
 		t.Errorf("%d cells still transcribing", n)
@@ -424,7 +425,8 @@ func TestSetupErrorBeforeTheUploadSkipsIt(t *testing.T) {
 	if n := e.f.count(func() int { return e.f.uploadCount[base+"/jobs/a/audio.flac"] }); n != 0 {
 		t.Errorf("audio uploaded %d times after the setup failed", n)
 	}
-	if !e.f.released {
+	e.b.handbacksSettled() // v3.2.x: the runtime goes in the background
+	if !e.f.wasReleased() {
 		t.Error("runtime kept after the worker failed")
 	}
 }

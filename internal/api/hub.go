@@ -42,6 +42,16 @@ type Hub struct {
 	hookMu    sync.Mutex
 	onClients func(n int)
 	jobHook   func(model.Job) // set by the server; must not block
+	// jobStats (v3.2.x P1-c) adds the run's statistics to a job event; set
+	// by the server (Server.jobEventStats), must not block.
+	jobStats func(*JobEvent, model.Job)
+}
+
+// setJobStats registers fn (see Hub.jobStats).
+func (h *Hub) setJobStats(fn func(*JobEvent, model.Job)) {
+	h.mu.Lock()
+	h.jobStats = fn
+	h.mu.Unlock()
 }
 
 // setClientsHook registers fn, called with the number of visible SSE
@@ -160,8 +170,15 @@ type sentInfo struct {
 func (h *Hub) Job(j model.Job) {
 	ev := JobEvent{Scope: j.Scope, ScopeID: j.ScopeID, Stage: j.Stage, Status: j.Status, Progress: j.Progress}
 	h.mu.Lock()
-	hook := h.jobHook
+	hook, decorate := h.jobHook, h.jobStats
 	h.mu.Unlock()
+	if decorate != nil {
+		// v3.2.x P1-c: stats, llm and last_activity_at of a running job.
+		// The event replaces the client's unsent one of the job like any
+		// other (latest wins), so an event that changes only the stats is
+		// neither dropped nor sent sooner than MinInterval after the last.
+		decorate(&ev, j)
+	}
 	if hook != nil {
 		hook(j)
 	}

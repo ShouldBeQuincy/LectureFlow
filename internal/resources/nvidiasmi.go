@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"lectureflow/internal/procutil"
 )
 
 // QueryArgs are the nvidia-smi arguments of A10.1.
@@ -124,10 +126,12 @@ func quoteShort(s string) string {
 	return strconv.Quote(s)
 }
 
-// execRun is the default Deps.RunCmd: it runs the command and returns its
-// stdout; a failing exit carries the first line of stderr in the error.
+// execRun is the default Deps.RunCmd: it runs the command (nvidia-smi;
+// ioreg on macOS) in its own directory, not the service's current one
+// (procutil.CommandInExeDir; SEC52 info-7), and returns its stdout; a
+// failing exit carries the first line of stderr in the error.
 func execRun(ctx context.Context, name string, args ...string) (string, error) {
-	out, err := exec.CommandContext(ctx, name, args...).Output()
+	out, err := procutil.CommandInExeDir(ctx, name, args...).Output()
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {

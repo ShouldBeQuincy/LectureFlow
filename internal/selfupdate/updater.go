@@ -14,11 +14,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"lectureflow/internal/components"
+	"lectureflow/internal/dirperm"
 	"lectureflow/internal/model"
 )
 
@@ -35,6 +37,9 @@ const (
 	// JSON {"at": RFC 3339, "result": "up_to_date" | "available" | "error",
 	// "failures": failed checks in a row, "error": the last failure}
 	KVLastCheck = "selfupdate.last_check"
+	// JSON failedRecord: the version whose installation did not work, until
+	// a strictly newer one appears ("" = none)
+	KVFailedInstall = "selfupdate.failed_install"
 )
 
 // When automatic checks run (README "Privacy"): a day after a check that
@@ -80,6 +85,10 @@ const (
 	StateImporting     = "importing"
 	StatePending       = "pending" // Status.Pending is installed at the next start
 	StateError         = "error"   // the last check or download failed (Status.Error)
+	// Status.InstallFailed: installing that version did not work; it is not
+	// offered until a newer one appears. Status.Available is that version
+	// when a check found it: downloading it is trying it again.
+	StateInstallFailed = "install_failed"
 )
 
 // Reasons of StateNotConfigured.
@@ -107,6 +116,18 @@ type Options struct {
 	Desktop  bool
 	Portable bool   // the Windows portable build
 	Platform string // "" = this computer's (windows-x64, darwin-arm64)
+	// NoInstall: the desktop shell found that this copy of the app cannot
+	// replace itself (an unpacked or copied folder; -no-self-update). No
+	// package is this copy's: a newer version is found and shown without
+	// one (the page says to install it by hand), a download or an offline
+	// update is refused with selfupdate.no_package, and any pending update
+	// in the data directory is another copy's (othercopy.go).
+	NoInstall bool
+	// InstallDir is the installation directory the desktop shell names
+	// (-install-dir: the Windows installation set up by the installer;
+	// "" = none, nothing is checked): while other accounts may change it,
+	// nothing is downloaded or imported (CheckInstallDir, installdir.go).
+	InstallDir string
 
 	// Overrides for tests ("" = the built-in values).
 	PublicKey string
@@ -143,6 +164,7 @@ type Status struct {
 	Pending        *PendingInfo     `json:"pending,omitempty"`
 	Rollback       *RollbackInfo    `json:"rollback,omitempty"`
 	LastResult     *Result          `json:"last_result,omitempty"`
+	InstallFailed  *FailedInstall   `json:"install_failed,omitempty"`
 	Error          *model.ErrorInfo `json:"error,omitempty"`
 }
 
@@ -229,8 +251,10 @@ type Updater struct {
 	failures  int    // failed checks in a row (the automatic checks back off)
 	failCode  string // the code of the last failed check
 	pending   *Pending
+	other     *Pending // pending.json when it is another copy's (othercopy.go)
 	previous  *Previous
 	result    *Result
+	failed    *failedRecord // kv selfupdate.failed_install (activeFailedLocked: in effect)
 	progress  *Progress
 	lastEmit  time.Time
 	lastErr   *model.ErrorInfo
@@ -325,8 +349,21 @@ func currentPlatform() string {
 	return ""
 }
 
-// importKinds are the package kinds an offline update may bring.
+// asset is the package of m this copy downloads and installs: none for a
+// copy that cannot update itself (Options.NoInstall).
+func (u *Updater) asset(m *Manifest) (Asset, bool) {
+	if u.opt.NoInstall {
+		return Asset{}, false
+	}
+	return m.Asset(u.platform, u.kind)
+}
+
+// importKinds are the package kinds an offline update may bring (none for
+// a copy that cannot update itself: matchPackage answers no_package).
 func (u *Updater) importKinds() []string {
+	if u.opt.NoInstall {
+		return nil
+	}
 	if u.platform == PlatformDarwinArm64 {
 		return []string{KindZip, KindDMG}
 	}
@@ -536,7 +573,7 @@ func (u *Updater) Status(ctx context.Context) Status {
 		m := u.avail.Manifest
 		r := &Release{Version: m.Version, Channel: m.Channel, ReleasedAt: m.ReleasedAt, NotesURL: m.NotesURL,
 			MinVersion: m.MinVersion, Direct: u.direct(m), Source: u.avail.Source}
-		if a, ok := m.Asset(u.platform, u.kind); ok {
+		if a, ok := u.asset(m); ok {
 			r.File, r.Size = a.Name, a.Size
 		}
 		st.Available = r
@@ -552,6 +589,10 @@ func (u *Updater) Status(ctx context.Context) Status {
 		r := *u.result
 		st.LastResult = &r
 	}
+	if f := u.activeFailedLocked(channel); f != nil {
+		fi := f.FailedInstall
+		st.InstallFailed = &fi
+	}
 	if u.progress != nil {
 		pr := *u.progress
 		st.Progress = &pr
@@ -564,7 +605,10 @@ func (u *Updater) Status(ctx context.Context) Status {
 	// network was not up yet, the latest release has no signature yet)
 	// leaves the version found before, or the one downloaded, as it is,
 	// with the failure as a note (Status.Error). A failed download of the
-	// available version is the state error (download again).
+	// available version is the state error (download again). A version
+	// whose installation did not work is not "available" again: the state
+	// install_failed (with a failed check as a note) until a newer version
+	// appears or the user tries it again.
 	switch {
 	case u.op == opCheck:
 		st.State = StateChecking
@@ -574,6 +618,8 @@ func (u *Updater) Status(ctx context.Context) Status {
 		st.State = StateImporting
 	case u.lastErr != nil && IsDownloadError(u.lastErr.Code) && st.Available != nil:
 		st.State = StateError
+	case st.InstallFailed != nil && st.Pending == nil && (st.Available == nil || st.Available.Version == st.InstallFailed.Version):
+		st.State = StateInstallFailed
 	case u.lastErr != nil && st.Available == nil && st.Pending == nil:
 		st.State = StateError
 	case st.Available != nil:
@@ -679,17 +725,31 @@ func (u *Updater) check(ctx context.Context) error {
 	} else {
 		u.avail = nil
 	}
+	forget := u.failed
+	if forget != nil && !(newer && compareVersions(m.Version, forget.Version) > 0) {
+		forget = nil
+	}
+	if forget != nil {
+		u.failed = nil // a strictly newer version appeared
+	}
 	u.mu.Unlock()
+	if forget != nil {
+		u.saveFailed(ctx, nil)
+		u.log.Info("selfupdate: a version newer than the one that failed to install is available", "failed", forget.Version, "version", m.Version)
+	}
 	if newer {
 		u.recordCheck(ctx, now, StateAvailable, nil)
-		if err := writeFileAtomic(filepath.Join(u.dir, latestFile), v.Raw); err == nil {
-			_ = writeFileAtomic(filepath.Join(u.dir, latestSigFile), v.Signature)
+		err := u.writeUpdatesFile(latestFile, v.Raw)
+		if err == nil {
+			err = u.writeUpdatesFile(latestSigFile, v.Signature)
+		}
+		if err != nil {
+			u.log.Warn("selfupdate: keeping the check's result for the next start", "error", err)
 		}
 		u.log.Info("selfupdate: a newer version is available", "version", m.Version, "channel", m.Channel, "source", redactURL(v.Source))
 	} else {
 		u.recordCheck(ctx, now, StateUpToDate, nil)
-		os.Remove(filepath.Join(u.dir, latestFile))
-		os.Remove(filepath.Join(u.dir, latestSigFile))
+		u.removeLatest()
 	}
 	return nil
 }
@@ -760,10 +820,14 @@ func (u *Updater) untilDue(every time.Duration) time.Duration {
 
 // Download starts downloading the available version's package (202: the
 // status is downloading). Errors: not_configured, busy, not_available,
-// too_old, no_package.
+// too_old, no_package, untrusted_dir, untrusted_install_dir,
+// other_copy_pending.
 func (u *Updater) Download(ctx context.Context) (Status, error) {
 	channel := u.channel(ctx)
 	if err := u.untrusted(); err != nil {
+		return u.Status(ctx), err
+	}
+	if err := u.otherCopyPending(); err != nil {
 		return u.Status(ctx), err
 	}
 	u.mu.Lock()
@@ -781,7 +845,7 @@ func (u *Updater) Download(ctx context.Context) (Status, error) {
 		err = cerr(CodeTooOld, map[string]any{"min_version": v.Manifest.MinVersion, "current": u.opt.Version}, nil)
 	default:
 		var ok bool
-		if a, ok = v.Manifest.Asset(u.platform, u.kind); !ok {
+		if a, ok = u.asset(v.Manifest); !ok {
 			err = cerr(CodeNoPackage, map[string]any{"platform": u.platform, "kind": u.kind}, nil)
 		}
 	}
@@ -790,6 +854,15 @@ func (u *Updater) Download(ctx context.Context) (Status, error) {
 		u.mu.Unlock()
 		return u.Status(ctx), err
 	}
+	// Downloading the version whose installation failed is trying it again
+	// (the user's "try again"): the failure no longer applies; a new one is
+	// recorded again from result.json.
+	var retry *failedRecord
+	if f := u.failed; f != nil && !f.Retry && f.Version == v.Manifest.Version {
+		f.Retry = true
+		r := *f
+		retry = &r
+	}
 	dctx, cancel := context.WithCancelCause(u.root)
 	done := make(chan struct{})
 	u.cancelDL, u.dlDone = cancel, done
@@ -797,6 +870,10 @@ func (u *Updater) Download(ctx context.Context) (Status, error) {
 	u.lastErr = nil
 	u.wg.Add(1)
 	u.mu.Unlock()
+	if retry != nil {
+		u.saveFailed(ctx, retry)
+		u.log.Info("selfupdate: trying again the version whose installation failed", "version", retry.Version)
+	}
 	u.changed()
 	go func() {
 		defer u.wg.Done()
@@ -832,14 +909,19 @@ func (u *Updater) CancelDownload() bool {
 
 var errCancelledByUser = errors.New("download cancelled")
 
-// checkTrust is CheckTrust (tests replace it).
-var checkTrust = CheckTrust
+// checkTrust is CheckTrust, checkInstall CheckInstallDir (tests replace
+// them).
+var (
+	checkTrust   = CheckTrust
+	checkInstall = CheckInstallDir
+)
 
 // untrusted returns selfupdate.untrusted_dir when other accounts may
-// change the data directory: nothing is downloaded or imported into it
-// (the desktop shell would not install it either). A check that fails
-// for another reason does not stop anything here; the shell checks again
-// (-selfupdate-verify) and refuses then.
+// change the data directory, selfupdate.untrusted_install_dir when they
+// may change the installation directory (Options.InstallDir): nothing is
+// downloaded or imported (the desktop shell would not install it either).
+// A check that fails for another reason does not stop anything here; the
+// shell checks again (-selfupdate-verify) and refuses then.
 func (u *Updater) untrusted() error {
 	if u.reason != "" || u.dir == "" {
 		return nil
@@ -851,6 +933,21 @@ func (u *Updater) untrusted() error {
 	}
 	if err != nil {
 		u.log.Warn("selfupdate: checking the data directory's permissions", "error", err)
+	}
+	if u.opt.InstallDir == "" {
+		return nil
+	}
+	// Any failure of this check refuses too (security review SEC20): the
+	// installation folder cannot be vouched for, and the shell's check
+	// would refuse the package after the download anyway; the diagnostics
+	// show the same folder as "cannot be confirmed".
+	err = checkInstall(u.opt.InstallDir)
+	if err != nil && CodeOf(err) != CodeUntrustedInstallDir {
+		err = cerr(CodeUntrustedInstallDir, map[string]any{"path": u.opt.InstallDir, "who": dirperm.NotConfirmed + InfoOf(err).Detail}, err)
+	}
+	if err != nil {
+		u.log.Warn("selfupdate: the installation directory cannot be vouched for; no update is downloaded or imported (install the new version by hand)", "error", err)
+		return err
 	}
 	return nil
 }
@@ -871,8 +968,8 @@ func (u *Updater) download(ctx context.Context, v *Verified, a Asset) error {
 	if !fileMatches(final, a) {
 		os.Remove(final)
 		part := final + ".part"
-		err := u.dl.Download(ctx, DownloadRequest{URLs: u.assetURLs(ctx, v, a), Path: part, Size: a.Size, SHA256: a.SHA256,
-			Progress: u.setProgress})
+		err := u.dl.Download(ctx, DownloadRequest{URLs: u.assetURLs(ctx, v, a), UserURLs: u.userAssetURLs(ctx, v, a), Path: part,
+			Size: a.Size, SHA256: a.SHA256, Progress: u.setProgress})
 		if c := context.Cause(ctx); c != nil {
 			return cerr(CodeCancelled, nil, c)
 		}
@@ -945,14 +1042,39 @@ func (u *Updater) assetURLs(ctx context.Context, v *Verified, a Asset) []string 
 	return out
 }
 
+// userAssetURLs are those of assetURLs that come from the user's own
+// sources (a {url} template or a directory of the settings, the source
+// that delivered update.json included): DownloadRequest.UserURLs.
+func (u *Updater) userAssetURLs(ctx context.Context, v *Verified, a Asset) []string {
+	var out []string
+	add := func(s *source) {
+		if s == nil || (s.kind != srcTemplate && s.kind != srcDir) {
+			return
+		}
+		if x := s.assetURL(a); x != "" && secureURL(x) && !slices.Contains(out, x) {
+			out = append(out, x)
+		}
+	}
+	add(v.source)
+	for _, s := range u.sources(u.Settings(ctx).Sources, ChannelStable) {
+		add(s)
+	}
+	return out
+}
+
 // ---- pending and previous ----
 
 // makePending records a verified package as the update to install at the
 // next start: previous.json first, then pending.json.
 func (u *Updater) makePending(m *Manifest, a Asset, origin string) error {
+	// never over another copy's update (both files have one slot; Download
+	// and ImportWith refuse before they begin, this is the last look)
+	if err := u.otherCopyPending(); err != nil {
+		return err
+	}
 	now := u.now().UTC().Format(time.RFC3339)
 	prev := u.previousFor(now)
-	if err := writeJSONAtomic(filepath.Join(u.dir, previousFile), prev); err != nil {
+	if err := u.writeUpdatesJSON(previousFile, prev); err != nil {
 		return ioErr(err)
 	}
 	p := Pending{Schema: fileSchema, Version: m.Version, FromVersion: u.opt.Version, Channel: m.Channel,
@@ -960,13 +1082,31 @@ func (u *Updater) makePending(m *Manifest, a Asset, origin string) error {
 		Manifest: relPath(m.Version, manifestFile), Signature: relPath(m.Version, signatureFile),
 		KeyID: hex.EncodeToString(keyIDDisplay(u.pk.KeyID)), Origin: origin, VerifiedAt: now}
 	p.KeyID = strings.ToUpper(p.KeyID)
-	if err := writeJSONAtomic(filepath.Join(u.dir, pendingFile), p); err != nil {
+	if err := u.writeUpdatesJSON(pendingFile, p); err != nil {
 		return ioErr(err)
 	}
 	u.mu.Lock()
 	u.pending = &p
+	u.other = nil // (one given up for its age: the slot is this copy's now)
 	u.previous = &prev
+	// the version whose installation failed: a newer one supersedes it; the
+	// same one (an offline update of it) is trying it again
+	var failedChange bool
+	var failedNow *failedRecord
+	if f := u.failed; f != nil {
+		switch {
+		case compareVersions(p.Version, f.Version) > 0:
+			u.failed, failedChange = nil, true
+		case p.Version == f.Version && !f.Retry:
+			f.Retry, failedChange = true, true
+			r := *f
+			failedNow = &r
+		}
+	}
 	u.mu.Unlock()
+	if failedChange {
+		u.saveFailed(context.Background(), failedNow)
+	}
 	u.log.Info("selfupdate: update ready; it is installed at the next start", "version", p.Version, "origin", origin)
 	u.cleanup(false)
 	return nil
@@ -1018,7 +1158,7 @@ func (u *Updater) DiscardPending(ctx context.Context) (Status, error) {
 	u.mu.Unlock()
 	var err error
 	if p != nil {
-		if rerr := os.Remove(filepath.Join(u.dir, pendingFile)); rerr != nil && !isNotExist(rerr) {
+		if rerr := u.removeUpdatesFile(pendingFile); rerr != nil {
 			err = ioErr(rerr)
 		} else {
 			u.mu.Lock()
@@ -1048,9 +1188,87 @@ func (u *Updater) removeVersion(version string) {
 	if keep {
 		return
 	}
-	if err := os.RemoveAll(filepath.Join(u.dir, version)); err != nil {
+	r, err := u.updatesRoot()
+	if err != nil {
+		if !isNotExist(err) {
+			u.log.Warn("selfupdate: removing the discarded update's files", "version", version, "error", err)
+		}
+		return
+	}
+	defer r.Close()
+	if err := r.RemoveAll(version); err != nil {
 		u.log.Warn("selfupdate: removing the discarded update's files", "version", version, "error", err)
 	}
+}
+
+// updatesRoot opens the updates directory for removing entries of it, when
+// it is a plain directory (security review SEC17: one that is a link —
+// left by whoever could once write to the data directory — is not
+// followed; what lies where it leads is not this program's to remove).
+// What is removed is then named relative to that handle, and os.Root's
+// RemoveAll removes a link below it without entering it.
+func (u *Updater) updatesRoot() (*os.Root, error) {
+	r, err := openPlainDir(u.dir)
+	if errors.Is(err, errNotPlainDir) {
+		u.log.Warn("selfupdate: the updates directory is a link; nothing is written or removed through it", "dir", u.dir)
+	}
+	return r, err
+}
+
+// writeUpdatesFile writes the file name of the updates directory (a
+// temporary file renamed over it) through updatesRoot: when the updates
+// directory is a link nothing is written (security review SEC17, 低-F: the
+// link could lead to any folder the user can write) and the error says
+// so. A missing updates directory is made first.
+func (u *Updater) writeUpdatesFile(name string, data []byte) error {
+	r, err := u.updatesRoot()
+	if isNotExist(err) {
+		if err = os.MkdirAll(u.dir, 0o755); err == nil {
+			r, err = u.updatesRoot()
+		}
+	}
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	return writeFileAtomicIn(r, name, data)
+}
+
+// removeLatest removes the last check's verified result (latest.json and
+// its signature) through removeUpdatesFile.
+func (u *Updater) removeLatest() {
+	for _, name := range []string{latestFile, latestSigFile} {
+		if err := u.removeUpdatesFile(name); err != nil {
+			u.log.Warn("selfupdate: removing the last check's result", "file", name, "error", err)
+		}
+	}
+}
+
+// writeUpdatesJSON is writeUpdatesFile of v as indented JSON.
+func (u *Updater) writeUpdatesJSON(name string, v any) error {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	return u.writeUpdatesFile(name, append(b, '\n'))
+}
+
+// removeUpdatesFile removes the entry name of the updates directory (a
+// link there is removed itself) through updatesRoot: nothing when the
+// updates directory is a link (an error) or missing (nil).
+func (u *Updater) removeUpdatesFile(name string) error {
+	r, err := u.updatesRoot()
+	if isNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	if err := r.Remove(name); err != nil && !isNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // ---- startup and cleanup ----
@@ -1092,11 +1310,163 @@ func (u *Updater) Startup(ctx context.Context) {
 		if m, err := verifyManifest(u.pk, raw, sig); err == nil && compareVersions(m.Version, u.opt.Version) > 0 {
 			u.avail = &Verified{Manifest: m, Raw: raw, Signature: sig}
 		} else {
-			os.Remove(filepath.Join(u.dir, latestFile))
-			os.Remove(filepath.Join(u.dir, latestSigFile))
+			u.removeLatest()
 		}
 	}
+	u.loadFailed(ctx)
+	// (removes the package of a version whose installation failed)
 	u.cleanup(true)
+}
+
+// ---- a failed installation ----
+
+// loadFailed (Startup) records a newer version whose installation did not
+// work: result.json rolled_back or failed for a version newer than this
+// one, with no pending update of it (Electron keeps pending.json when it
+// only could not check the package this time: that is no failure). A
+// result already recorded (same version and time) is not recorded again,
+// so that the user's "try again" stays. The record is dropped once this
+// version is not older than it, or a strictly newer version is offered or
+// pending.
+func (u *Updater) loadFailed(ctx context.Context) {
+	channel := u.channel(ctx)
+	rec := u.readFailed(ctx)
+	if r := u.result; r != nil && (r.Outcome == OutcomeRolledBack || r.Outcome == OutcomeFailed) && validVersion(r.Version) &&
+		compareVersions(r.Version, u.opt.Version) > 0 && (u.pending == nil || u.pending.Version != r.Version) {
+		if rec == nil || rec.Version != r.Version || rec.At != r.At {
+			// only an installation this version started of a version Go
+			// verified (SEC12 L-3): a planted or stale result.json cannot
+			// hold back an update
+			if why := u.unprovenFailure(r); why != "" {
+				u.log.Info("selfupdate: result.json is not about an update of this version; not remembered as failed",
+					"version", r.Version, "reason", why)
+			} else {
+				rec = &failedRecord{FailedInstall: FailedInstall{Version: r.Version, At: r.At, Outcome: r.Outcome, Error: r.Error}}
+				u.saveFailed(ctx, rec)
+				u.log.Warn("selfupdate: installing the update did not work; it is not offered again until a newer version appears",
+					"version", r.Version, "outcome", r.Outcome)
+			}
+		}
+	}
+	if rec == nil {
+		return
+	}
+	u.mu.Lock()
+	u.failed = rec
+	superseded := u.supersededLocked(rec, channel)
+	retried := !superseded && !rec.Retry && u.pending != nil && u.pending.Version == rec.Version
+	if superseded {
+		u.failed = nil
+	}
+	if retried {
+		rec.Retry = true
+	}
+	u.mu.Unlock()
+	switch {
+	case superseded:
+		u.saveFailed(ctx, nil)
+		u.log.Info("selfupdate: forgetting the failed installation: a newer version is here", "version", rec.Version)
+	case retried:
+		u.saveFailed(ctx, rec)
+	}
+}
+
+// unprovenFailure says why result.json r is not a failed update of this
+// version ("" when it is): its "from" must be the running version (the
+// shell writes the version it went back to, or left running), and
+// updates/<version>/ must hold that version's update.json with a signature
+// that verifies with the built-in key (Go wrote both when it downloaded or
+// imported it; the start's clean-up removes them only afterwards). The
+// path comes from r.Version only after it parsed as a version, and the
+// files are only read. Nothing is proven in a data directory other
+// accounts may change (selfupdate.untrusted_dir): result.json and
+// update.json may be theirs (SEC12 review residual). Only the data
+// directory counts here, not the installation folder (untrusted): a
+// rollback can leave that one open, and the failure it rolled back is
+// then the very one to remember.
+func (u *Updater) unprovenFailure(r *Result) string {
+	if r.From != u.opt.Version {
+		return "it is about an update from " + r.From
+	}
+	if u.dir != "" && CodeOf(checkTrust(u.dir)) == CodeUntrustedDir {
+		return "the data directory can be changed by other accounts"
+	}
+	if !validVersion(r.Version) || r.Version != filepath.Base(r.Version) {
+		return "not a version"
+	}
+	mf, ok1 := absPath(u.dir, relPath(r.Version, manifestFile))
+	sf, ok2 := absPath(u.dir, relPath(r.Version, signatureFile))
+	if !ok1 || !ok2 {
+		return "not a version"
+	}
+	raw, err1 := os.ReadFile(mf)
+	sig, err2 := os.ReadFile(sf)
+	if err1 != nil || err2 != nil {
+		return "no update.json of that version here"
+	}
+	m, err := verifyManifest(u.pk, raw, sig)
+	if err != nil || m.Version != r.Version {
+		return "its update.json does not verify"
+	}
+	return ""
+}
+
+func validVersion(s string) bool {
+	_, err := parseVersion(s)
+	return err == nil
+}
+
+// readFailed is kv selfupdate.failed_install (nil: none or unreadable).
+func (u *Updater) readFailed(ctx context.Context) *failedRecord {
+	v, ok := u.kvGet(ctx, KVFailedInstall)
+	if !ok || v == "" {
+		return nil
+	}
+	var r failedRecord
+	if json.Unmarshal([]byte(v), &r) != nil || !validVersion(r.Version) {
+		return nil
+	}
+	return &r
+}
+
+// saveFailed stores r (nil: forgets the record). A failure is only logged:
+// the record is a convenience, never a reason for anything else to fail.
+func (u *Updater) saveFailed(ctx context.Context, r *failedRecord) {
+	if u.opt.KV == nil {
+		return
+	}
+	v := ""
+	if r != nil {
+		b, _ := json.Marshal(r)
+		v = string(b)
+	}
+	if err := u.opt.KV.SetKV(ctx, KVFailedInstall, v); err != nil {
+		u.log.Warn("selfupdate: saving the failed installation", "error", err)
+	}
+}
+
+// supersededLocked: the failed version r no longer matters: this version
+// is not older than it, or a strictly newer version is offered on channel
+// or pending (u.mu held).
+func (u *Updater) supersededLocked(r *failedRecord, channel string) bool {
+	if compareVersions(r.Version, u.opt.Version) <= 0 {
+		return true
+	}
+	if v := u.avail; v != nil && u.offeredLocked(v, channel) && compareVersions(v.Manifest.Version, r.Version) > 0 {
+		return true
+	}
+	return u.pending != nil && compareVersions(u.pending.Version, r.Version) > 0
+}
+
+// activeFailedLocked is the failed installation in effect, or nil: none,
+// the user is trying it again (Retry, or it is pending), or superseded
+// (u.mu held).
+func (u *Updater) activeFailedLocked(channel string) *failedRecord {
+	r := u.failed
+	if r == nil || r.Retry || (u.pending != nil && u.pending.Version == r.Version) || u.supersededLocked(r, channel) {
+		return nil
+	}
+	return r
 }
 
 func (u *Updater) loadPending() {
@@ -1108,17 +1478,26 @@ func (u *Updater) loadPending() {
 	}
 	drop := func(why string) {
 		u.log.Info("selfupdate: removing pending.json", "reason", why, "version", p.Version)
-		os.Remove(path)
+		if err := u.removeUpdatesFile(pendingFile); err != nil {
+			u.log.Warn("selfupdate: removing pending.json", "error", err)
+		}
 	}
 	if err != nil || p.Schema != fileSchema {
 		drop("unreadable")
 		return
 	}
-	if _, err := parseVersion(p.Version); err != nil || p.Platform != u.platform {
+	if _, err := parseVersion(p.Version); err != nil {
 		drop("invalid")
 		return
 	}
-	if compareVersions(p.Version, u.opt.Version) <= 0 {
+	// Another copy's update (othercopy.go) is that copy's whatever its
+	// version: the other copy may be older than this one.
+	other := u.otherCopys(&p)
+	if !other && p.Platform != u.platform {
+		drop("invalid")
+		return
+	}
+	if !other && compareVersions(p.Version, u.opt.Version) <= 0 {
 		drop("installed or older than this version")
 		return
 	}
@@ -1127,15 +1506,37 @@ func (u *Updater) loadPending() {
 		drop("the package is missing")
 		return
 	}
+	if other {
+		u.other = &p
+		u.log.Info("selfupdate: pending.json is another copy's (a copy of LectureFlow of another kind shares this data directory); left alone, and this copy starts no update until that one is installed",
+			"version", p.Version, "kind", p.Kind, "this", u.kind)
+		return
+	}
 	u.pending = &p
 }
 
 // cleanup removes version directories nothing refers to (not this version,
-// the pending one, previous.json's, nor the available one being
-// downloaded); atStart also removes offline-update staging directories.
-// Other names (Electron's backup/) are never touched.
+// the pending one, another copy's pending one, previous.json's, nor the
+// available one being
+// downloaded, unless its installation failed and the user has not asked to
+// try it again: its package goes); atStart also removes offline-update
+// staging directories. Only entries of the updates directory whose names
+// are versions (or staging names) are removed, never a path built from a
+// JSON file; other names (Electron's backup/) are never touched. A
+// directory that cannot be removed is logged and left for the next start.
+// Nothing is removed when the updates directory is a link (updatesRoot).
 func (u *Updater) cleanup(atStart bool) {
-	entries, err := os.ReadDir(u.dir)
+	r, err := u.updatesRoot()
+	if err != nil {
+		return
+	}
+	defer r.Close()
+	d, err := r.Open(".")
+	if err != nil {
+		return
+	}
+	entries, err := d.ReadDir(-1)
+	d.Close()
 	if err != nil {
 		return
 	}
@@ -1144,11 +1545,16 @@ func (u *Updater) cleanup(atStart bool) {
 	if u.pending != nil {
 		keep[u.pending.Version] = true
 	}
+	if u.other != nil {
+		keep[u.other.Version] = true // another copy's package (othercopy.go)
+	}
 	if u.previous != nil {
 		keep[u.previous.Version] = true
 	}
 	if u.avail != nil {
-		keep[u.avail.Manifest.Version] = true
+		if f := u.failed; f == nil || f.Retry || f.Version != u.avail.Manifest.Version {
+			keep[u.avail.Manifest.Version] = true
+		}
 	}
 	u.mu.Unlock()
 	for _, e := range entries {
@@ -1159,11 +1565,11 @@ func (u *Updater) cleanup(atStart bool) {
 		switch {
 		case strings.HasPrefix(name, importPrefix):
 			if atStart {
-				os.RemoveAll(filepath.Join(u.dir, name))
+				r.RemoveAll(name)
 			}
 		case !keep[name]:
 			if _, err := parseVersion(name); err == nil {
-				if err := os.RemoveAll(filepath.Join(u.dir, name)); err != nil {
+				if err := r.RemoveAll(name); err != nil {
 					u.log.Warn("selfupdate: removing an old update", "version", name, "error", err)
 				}
 			}

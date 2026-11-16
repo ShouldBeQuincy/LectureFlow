@@ -53,9 +53,9 @@ func TestDiagnosticsUseComponentPython(t *testing.T) {
 			switch {
 			case len(args) == 1 && args[0] == "--version":
 				key = "version"
-			case len(args) == 2 && args[0] == "-c":
-				key = args[1]
-			case len(args) > 1 && args[1] == "--selftest":
+			case len(args) == 3 && args[0] == "-I" && args[1] == "-c":
+				key = args[2]
+			case isScriptRun(args, "--selftest"):
 				key = "selftest"
 				select {
 				case seen <- s.SelfCheckPythons():

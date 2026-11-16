@@ -51,6 +51,50 @@ test('tone (SPEC §0.1): calm, no exclamation marks', () => {
   }
 });
 
+// T26 S1: a restart continues lecture and course jobs (SPEC §4.7) but not
+// the fetches of recordings, whose sign-in data lives in memory only; the
+// close dialog says so instead of promising "continue where they stopped".
+test('close dialog: fetched recordings go back to the recording page; no notification promised for them', () => {
+  const zh = all['zh-CN'];
+  for (const k of ['close.detail_downloads', 'close.detail_both']) {
+    assert.match(zh[k], /录播页/, `zh-CN ${k}`);
+    assert.match(zh[k], /续传/, `zh-CN ${k}`);
+    assert.match(en[k], /recording page/, `en ${k}`);
+    assert.match(en[k], /resume/, `en ${k}`);
+    // recordings are fetched, never downloaded (web/i18n/glossary.md)
+    assert.doesNotMatch(zh[k], /下载/, `zh-CN ${k}`);
+    assert.doesNotMatch(en[k], /download/i, `en ${k}`);
+    // the recording site's sign-in data (review R69 M-1): API keys, the
+    // Colab authorisation and the Google sign-in are kept, not lost
+    assert.match(zh[k], /录播网站的登录凭据只保存在内存里/, `zh-CN ${k}`);
+    assert.match(en[k], /The sign-in data for the recording site is kept in memory only/, `en ${k}`);
+    // one recording page at a time, as errors.downloads.restarted says it
+    // (review R69 L-5); recordings are fetched, they do not fetch
+    assert.match(en[k], /each recording that has not been fully fetched has to be resumed from its own recording page: open the page again and click the LectureFlow extension\./, `en ${k}`);
+    assert.doesNotMatch(en[k], /finished fetching/, `en ${k}`);
+  }
+  // fetches send no notification when they finish (web/app.js checkNotify)
+  assert.doesNotMatch(zh['close.detail_downloads'], /通知/);
+  assert.doesNotMatch(en['close.detail_downloads'], /notif/i);
+  assert.doesNotMatch(zh['close.detail_downloads'], /从中断处继续/);
+  assert.doesNotMatch(en['close.detail_downloads'], /where they stopped/);
+  // both: the notification is about lectures, the other tasks continue
+  assert.match(zh['close.detail_both'], /讲座处理完成后会通知你/);
+  assert.match(zh['close.detail_both'], /其余任务下次打开时从中断处继续/);
+  assert.match(en['close.detail_both'], /notified when a lecture has been processed/);
+  assert.match(en['close.detail_both'], /other tasks continue from where they stopped/);
+  // only queued: nothing is said to be running
+  assert.doesNotMatch(zh['close.message_queued'], /正在/);
+  assert.doesNotMatch(en['close.message_queued'], /running/i);
+  // every text the dialog can pick exists
+  const { closeDialogKeys } = require('../../src/main/lib/policy');
+  for (const [running, queued, downloads] of [[1, 0, 0], [0, 1, 0], [1, 0, 1], [0, 1, 1], [2, 1, 1]]) {
+    for (const k of Object.values(closeDialogKeys({ running, queued, downloads }))) {
+      assert.ok(Object.prototype.hasOwnProperty.call(en, k), `missing key ${k}`);
+    }
+  }
+});
+
 test('every key used in the main process exists', () => {
   const src = path.join(__dirname, '..', '..', 'src', 'main');
   const used = new Set();

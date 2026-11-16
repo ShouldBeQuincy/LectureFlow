@@ -271,6 +271,51 @@ func TestTitleRetryFeedback(t *testing.T) {
 	}
 }
 
+// TestTitleRetryFeedbackBlurbTooLong: a Chinese description over the limit
+// (the T9b case: 52 characters, limit 50) is asked again once with feedback
+// naming the field, the limit and the count; a valid second answer
+// completes the task. Two over-long answers fail it after exactly two
+// requests (TestTitleInvalidOutput "blurb too long").
+func TestTitleRetryFeedbackBlurbTooLong(t *testing.T) {
+	e := newEnv(t)
+	e.organizerRoles()
+	l := e.titleLecture("x.mp4")
+	long := strings.Repeat("长", ctxbuild.BlurbZhLen+2)
+	n := 0
+	e.fake.Handle(llmtest.RoleTitle, func(string, string) string {
+		n++
+		if n == 1 {
+			return `{"title_en": "Caches", "title_zh": "缓存", "blurb_en": "First.", "blurb_zh": "` + long + `"}`
+		}
+		return `{"title_en": "Caches", "title_zh": "缓存", "blurb_en": "Second.", "blurb_zh": "第二。"}`
+	})
+	r := e.runTitle(e.deps(nil), l.ID)
+	if r.err != nil || r.job.Status != model.StatusDone {
+		t.Fatalf("err %v, job %s", r.err, r.job.Status)
+	}
+	reqs := e.fake.Requests(llmtest.RoleTitle)
+	if len(reqs) != 2 {
+		t.Fatalf("%d requests, want 2", len(reqs))
+	}
+	fb := strings.TrimPrefix(reqs[1].User, reqs[0].User)
+	if fb == reqs[1].User {
+		t.Fatalf("the retry does not start with the original request: %q", reqs[1].User)
+	}
+	want := fmt.Sprintf("- blurb_zh has %d characters; at most %d are allowed", ctxbuild.BlurbZhLen+2, ctxbuild.BlurbZhLen)
+	for _, w := range []string{"YOUR PREVIOUS ANSWER WAS REJECTED", want, long} {
+		if !strings.Contains(fb, w) {
+			t.Errorf("feedback lacks %q:\n%s", w, fb)
+		}
+	}
+	if strings.Contains(fb, "title_") || strings.Contains(fb, "blurb_en") {
+		t.Errorf("feedback names valid fields:\n%s", fb)
+	}
+	got := e.lec(l.ID)
+	if got.Title != "Caches" || ptrStr(got.TitleZh) != "缓存" || ptrStr(got.BlurbEn) != "Second." || ptrStr(got.BlurbZh) != "第二。" {
+		t.Errorf("lecture %+v", got)
+	}
+}
+
 // TestTitleBlurbsOfLastValidAnswer: both answers fail on the titles; the
 // descriptions of the second are written, the titles stay, a pending
 // "regenerate" (force) stays for the next run.

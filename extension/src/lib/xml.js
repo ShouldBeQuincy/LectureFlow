@@ -39,7 +39,7 @@ export function escapeAttr(s) {
  * Throws XmlError on malformed input.
  */
 export function parseXml(input, { maxDepth = 64 } = {}) {
-  const s = String(input).replace(/^﻿/, '');
+  const s = String(input).replace(/^\ufeff/, '');
   let i = 0;
   const root = { name: '#document', attrs: [], children: [] };
   const stack = [root];

@@ -34,7 +34,7 @@
 // position; every list comes from the API.
 
 import { api } from './api.js';
-import { h, clear, toast, copyText, openDialog } from './dom.js';
+import { h, clear, toast, openDialog } from './dom.js';
 import { t } from './i18n.js';
 import { fmtDecimal } from './util.js';
 import { openMenu, closeMenu } from './menu.js';
@@ -46,12 +46,14 @@ import { createTranscript, isModified, isPending } from './player_transcript.js'
 import { createChapters, chapterList } from './player_chapters.js';
 import { bindKeys, openHelp } from './player_keys.js';
 import { fmtPlayerTime, sentenceStart, readPref, writePref, codeText } from './player_util.js';
-import { citeRef, coursePart } from './view_transcript.js';
+import { citeRef, coursePart, copyKeepingFocus } from './view_transcript.js';
 import { zh } from './zh_display.js';
 import { lectureTagText } from './kinds.js';
 import { englishOnly } from './lecture_english.js';
 import { createAngles, lectureAngles } from './player_angles.js';
 import { angleURL } from './api_ext.js';
+import { canRetranslateCurrent, retranslateCurrent, heldToast } from './retranslate_current.js';
+import { retranslateWatch, translationHeld } from './retranslate_watch.js';
 
 const enc = encodeURIComponent;
 
@@ -90,6 +92,7 @@ export function mountPlayer(main, route, ctx) {
   let seekFloor = null;
   let offMedia = [];
   let textSeq = 0;
+  const retranslated = retranslateWatch(); // "translate again" asked: the translation it had (T25 S3)
   let lastSaved = -1;
   let lastClockSec = -1;
   let lastClockDur = -1;
@@ -185,6 +188,8 @@ export function mountPlayer(main, route, ctx) {
   frame.after(angles.box);
 
   const playBtn = ctlBtn('play', t('player.ctl.play'), `${t('player.key.space')} / K`, () => togglePlay(), { class: 'pl-ctl-play', size: 20 });
+  // T23 general 13: ← (5 s back) on screen too, for touch and the mouse
+  const backBtn = ctlBtn('rotate-ccw', t('player.ctl.back5'), '←', () => seekBy(-5000), { size: 17, class: 'pl-ctl-back' });
   const prevBtn = ctlBtn('skip-back', t('player.ctl.prev'), 'A', () => prevSentence(), { size: 17 });
   const nextBtn = ctlBtn('skip-forward', t('player.ctl.next'), 'D', () => nextSentence(), { size: 17 });
   const loopBtn = ctlBtn('repeat-1', t('player.ctl.loop'), 'R', () => toggleLoop(), { pressed: false });
@@ -238,7 +243,7 @@ export function mountPlayer(main, route, ctx) {
   const bar = h(
     'div',
     { class: 'pl-bar' },
-    h('div', { class: 'pl-bar-group' }, playBtn, prevBtn, nextBtn, loopBtn, clockEl),
+    h('div', { class: 'pl-bar-group' }, playBtn, backBtn, prevBtn, nextBtn, loopBtn, clockEl),
     h('div', { class: 'pl-bar-spacer' }),
     h('div', { class: 'pl-bar-group' }, rateBtn, h('div', { class: 'pl-vol' }, volBtn, volRange), ccBtn, citeBtn, sideBtn, angles.button, theaterBtn, fsBtn),
   );
@@ -594,12 +599,12 @@ export function mountPlayer(main, route, ctx) {
     if (!s) s = S.sentences[Math.max(0, currentSentence())];
     if (!s) return;
     const ref = `[${citeRef(courseForCite(), S.lec.cite_label || S.lec.label, s.start_ms)}]`;
-    const ok = await copyText(ref);
+    const ok = await copyKeepingFocus(ref); // T23 serious 3: the sentence keeps the focus
     toast(ok ? t('player.cite_copied', { ref }) : t('player.copy_failed'), ok ? 'success' : 'warn');
   }
 
   async function copyPlain(text, what) {
-    const ok = await copyText(text);
+    const ok = await copyKeepingFocus(text);
     toast(ok ? t(what) : t('player.copy_failed'), ok ? 'success' : 'warn');
   }
 
@@ -627,14 +632,20 @@ export function mountPlayer(main, route, ctx) {
       can ? { label: t('player.menu.edit'), icon: 'pencil', onSelect: () => editSentence(s) } : null,
       can && s.human_text != null ? { label: t('player.menu.reset'), icon: 'undo-2', hint: t('player.menu.reset_hint'), onSelect: () => sentenceOp(s, 'reset') } : null,
       can && (s.zh_status === 'ok' || s.zh_status === 'qa_failed') ? { label: t('player.menu.retranslate'), icon: 'languages', onSelect: () => sentenceOp(s, 'retranslate') } : null,
+      can && canRetranslateCurrent(s) ? { label: t('player.menu.retranslate_current'), icon: 'languages', hint: t('player.menu.retranslate_current_hint'), onSelect: () => retranslateCurrent(id, s.idx, S.lec).then((u) => u && applySentence(u)) } : null,
       'sep',
       s.patch && s.patch.class === 'decide' ? { label: t('player.menu.open_review'), icon: 'list-checks', onSelect: () => (location.hash = `#/lecture/${enc(id)}/review`) } : null,
     ];
   }
 
   function editSentence(s) {
-    openDialog(t('player.edit.title', { n: s.idx + 1 }), (close) => {
-      const ta = h('textarea', { class: 'input pl-edit-ta', rows: '4', 'aria-label': t('player.edit.label'), autofocus: true });
+    // R78b medium 2: the lecture's translation held (stale, failed,
+    // cancelled): the edit waits for its next run, the texts say so
+    const wait = translationHeld(S.lec);
+    openDialog(t('player.edit.title', { n: s.idx + 1 }), (close, busy) => {
+      // round 9 WV-02 (T28 suggestion 4): the two notes under the box
+      // describe it (one such dialog at a time: fixed ids)
+      const ta = h('textarea', { class: 'input pl-edit-ta', rows: '4', 'aria-label': t('player.edit.label'), 'aria-describedby': 'pl-edit-hint pl-edit-zh-note', autofocus: true });
       ta.value = s.text;
       const saveBtn = h('button', { type: 'submit', class: 'btn btn-primary' }, t('player.edit.save'));
       const submit = async (e) => {
@@ -646,10 +657,12 @@ export function mountPlayer(main, route, ctx) {
         }
         saveBtn.disabled = true;
         try {
-          const updated = await api.sentenceEdit(id, s.idx, text);
+          const updated = await busy(api.sentenceEdit(id, s.idx, text));
+          retranslated.drop(s.idx); // the English changed: its translation is a new one
           if (updated) applySentence(updated);
           close(true);
-          toast(t('player.edit.saved'), 'success');
+          if (wait) heldToast(t('player.edit.saved_held'));
+          else toast(t('player.edit.saved'), 'success');
         } catch {
           saveBtn.disabled = false; // shown by the API layer; keep the dialog open
         }
@@ -662,17 +675,24 @@ export function mountPlayer(main, route, ctx) {
         { onsubmit: submit },
         h('p', { class: 'dlg-msg pl-edit-asr' }, h('span', { class: 'muted' }, t('player.edit.asr')), ' ', h('span', { lang: 'en' }, s.asr_text)),
         ta,
-        h('p', { class: 'dlg-hint' }, t('player.edit.hint')),
+        h('p', { class: 'dlg-hint', id: 'pl-edit-hint' }, wait ? t('player.edit.hint_held') : t('player.edit.hint')),
+        // T22 S2, T23 general 7: the translation is not edited itself
+        h('p', { class: 'dlg-hint', id: 'pl-edit-zh-note' }, wait ? t('player.edit.zh_note_held') : t('player.edit.zh_note')),
         h('div', { class: 'dlg-actions' }, h('button', { type: 'button', class: 'btn', onclick: () => close(null) }, t('common.cancel')), saveBtn),
       );
     });
   }
 
   async function sentenceOp(s, op) {
+    const wait = translationHeld(S.lec); // R78b medium 2, as the lecture was when it was sent
     try {
       const updated = op === 'reset' ? await api.sentenceReset(id, s.idx) : await api.sentenceRetranslate(id, s.idx);
+      if (op === 'retranslate' && !wait) retranslated.start(s);
+      else retranslated.drop(s.idx);
       if (updated) applySentence(updated);
-      toast(op === 'reset' ? t('player.menu.reset_done') : t('player.menu.retranslate_done'), 'success');
+      // WV-01: the held texts stay until closed
+      if (wait) heldToast(t(op === 'reset' ? 'player.menu.reset_done_held' : 'player.menu.retranslate_held'));
+      else toast(t(op === 'reset' ? 'player.menu.reset_done' : 'player.menu.retranslate_done'), 'success');
     } catch {
       // shown by the API layer
     }
@@ -946,9 +966,10 @@ export function mountPlayer(main, route, ctx) {
 
   function rateMenu() {
     openMenu(
-      RATES.map((r) => ({ label: `${fmtDecimal(r)}×`, icon: r === S.rate ? 'check' : null, onSelect: () => setRate(r) })),
+      // T23 general 17: a radio menu (menuitemradio, aria-checked), as the language menu
+      RATES.map((r) => ({ label: `${fmtDecimal(r)}×`, checked: r === S.rate, onSelect: () => setRate(r) })),
       { anchor: rateBtn },
-      { returnFocus: rateBtn },
+      { returnFocus: rateBtn, focus: Math.max(0, RATES.indexOf(S.rate)) },
     );
   }
 
@@ -957,6 +978,8 @@ export function mountPlayer(main, route, ctx) {
     if (media) media.setRate(r);
     writePref(PREF_RATE, r);
     rateBtn.textContent = `${fmtDecimal(r)}×`;
+    // T23 general 17: the name says the speed too (it replaced the text "1.5×")
+    rateBtn.setAttribute('aria-label', t('player.ctl.rate_now', { rate: `${fmtDecimal(r)}×` }));
     rateBtn.classList.toggle('is-on', r !== 1);
     if (!quiet) osd(t('player.osd.rate', { rate: fmtDecimal(r) }));
   }
@@ -999,6 +1022,12 @@ export function mountPlayer(main, route, ctx) {
   // the citation number is in the hover text.
   function renderHead() {
     if (!S.lec) return;
+    // T28 suggestion 8 (round 9, with the dashboard line's title): the
+    // shell names the window after the current course as on the lecture
+    // page, which says which course it is on every draw (view_lecture.js);
+    // opened straight from the dashboard the player was in none. The name
+    // comes from the shell's course list: no request here.
+    ctx.setCurrentCourse(S.lec.course_id);
     courseEl.textContent = coursePrefix();
     courseEl.hidden = !courseEl.textContent;
     refEl.textContent = lectureTagText(S.lec);
@@ -1131,6 +1160,7 @@ export function mountPlayer(main, route, ctx) {
     try {
       const [cues, sentences] = await Promise.all([api.cues(id, { quiet: !first }), loadAllSentences()]);
       if (!alive || my !== textSeq) return;
+      for (const s of sentences) retranslated.seen(s); // T25 S3: the same translation back is said
       S.cues = cues || [];
       S.sentences = sentences;
       transcript.setSentences(sentences);

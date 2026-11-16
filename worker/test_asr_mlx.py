@@ -792,7 +792,9 @@ def test_stray_tmp_of_a_killed_run_is_removed(lecture, mlxjob, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Real processes (as Go starts them), with the fake packages on PYTHONPATH
+# Real processes, with the fake packages on PYTHONPATH. Not quite as Go
+# starts them: Go adds -s and leaves PYTHONPATH out of the environment
+# (internal/pyenv), while these tests need PYTHONPATH to bring the fakes in.
 # ---------------------------------------------------------------------------
 
 def _env(tmp_path, **cfg):

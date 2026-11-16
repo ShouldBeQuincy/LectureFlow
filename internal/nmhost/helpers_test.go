@@ -237,21 +237,46 @@ func uniquePipe(t *testing.T) string {
 }
 
 // uniqueSocket is a socket path in a private directory. A Unix socket path
-// holds at most 104 bytes on macOS (sun_path); the per-user temporary
-// directory there (/var/folders/…/T/, also on the CI runners) plus a long
-// test name goes past that, so such a path moves to a short private
-// directory under /tmp.
+// holds at most 104 bytes on macOS and 108 on Linux and Windows (sun_path,
+// counting the terminating NUL). The temporary directory plus a long test
+// name can go past that (macOS: /var/folders/…/T/, also on the CI runners;
+// Windows: a long user name or TEMP pointed somewhere deep), so such a path
+// moves to a short private directory: /tmp, or on Windows the public
+// profile or the root of the temporary directory's drive. Every call gets
+// its own directory, so parallel tests never share a socket.
 func uniqueSocket(t *testing.T) string {
+	t.Helper()
+	const maxLen = 100
 	p := filepath.Join(t.TempDir(), "nm.sock")
-	if len(p) < 100 || runtime.GOOS == "windows" {
+	if len(p) < maxLen {
 		return p
 	}
-	d, err := os.MkdirTemp("/tmp", "lfnm-")
-	if err != nil {
-		t.Fatal(err)
+	var bases []string
+	if runtime.GOOS == "windows" {
+		if pub := os.Getenv("PUBLIC"); pub != "" {
+			bases = append(bases, pub)
+		}
+		if vol := filepath.VolumeName(os.TempDir()); vol != "" {
+			bases = append(bases, vol+`\`)
+		}
+	} else {
+		bases = append(bases, "/tmp")
 	}
-	t.Cleanup(func() { os.RemoveAll(d) })
-	return filepath.Join(d, "nm.sock")
+	var errs []error
+	for _, base := range bases {
+		d, err := os.MkdirTemp(base, "lfnm-")
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		t.Cleanup(func() { os.RemoveAll(d) })
+		if p := filepath.Join(d, "nm.sock"); len(p) < maxLen {
+			return p
+		}
+		errs = append(errs, fmt.Errorf("%s: path still too long", d))
+	}
+	t.Fatalf("no directory short enough for a Unix socket (temporary directory %s): %v", os.TempDir(), errors.Join(errs...))
+	return ""
 }
 
 // serveFake serves a fake handler on endpoint and returns the server.

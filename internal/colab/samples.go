@@ -60,6 +60,7 @@ func (b *Backend) noteReading(s *liveSession, ev remoteEvent) {
 	if !live {
 		return
 	}
+	b.noteReach(s, true) // its events arrive: the runtime answers
 	switch ev.Type {
 	case remote.EventMachine:
 		b.samples.SetMachine(ev.Machine.Machine(remote.SourceNvidiaSMI))
@@ -115,6 +116,14 @@ func (b *Backend) pollResources(ctx context.Context) {
 	live, logged := b.sess == s, b.pollFail
 	b.pollFail = err != nil
 	b.mu.Unlock()
+	// Status.Runtime (retry.go): the runtime answered, or failed in the way
+	// a lost connection does. Any other failure (the endpoint is not
+	// public: it may be gone) says nothing.
+	if err == nil {
+		b.noteReach(s, true)
+	} else if ctx.Err() == nil && Code(err) == "" && transient(err) {
+		b.noteReach(s, false)
+	}
 	if err != nil {
 		if !logged && ctx.Err() == nil {
 			b.log.Info("colab: reading the runtime's resources failed (the resource bar shows the last reading)",

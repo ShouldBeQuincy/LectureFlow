@@ -2,11 +2,11 @@
 // Copyright (C) 2026 LectureFlow contributors. Licensed under the GNU AGPL v3 or later; see LICENSE.
 // Course card of the dashboard's course overview and the course list (v1.1
 // A9, A12.2 course-card context menu). Works with api.CourseCard and
-// api.Course.
+// api.Course (failed_count: round 7, absent from an older server).
 
-import { h } from './dom.js';
+import { h, iconBtn } from './dom.js';
 import { icon } from './icons.js';
-import { bindContextMenu } from './menu.js';
+import { bindContextMenu, menuButton } from './menu.js';
 import { courseMenuItems } from './actions.js';
 import * as U from './util.js';
 import { t } from './i18n.js';
@@ -33,6 +33,7 @@ export function cardOf(c) {
     draft_count: c.draft_count || 0,
     stale_count: c.stale_lecture_count || 0,
     running_count: c.running_count || 0,
+    failed_count: c.failed_count || 0,
     patches_pending: c.patches_pending || 0,
     last_activity_at: c.last_activity_at || c.created_at,
     course_actions: c.course_actions || [],
@@ -41,13 +42,19 @@ export function cardOf(c) {
   };
 }
 
-export function courseCard(card, { onChanged } = {}) {
+// settings (optional): () => the settings the page has read, or null; the
+// course menu judges the launch's cost by them (round 8 convention F6,
+// actions.js courseMenuItems). A page without them passes none.
+export function courseCard(card, { onChanged, settings } = {}) {
   const chips = [];
   if (card.running_count) chips.push(h('span', { class: 'chip chip-run' }, h('span', { class: 'chip-dot' }), t('course.card.running', { n: card.running_count })));
+  // T24 S2: the lectures that failed, also those of more than 24 hours ago
+  // (the workbench lists only the last 24 hours)
+  if (card.failed_count) chips.push(h('span', { class: 'chip chip-err' }, t('course.card.failed', { n: card.failed_count })));
   if (card.draft_count) chips.push(h('span', { class: 'chip chip-draft' }, t('course.card.drafts', { n: card.draft_count })));
   if (card.stale_count) chips.push(h('span', { class: 'chip chip-warn' }, t('course.card.stale', { n: card.stale_count })));
   if (card.patches_pending) chips.push(h('span', { class: 'chip chip-quiet' }, t('course.card.reviews', { n: card.patches_pending })));
-  const el = h(
+  const link = h(
     'a',
     { class: 'ccard', href: `#/course/${encodeURIComponent(card.id)}`, dataset: { fkey: 'ccard:' + card.id } },
     h(
@@ -61,7 +68,19 @@ export function courseCard(card, { onChanged } = {}) {
     h('div', { class: 'ccard-chips' }, chips.length ? chips : h('span', { class: 'ccard-quiet' }, card.lecture_count ? t('course.card.all_ready') : t('course.card.no_lectures'))),
     h('div', { class: 'ccard-foot' }, icon('clock', { size: 12 }), U.relTime(card.last_activity_at) || '—'),
   );
-  bindContextMenu(el, () => courseMenuItems(card, { onChanged }));
+  const items = () => courseMenuItems(card, settings ? { onChanged, settings } : { onChanged });
+  // T22 G15 (round 8 WD-03): the right-click menu was the card's only way
+  // to its actions. A visible ⋯ at its top right opens the same items, as
+  // the course page's ⋯ (view_course.js, same name). It is the link's
+  // sibling, not inside it (no control in a link: its click never opens the
+  // course, the link's name stays the card's text), next after it in the
+  // Tab order; the wrapper takes the card's place in the grid, and the
+  // right-click menu is bound to it (on the ⋯ too).
+  // R86 L6 (r9 WD-06): a page has many cards, so each ⋯ names its course
+  // (the code, else the name), as the lecture rows' ⋯ name their lecture.
+  const more = menuButton(iconBtn('ellipsis', t('course.card.menu_named', { name: card.code || card.name }), { fkey: `ccard:${card.id}:menu`, menu: true, class: 'ccard-more' }), items);
+  const el = h('div', { class: 'ccard-wrap' }, link, more);
+  bindContextMenu(el, items);
   return el;
 }
 

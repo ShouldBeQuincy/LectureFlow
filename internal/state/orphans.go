@@ -18,6 +18,7 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"lectureflow/internal/db"
+	"lectureflow/internal/media"
 	"lectureflow/internal/model"
 )
 
@@ -137,9 +138,11 @@ func IsRecordID(name string) bool {
 // delete could not remove, and returns how many it removed. It looks only
 // at data_dir/courses/{course}/lectures/{id}, and removes such a directory
 // only when all of these hold:
-//   - {course}, lectures and {id} are plain directories (no link or
-//     junction is followed), and the names of {course} and {id} are record
-//     ids (IsRecordID);
+//   - courses, {course}, lectures and {id} are plain directories (no link
+//     or junction is followed: media.PlainDir — a cloud placeholder
+//     directory of a synced folder is one —, and media.PlainPath for the
+//     whole way down from data_dir; SEC49b), and the names of {course} and
+//     {id} are record ids (IsRecordID);
 //   - {id} holds a tombstone that names {id} (Tombstoned);
 //   - the database has no lecture {id} (GetLecture says not found; any other
 //     error keeps it). A tombstoned lecture the database has (a newer backup
@@ -161,11 +164,11 @@ func SweepLectureDirs(ctx context.Context, st db.Store, dataDir string) int {
 	}
 	removed := 0
 	for _, c := range entries {
-		if c.Type() != fs.ModeDir || !IsRecordID(c.Name()) { // a link or a junction is not followed
+		if !media.PlainDir(c.Type()) || !IsRecordID(c.Name()) { // a link or a junction is not followed
 			continue
 		}
 		lecturesDir := filepath.Join(model.CourseDir(dataDir, c.Name()), "lectures")
-		if fi, err := os.Lstat(lecturesDir); err != nil || fi.Mode().Type() != fs.ModeDir {
+		if fi, err := os.Lstat(lecturesDir); err != nil || !media.PlainDir(fi.Mode()) {
 			continue // none, or a link or a junction: not followed
 		}
 		lectures, err := os.ReadDir(lecturesDir)
@@ -174,10 +177,13 @@ func SweepLectureDirs(ctx context.Context, st db.Store, dataDir string) int {
 			continue
 		}
 		for _, l := range lectures {
-			if l.Type() != fs.ModeDir || !IsRecordID(l.Name()) {
+			if !media.PlainDir(l.Type()) || !IsRecordID(l.Name()) {
 				continue
 			}
 			dir := model.LectureDir(dataDir, c.Name(), l.Name())
+			if !media.PlainPath(dataDir, dir) { // courses itself a link, too
+				continue
+			}
 			if !Tombstoned(dir, l.Name()) {
 				continue
 			}

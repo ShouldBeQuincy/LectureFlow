@@ -378,7 +378,7 @@ func (s *asrStage) run(ctx context.Context, lectureID string, progress func(floa
 	audio := filepath.Join(dir, model.AudioFile)
 	if _, err := os.Stat(audio); err != nil {
 		return sched.Permanent(model.Errorf(CodeASRAudioMissing, map[string]any{"file": model.AudioFile},
-			fmt.Errorf("找不到 %s（prep 的产物），请重跑 prep 阶段", audio)))
+			fmt.Errorf("找不到 %s（预处理的产物），请重新运行预处理阶段", audio)))
 	}
 	prompt, glossaryVersion, err := s.asrPrompt(ctx, l)
 	if err != nil {
@@ -445,7 +445,7 @@ func (s *asrStage) run(ctx context.Context, lectureID string, progress func(floa
 	}
 	if len(ss) == 0 {
 		return sched.Permanent(model.Errorf(CodeASRNoSpeech, nil,
-			errors.New("未识别到任何语音：音频可能是静音、没有讲话或音量过低。请确认上传的是正确的录音，然后重跑 prep")))
+			errors.New("未识别到任何语音：音频可能是静音、没有讲话或音量过低。请确认上传的是正确的录音，然后重新运行预处理")))
 	}
 	// One transaction for all sentences (SPEC §6.2). Leftovers of an attempt
 	// interrupted after a previous commit are removed first. A run resumed

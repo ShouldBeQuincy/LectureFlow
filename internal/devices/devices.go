@@ -376,7 +376,8 @@ func asrRan(ctx context.Context, st db.Store) (bool, error) {
 // its workbench prompt dismissed (it is built in, not a new device), and
 // not listed in newIDs. Where faster-whisper cannot run (macOS, mac-opti
 // M5, platform.go) there is no fw:cpu: Detect neither inserts nor touches
-// it.
+// it. Then, with a component manager, applyCPUFallback (cpu_fallback.go)
+// may turn on the CPU device of an installed backend, once.
 func (r *Registry) Detect(ctx context.Context) (d Detection, newIDs []string, err error) {
 	r.detectMu.Lock()
 	defer r.detectMu.Unlock()
@@ -521,6 +522,11 @@ func (r *Registry) Detect(ctx context.Context) (d Detection, newIDs []string, er
 	}
 	if len(newIDs) > 0 {
 		slog.Info("asr devices: new devices detected", "devices", newIDs)
+	}
+	// next-33: a computer without an accelerator whose devices cannot
+	// transcribe gets its CPU device of an installed backend (cpu_fallback.go)
+	if _, err := r.applyCPUFallback(ctx); err != nil && ctx.Err() == nil {
+		slog.Warn("asr devices: turning on the CPU device failed; tried again at the next detection", "err", err)
 	}
 	r.changed()
 	return d, newIDs, nil

@@ -46,3 +46,8 @@ __pycache__/
 !/spikes/openvino/
 /spikes/openvino/*
 !/spikes/openvino/recommendation.json
+
+# Release working files (downloaded manifest, signature, release body)
+/release-v*/
+# Unattended-run logs of the agents (process files, like .claude/)
+/.agent-log/

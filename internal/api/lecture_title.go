@@ -17,13 +17,13 @@ import (
 // one, lecture.title_empty).
 const defaultLectureTitle = "lecture"
 
-// cleanLectureTitle is a title as it is stored (test-media I8): without
-// bidirectional control characters (media.StripBidi; they would make an
-// export's file name show another extension) and without surrounding
-// white space.
-func cleanLectureTitle(s string) string {
-	return strings.TrimSpace(media.StripBidi(s))
-}
+// maxLectureTitleRunes caps a stored title (test-media I8):
+// media.MaxTitleRunes.
+const maxLectureTitleRunes = media.MaxTitleRunes
+
+// cleanLectureTitle is a title as it is stored (test-media I8):
+// media.CleanTitle, which the file-name rule (stages) uses as well.
+func cleanLectureTitle(s string) string { return media.CleanTitle(s) }
 
 // titleFromFilename is the title a file name gives: the name without its
 // extension, cleaned (cleanLectureTitle); defaultLectureTitle when nothing

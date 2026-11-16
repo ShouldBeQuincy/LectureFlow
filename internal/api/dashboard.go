@@ -78,28 +78,28 @@ func (s *Server) getDashboard(w http.ResponseWriter, r *http.Request) {
 	for i, c := range courses {
 		courseIDs[i] = c.ID
 	}
-	termCounts, err := s.termCounts(ctx, courseIDs)
+	// every course's lectures, term and patch counts at once, and the kind
+	// catalog once (course_reads.go; courseLectures per course before)
+	rd, err := s.readCourses(ctx, courseIDs, false)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	kinds, err := s.st.ListLectureKinds(ctx)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	var all []lecEntry
 	for _, c := range courses {
-		lecs, nums, err := s.courseLectures(ctx, c)
-		if err != nil {
-			s.fail(w, r, err)
-			return
-		}
+		nums := numberLectures(c, rd.lectures[c.ID], kinds)
+		lecs := orderLectures(rd.lectures[c.ID], nums)
 		pending := map[string]int{}
-		a, err := s.aggregate(ctx, c, lecs, ix, pending)
-		if err != nil {
-			s.fail(w, r, err)
-			return
-		}
+		a := aggregate(c, lecs, ix, rd.pending, pending)
 		code := strOrNil(c.Code)
 		d.Courses = append(d.Courses, CourseCard{
-			ID: c.ID, Name: c.Name, Code: code, LectureCount: a.lectures, TermCount: termCounts[c.ID],
-			DraftCount: a.drafts, StaleCount: a.stale, RunningCount: a.running, PatchesPending: a.patchesPending,
+			ID: c.ID, Name: c.Name, Code: code, LectureCount: a.lectures, TermCount: rd.terms[c.ID],
+			DraftCount: a.drafts, StaleCount: a.stale, RunningCount: a.running, PatchesPending: a.patchesPending, FailedCount: a.failed,
 			LastActivityAt: a.lastActivity, CourseActions: a.actions(),
 		})
 		if a.drafts > 0 {
@@ -164,11 +164,13 @@ func (s *Server) getDashboard(w http.ResponseWriter, r *http.Request) {
 			done = append(done, e)
 		}
 		actions := state.StageActions(e.jobs, s.mediaDeleted(e.l))
+		listed := false
 		for _, j := range orderJobs(model.ScopeLecture, e.jobs) {
 			// failed is final: automatic retries go failed → queued in one transaction.
 			if j.Status != model.StatusFailed || j.FinishedAt == nil || *j.FinishedAt < cutoff {
 				continue
 			}
+			listed = true
 			acts := actions[j.Stage]
 			if acts == nil {
 				acts = []string{}
@@ -179,6 +181,11 @@ func (s *Server) getDashboard(w http.ResponseWriter, r *http.Request) {
 			d.Failures = append(d.Failures, FailureItem{LectureID: e.l.ID, LectureTitle: e.l.Title, Label: e.label(),
 				CourseID: e.c.ID, CourseName: e.c.Name, CourseCode: strOrNil(e.c.Code), Stage: j.Stage, Error: errText, ErrorInfo: errInfo,
 				FinishedAt: strOrNil(j.FinishedAt), AllowedActions: acts, KindTag: kindTag(e.num)})
+		}
+		// v3.2.x r7 (T24 S2): a lecture still failed whose failures all
+		// predate the window is counted, not listed ("还有 N 节更早失败").
+		if !listed && failedLecture(e.l, e.jobs) {
+			d.EarlierFailedTotal++
 		}
 	}
 	launched := func(e lecEntry) string {

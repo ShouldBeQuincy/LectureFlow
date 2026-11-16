@@ -367,6 +367,12 @@
       "path"
     ]
   },
+  "check.credentials_key_missing": {
+    "zh": "数据目录里的密钥文件 secrets.key 不见了（被删除，或复制数据目录时没有一起复制），已生成新密钥；有 {n} 项保存的凭据（API key、Colab 授权）是用原来的密钥加密的，现在无法解密，但密文仍原样保留",
+    "params": [
+      "n"
+    ]
+  },
   "check.credentials_keychain": {
     "zh": "保存的 API key 与 Colab 授权已加密，密钥保存在 macOS 钥匙串中",
     "params": []
@@ -384,6 +390,10 @@
       "n"
     ]
   },
+  "check.credentials_scrub_pending": {
+    "zh": "保存的 API key 与 Colab 授权已加密，但更换、删除或加密凭据之后的清理还没有完成：数据库文件里可能还留有旧值（包括加密之前的明文）",
+    "params": []
+  },
   "check.credentials_unavailable": {
     "zh": "系统凭据库现在不可用（{error}）：本次没有使用已保存的 API key 与 Colab 授权，密钥文件保持不变，下次启动会再试；现在填写的 key 会以明文保存",
     "params": [
@@ -391,7 +401,7 @@
     ]
   },
   "check.credentials_unreadable": {
-    "zh": "有 {n} 项保存的凭据无法在这台电脑或这个账户上解密（数据目录可能来自别的电脑或账户），需要重新输入",
+    "zh": "有 {n} 项保存的凭据无法在这台电脑或这个账户上解密（数据目录可能来自别的电脑或账户），需要重新输入。重新输入提供商的 API key 之前，请先确认这个提供商的地址是你设置的；如果不是，先把地址改回正确的再输入",
     "params": [
       "n"
     ]
@@ -419,11 +429,61 @@
       "service"
     ]
   },
+  "check.data_dir_component_asr_cuda": {
+    "zh": "“NVIDIA 显卡转写”：这台电脑推荐用它转写",
+    "params": []
+  },
+  "check.data_dir_component_asr_openvino": {
+    "zh": "“Intel 转写（OpenVINO）”：这台电脑推荐用它转写",
+    "params": []
+  },
+  "check.data_dir_component_gcloud": {
+    "zh": "“Google Cloud CLI（gcloud）”：在 LectureFlow 里登录 Colab 要用到它",
+    "params": []
+  },
+  "check.data_dir_component_python": {
+    "zh": "“Python 运行环境”：本机转写与课件文本抽取都要用到它",
+    "params": []
+  },
   "check.data_dir_no_acl": {
     "zh": "数据目录 {path} 所在的磁盘是 {fs} 格式，这种格式不记录访问权限，本机的任何账户都能读取其中的文件",
     "params": [
       "path",
       "fs"
+    ]
+  },
+  "check.data_dir_path_components": {
+    "zh": "数据目录的路径 {path} 有 {len} 个字符，超过了 {max}，这台电脑要用的一些组件在这里装不了（它们最深的文件会超过 Windows 的路径上限 250 个字符）",
+    "params": [
+      "path",
+      "len",
+      "max",
+      "extra"
+    ]
+  },
+  "check.data_dir_path_near_limit": {
+    "zh": "数据目录的路径 {path} 有 {len} 个字符，接近上限 {max}：转写、修复断句与课件文本抽取要读写的文件在它下面还要深约 90 个字符，路径再长一些，在没有开启 Windows 长路径支持的电脑上，这几步就可能写不了结果文件",
+    "params": [
+      "path",
+      "len",
+      "max"
+    ]
+  },
+  "check.data_dir_path_too_long": {
+    "zh": "数据目录的路径 {path} 有 {len} 个字符，超过了 {max}：转写、修复断句与课件文本抽取要读写的文件在它下面还要深约 90 个字符，在没有开启 Windows 长路径支持的电脑上，这几步可能写不了结果文件",
+    "params": [
+      "path",
+      "len",
+      "max"
+    ]
+  },
+  "check.data_dir_path_too_long_to_start": {
+    "zh": "数据目录的路径 {path} 有 {len} 个字符，超过了 {hard}：处理进程要在它下面约 70 个字符深的文件夹里启动，不论是否开启 Windows 长路径支持，转写、修复断句与课件文本抽取都无法启动；即使缩短到 {hard} 以内，路径超过 {max} 时，在没有开启长路径支持的电脑上这几步也可能写不了结果文件",
+    "params": [
+      "path",
+      "len",
+      "max",
+      "hard"
     ]
   },
   "check.data_dir_readable": {
@@ -438,6 +498,13 @@
     "params": [
       "path",
       "who"
+    ]
+  },
+  "check.data_dir_unconfirmed": {
+    "zh": "{path} 可写，但无法确认其中的文件只有你的账户能修改：{reason}",
+    "params": [
+      "path",
+      "reason"
     ]
   },
   "check.dir_not_writable": {
@@ -566,6 +633,16 @@
     "zh": "在设置页的“提供商”中为标有“需要重新输入”的提供商填写 API key；Colab 需要重新授权",
     "params": []
   },
+  "check.hint_credentials_restore_key": {
+    "zh": "如果还有原来的 secrets.key（例如在数据目录的备份里），先退出 LectureFlow，把它改名为 secrets.key.unreadable-restored 放进数据目录 {dir}（不要覆盖现有的 secrets.key），再启动即可恢复，不必重新输入；这只在当初创建它的电脑与 Windows 账户上有效。没有原文件时，在设置页的“提供商”中为标有“需要重新输入”的提供商重新填写 API key，Colab 需要重新授权",
+    "params": [
+      "dir"
+    ]
+  },
+  "check.hint_credentials_scrub_pending": {
+    "zh": "清理会在下次启动 LectureFlow 时自动完成。重启后仍有这条提醒时，先关闭正在读取 lectureflow.db 的其他程序（数据库查看工具、备份或同步软件），再重启 LectureFlow",
+    "params": []
+  },
   "check.hint_cudnn": {
     "zh": "在项目的 .venv 中执行 pip install -r worker/requirements.txt（含 nvidia-cudnn-cu12），然后点击“重新检查”",
     "params": []
@@ -584,6 +661,14 @@
   },
   "check.hint_data_dir_restrict": {
     "zh": "点击“收紧权限”，让数据目录只有你的账户（以及系统与管理员）可以访问",
+    "params": []
+  },
+  "check.hint_data_dir_shorter": {
+    "zh": "在设置页的“数据目录”中把它移到路径更短的位置（例如 D:\\LectureFlow）",
+    "params": []
+  },
+  "check.hint_data_dir_unconfirmed": {
+    "zh": "原因里提到链接（junction、符号链接）时，删除该链接，或在设置页把数据目录改到实际所在的文件夹；提到无法检查的项目时，删除它或请管理员处理；提到条目数或层数超出上限时，把不属于 LectureFlow 的文件移出数据目录里的 updates、components、electron 文件夹；然后点击“重新检查”",
     "params": []
   },
   "check.hint_disk_error": {
@@ -605,6 +690,40 @@
   "check.hint_gcloud_dev": {
     "zh": "安装 Google Cloud CLI，确认 gcloud 在 PATH 中，然后点击“重新检查”",
     "params": []
+  },
+  "check.hint_install_dir": {
+    "zh": "卸载 LectureFlow，再到发布页下载新版安装包重新安装，安装时保持安装程序给出的默认位置（{default}）；或者自己（或请管理员）把 {dir} 的权限收紧为只有你的账户、SYSTEM 与 Administrators 可以修改。处理后点击“重新检查”",
+    "params": [
+      "dir",
+      "default"
+    ]
+  },
+  "check.hint_install_dir_above": {
+    "zh": "问题出在上层文件夹 {path}：其他账户可以把它改名或移走，换成自己的文件夹。卸载 LectureFlow，再到发布页下载新版安装包重新安装，安装时保持安装程序给出的默认位置（{default}）；或者把 {path} 的权限收紧为只有你的账户、SYSTEM 与 Administrators 可以修改（这个文件夹如果是你自己建的，不需要管理员）。处理后点击“重新检查”",
+    "params": [
+      "path",
+      "default"
+    ]
+  },
+  "check.hint_install_dir_profile": {
+    "zh": "LectureFlow 装在你自己的用户文件夹里，这里通常只有你能修改；现在判为不可信，说明 {path} 的权限被改过（例如公司电脑的管理软件加了别的账户），或者这个位置是用链接搬到别处的。重新安装到同一位置解决不了：请把这一行的内容交给电脑的管理员，检查 {path} 的权限。处理后点击“重新检查”",
+    "params": [
+      "path"
+    ]
+  },
+  "check.hint_install_dir_root": {
+    "zh": "问题出在 {path}，也就是这个磁盘的根目录或网络共享的根目录：其他账户可以删掉或替换其中的条目（包括通往安装目录的那个文件夹），换成自己的。卸载 LectureFlow，再到发布页下载新版安装包重新安装，安装时保持安装程序给出的默认位置（{default}）；或者请管理员把 {path} 的权限收紧为只有你的账户、SYSTEM 与 Administrators 可以修改（这会影响其中的所有文件夹）。处理后点击“重新检查”",
+    "params": [
+      "path",
+      "default"
+    ]
+  },
+  "check.hint_install_dir_unconfirmed": {
+    "zh": "无法核实 {path}（原因见上一行）。卸载 LectureFlow，再到发布页下载新版安装包重新安装，安装时保持安装程序给出的默认位置（{default}）；原因里提到链接（junction、符号链接）时，也可以把 LectureFlow 装到不经过链接的文件夹。处理后点击“重新检查”",
+    "params": [
+      "path",
+      "default"
+    ]
   },
   "check.hint_install_fw": {
     "zh": "需要用 NVIDIA 显卡或 CPU 转写时，在设置的“组件”中安装或修复“NVIDIA 显卡转写”",
@@ -648,6 +767,10 @@
     "params": [
       "env"
     ]
+  },
+  "check.hint_key_plain_http": {
+    "zh": "这个提供商的地址用的是 http：API key 和讲座内容会不加密地经过网络。服务支持 https 的话，建议在设置页的“提供商”中改用 https 地址",
+    "params": []
   },
   "check.hint_key_settings": {
     "zh": "在设置页的“提供商”中编辑「{provider}」并填写 API key",
@@ -736,6 +859,26 @@
     "zh": "可以导入 {module}",
     "params": [
       "module"
+    ]
+  },
+  "check.install_dir_private": {
+    "zh": "LectureFlow 安装在 {path}，只有你的账户（以及系统与管理员）能修改其中的程序",
+    "params": [
+      "path"
+    ]
+  },
+  "check.install_dir_shared": {
+    "zh": "本机的其他账户可以修改或替换 LectureFlow 的程序文件（{path}：{who}）：下次启动时运行的可能是他们放进去的程序。为安全起见，应用内更新已停用",
+    "params": [
+      "path",
+      "who"
+    ]
+  },
+  "check.install_dir_unconfirmed": {
+    "zh": "无法确认 LectureFlow 的安装目录只有你的账户能修改（{path}）：{reason}。为安全起见，应用内更新已停用",
+    "params": [
+      "path",
+      "reason"
     ]
   },
   "check.key_env_unset": {
@@ -1006,6 +1149,18 @@
       "path"
     ]
   },
+  "data_dir.path_not_allowed": {
+    "zh": "“{path}”在网络位置上。出于安全考虑，网络上的文件夹只能在文件夹选择框里选中后使用（之前的选择可能已失效，或应用重启过），请重新选择这个文件夹",
+    "params": [
+      "path"
+    ]
+  },
+  "data_dir.path_not_granted": {
+    "zh": "出于安全考虑，“{path}”需要先在文件夹选择框里选中才能使用（之前的选择可能已失效，或应用重启过），请重新选择这个文件夹",
+    "params": [
+      "path"
+    ]
+  },
   "data_dir.path_too_long": {
     "zh": "“{data_dir}”的路径太长：转写组件里最深的文件路径会有 {path_len} 个字符，超过 Windows 的上限 {max}。请选一个更短的文件夹（例如 D:\\LectureFlow）",
     "params": [
@@ -1055,6 +1210,12 @@
       "what"
     ]
   },
+  "data_import.modified": {
+    "zh": "“{path}”里的资料库含有 LectureFlow 自己不会写入的内容（例如用数据库工具加过或改过的表、列、视图、触发器，或格式不对的记录编号、文件名）。为了安全，不能导入",
+    "params": [
+      "path"
+    ]
+  },
   "data_import.network_path": {
     "zh": "要导入的资料库里有 {count} 个文件路径指向网络共享或其他电脑（例如 {path}），不在这个数据目录之内。为了不让 LectureFlow 自动连接其他电脑，不能导入。如果这个数据目录本身就在网络共享上，请用当初使用的同一路径选择它",
     "params": [
@@ -1072,6 +1233,13 @@
   "data_import.not_lectureflow": {
     "zh": "“{path}”不是 LectureFlow 的数据目录（里面应当有 lectureflow.db）",
     "params": [
+      "path"
+    ]
+  },
+  "data_import.outside_path": {
+    "zh": "要导入的资料库里有 {count} 个文件路径指向资料库自己的文件夹之外，或指向另一条记录的文件（例如 {path}）。为了不让 LectureFlow 读取资料库之外的文件，不能导入",
+    "params": [
+      "count",
       "path"
     ]
   },
@@ -1377,6 +1545,23 @@
     "zh": "文件格式不支持",
     "params": []
   },
+  "model_choice.manual_conflict": {
+    "zh": "临时指定的模型只能和“临时指定”这一选项一起提交",
+    "params": []
+  },
+  "model_choice.manual_incomplete": {
+    "zh": "临时指定模型时缺少 {field}",
+    "params": [
+      "field"
+    ]
+  },
+  "model_choice.manual_unsupported": {
+    "zh": "只有摘要、修复和翻译的重试可以临时指定模型（{stage} / {action}）",
+    "params": [
+      "stage",
+      "action"
+    ]
+  },
   "model_choice.snapshot_unusable": {
     "zh": "原模型不可用，请改选“使用当前设置”",
     "params": []
@@ -1506,6 +1691,10 @@
       "id"
     ]
   },
+  "remote_server.host_key_pinned": {
+    "zh": "这台远程服务器的主机密钥已经确认过，没有替换。请重新连接，在“主机密钥已变化”一步核对新旧指纹后再确认",
+    "params": []
+  },
   "remote_server.invalid": {
     "zh": "远程服务器的设置无效（{field}）",
     "params": [
@@ -1575,6 +1764,10 @@
   },
   "sentence.not_found": {
     "zh": "找不到这一句（句子可能已经重新生成），请刷新",
+    "params": []
+  },
+  "sentence.not_pending": {
+    "zh": "这句已有可用的译文，只有未能翻译的句子才能改用当前设置的模型重新翻译",
     "params": []
   },
   "sentence.text_empty": {
@@ -1792,11 +1985,23 @@
     "zh": "上传中断",
     "params": []
   },
+  "upload.media_empty": {
+    "zh": "“{name}”是空文件（0 字节），不是录音或录像。可能是下载没有完成，请重新下载后再导入",
+    "params": [
+      "name"
+    ]
+  },
   "upload.media_format": {
     "zh": "“{name}”的实际格式（{format}）不是支持的音视频格式，可能会读取其他文件。为安全起见不接受这个文件，请先转换为 MP4、MKV、MP3 等常见格式",
     "params": [
       "name",
       "format"
+    ]
+  },
+  "upload.media_html": {
+    "zh": "“{name}”其实是一个网页，不是录音或录像。下载到的往往是登录页或错误页：请在浏览器里登录后重新下载，再导入",
+    "params": [
+      "name"
     ]
   },
   "upload.media_playlist": {
@@ -1844,6 +2049,12 @@
   },
   "upload.path_invalid": {
     "zh": "文件路径无效：{path}",
+    "params": [
+      "path"
+    ]
+  },
+  "upload.path_not_allowed": {
+    "zh": "这个文件的选择已失效（可能已经添加过，或选择后隔得太久、重启过应用），请重新选择或拖入这个文件：{path}",
     "params": [
       "path"
     ]

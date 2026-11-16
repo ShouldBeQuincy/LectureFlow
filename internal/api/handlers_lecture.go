@@ -21,6 +21,7 @@ import (
 
 	"lectureflow/internal/calendar"
 	"lectureflow/internal/db"
+	"lectureflow/internal/media"
 	"lectureflow/internal/model"
 	"lectureflow/internal/procutil"
 	"lectureflow/internal/stages"
@@ -49,6 +50,9 @@ func (s *Server) respondLecture(w http.ResponseWriter, r *http.Request, id strin
 	if err != nil {
 		s.fail(w, r, err)
 		return
+	}
+	if wantUsageTotal(r) {
+		v.UsageTotal = s.usageTotal(r.Context(), l.ID) // GET ?usage_total=1 only (lecture_usage.go)
 	}
 	writeJSON(w, status, v)
 }
@@ -83,6 +87,9 @@ func (s *Server) uploadLecture(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	courseID := r.PathValue("id")
 	c, err := s.courseOr404(ctx, courseID)
+	if err == nil {
+		err = checkRecordIDs(c.ID) // record_dir.go
+	}
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -111,7 +118,8 @@ func (s *Server) uploadLecture(w http.ResponseWriter, r *http.Request) {
 	case l.Title != stem:
 		l.TitleSource = model.TitleSourceUser
 	}
-	l.OriginalFilename = up.filename
+	// shown as the file's name: without bidi controls (test-media I8, R10 S7)
+	l.OriginalFilename = media.StripBidi(up.filename)
 	// Absolute, so the path works however a stage resolves it (state.MediaExists).
 	l.MediaPath, _ = filepath.Abs(up.path)
 	if err := s.st.CreateLecture(ctx, l); err != nil {
@@ -260,6 +268,14 @@ func (s *Server) replaceMedia(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "lecture.not_draft", nil)
 		return
 	}
+	if err := checkRecordIDs(l.CourseID, l.ID); err != nil { // record_dir.go
+		s.fail(w, r, err)
+		return
+	}
+	if err := s.checkRecordPath(s.lectureDir(l)); err != nil { // record_dir.go: no link on the way
+		s.fail(w, r, err)
+		return
+	}
 	if err := s.checkSpace(r); err != nil {
 		s.fail(w, r, err)
 		return
@@ -293,7 +309,7 @@ func (s *Server) replaceMedia(w http.ResponseWriter, r *http.Request) {
 		if !state.IsDraft(cur) {
 			return apiErr(http.StatusConflict, "lecture.not_draft", nil)
 		}
-		if err := tx.SetLectureOriginalFilename(ctx, l.ID, up.filename); err != nil {
+		if err := tx.SetLectureOriginalFilename(ctx, l.ID, media.StripBidi(up.filename)); err != nil {
 			return err
 		}
 		return tx.SetLectureMedia(ctx, l.ID, newPath)
@@ -312,7 +328,11 @@ func (s *Server) replaceMedia(w http.ResponseWriter, r *http.Request) {
 		s.sc.RequestFilenameRule(l.CourseID)
 	}
 	if old := s.replacedMediaToRemove(l, newPath); old != "" {
-		if err := os.Remove(old); err != nil && !errors.Is(err, os.ErrNotExist) {
+		// the directory is the lecture's own (media.OwnDirIn: an ordinary
+		// directory of exactly its name, no link at it or on its way)
+		if own, _ := media.OwnDirIn(s.dataDir, s.lectureDir(l)); !own {
+			slog.Warn("replaced media not removed: the lecture's directory is not an ordinary directory of its own", "lecture", l.ID)
+		} else if err := os.Remove(old); err != nil && !errors.Is(err, os.ErrNotExist) {
 			s.logWarn("remove replaced media", l.ID, err)
 		}
 	}
@@ -326,7 +346,12 @@ func (s *Server) replaceMedia(w http.ResponseWriter, r *http.Request) {
 // outside data_dir (the user's original, A7), or a stored path naming
 // another computer (state.StoredPathUnsafe; security review 2, M3): that
 // one is never stat'ed or removed, StoredPathUnsafe logs it once per process
-// (Warn) and the replacement goes on. Nothing here touches the disk.
+// (Warn) and the replacement goes on. A file inside data_dir but not
+// strictly inside this lecture's own directory (another lecture's media,
+// the course folder, the database: a media_path the database holds, which
+// an imported library supplies; R77b) is not removed either, with a Warn
+// that names the lecture only. Nothing here touches the disk; the caller
+// checks the directory itself (media.OwnDir) before removing.
 func (s *Server) replacedMediaToRemove(l model.Lecture, newPath string) string {
 	if l.MediaPath == "" || samePath(newPath, l.MediaPath) {
 		return ""
@@ -341,7 +366,23 @@ func (s *Server) replacedMediaToRemove(l model.Lecture, newPath string) string {
 	if !s.inDataDir(old) {
 		return ""
 	}
+	if !strictlyInside(old, s.lectureDir(l)) {
+		slog.Warn("replaced media not removed: it is not inside the lecture's own directory", "lecture", l.ID)
+		return ""
+	}
 	return old
+}
+
+// strictlyInside reports whether p lies inside dir, not dir itself
+// (lexical, after filepath.Abs; nothing is touched on disk).
+func strictlyInside(p, dir string) bool {
+	root, err1 := filepath.Abs(dir)
+	abs, err2 := filepath.Abs(p)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	rel, err := filepath.Rel(root, abs)
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
 func samePath(a, b string) bool {
@@ -448,6 +489,13 @@ func (s *Server) lectureStageAction(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	// v3.2.x P1-b: model_choice manual (the retry of summary, repair or
+	// translate with a model named for this one retry).
+	manual, err := manualTarget(stage, action, req)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	if req.TextOnly && (stage != model.StageASR || action != model.ActionRerun) {
 		// "修复断句" is the asr rerun only (textrepair.go)
 		writeError(w, http.StatusBadRequest, "stage.invalid", map[string]any{"stage": stage, "action": action})
@@ -457,8 +505,9 @@ func (s *Server) lectureStageAction(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	var err error
 	switch {
+	case manual != nil:
+		err = s.sc.RetryManual(ctx, model.ScopeLecture, id, stage, *manual)
 	case req.TextOnly:
 		err = s.rerunTextRepair(ctx, id, req.ModelChoice)
 	case stage == model.StageStream && action == model.ActionRetry && s.streamRetryIsNewRun(ctx, id):
@@ -817,7 +866,14 @@ func (s *Server) sentenceOp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var text string
+	var rt RetranslateRequest
 	switch op {
+	case "retranslate":
+		// v3.2.x P1-b: the optional {"use_current": true}
+		if err := decodeOptionalJSON(r, &rt); err != nil {
+			s.fail(w, r, err)
+			return
+		}
 	case "edit":
 		var req struct {
 			Text *string `json:"text"`
@@ -831,7 +887,7 @@ func (s *Server) sentenceOp(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		text = strings.TrimSpace(*req.Text)
-	case "reset", "retranslate":
+	case "reset":
 	default:
 		writeError(w, http.StatusBadRequest, "sentence.unknown_op", nil)
 		return
@@ -842,6 +898,7 @@ func (s *Server) sentenceOp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var x model.Sentence
+	var mixed *bool
 	n := 0
 	switch op {
 	case "edit":
@@ -849,7 +906,17 @@ func (s *Server) sentenceOp(w http.ResponseWriter, r *http.Request) {
 	case "reset":
 		x, n, err = state.ResetSentence(ctx, s.st, snapshotWindow, l.ID, idx)
 	case "retranslate":
-		x, err = state.RetranslateSentence(ctx, s.st, l.ID, idx)
+		if rt.UseCurrent && s.sc != nil {
+			var m bool
+			x, m, err = s.sc.RetranslateSentence(ctx, l.ID, idx, true)
+			mixed = &m
+			if errors.Is(err, state.ErrConflict) && !errors.Is(err, state.ErrBusy) {
+				// the sentence has a usable translation (state.RetranslateSentenceWith)
+				err = apiErrDetail(http.StatusConflict, codeSentenceNotPending, nil, err.Error())
+			}
+		} else {
+			x, err = state.RetranslateSentence(ctx, s.st, l.ID, idx)
+		}
 		n = 1
 	}
 	if err != nil {
@@ -862,6 +929,10 @@ func (s *Server) sentenceOp(w http.ResponseWriter, r *http.Request) {
 		p = &pp
 	} else if !errors.Is(err, db.ErrNotFound) {
 		s.fail(w, r, err)
+		return
+	}
+	if mixed != nil {
+		writeJSON(w, http.StatusOK, RetranslateResult{Sentence: sentenceView(x, p), Mixed: mixed})
 		return
 	}
 	writeJSON(w, http.StatusOK, sentenceView(x, p))
@@ -962,8 +1033,10 @@ func (s *Server) audio(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) exportFile(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("file")
+	// A trailing dot or space is refused too (AUD1 I-5): Windows drops them,
+	// so "x.tmp." would open the half-written "x.tmp".
 	if name == "" || name != filepath.Base(name) || strings.ContainsAny(name, `/\:`) || name == "." || name == ".." ||
-		strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".tmp") {
+		strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".tmp") || strings.TrimRight(name, ". ") != name {
 		writeError(w, http.StatusBadRequest, "export.bad_name", nil)
 		return
 	}

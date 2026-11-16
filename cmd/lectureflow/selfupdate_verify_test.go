@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -188,5 +189,153 @@ func TestSelfUpdateVerifyPrevious(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "previous.json"), b, 0o644)
 	if code, out := runVerify(t, "-selfupdate-verify", dir, "-selfupdate-previous", "-app-version", "3.2.0"); code != 1 || !strings.HasPrefix(out, "invalid selfupdate.not_available: ") {
 		t.Fatalf("backup only: %d %q", code, out)
+	}
+}
+
+// -selfupdate-private: no package is verified; after the check of the
+// data directory's permissions an empty private directory is made for the
+// shell's copy of a backup (security audit M-3). It needs no public key.
+func TestSelfUpdateVerifyPrivate(t *testing.T) {
+	dir := updatesDir(t)
+	orig := selfupdateVerifyKey
+	t.Cleanup(func() { selfupdateVerifyKey = orig })
+	selfupdateVerifyKey = func() string { return "" }
+	tmp := t.TempDir()
+	code, out := runVerify(t, "-selfupdate-verify", dir, "-app-version", "3.2.0", "-selfupdate-private", "-selfupdate-copy", tmp)
+	if code != 0 || !strings.HasPrefix(out, "ok private=") || strings.Count(out, "\n") != 1 {
+		t.Fatalf("private: %d %q", code, out)
+	}
+	priv := strings.TrimSuffix(strings.TrimPrefix(out, "ok private="), "\n")
+	if filepath.Dir(priv) != tmp || !strings.HasPrefix(filepath.Base(priv), selfupdate.CopyPrefix) {
+		t.Fatalf("the private directory %q is not in %q", priv, tmp)
+	}
+	if entries, err := os.ReadDir(priv); err != nil || len(entries) != 0 {
+		t.Fatalf("not an empty directory: %v %v", entries, err)
+	}
+	if e, err := dirperm.Check(priv); err != nil || e.Exposed() {
+		t.Fatalf("the private directory: %+v %v", e, err)
+	}
+	if rep, err := dirperm.CheckTree(priv, dirperm.TreeOptions{}); err != nil || !rep.OK() {
+		t.Fatalf("the private directory: %+v %v", rep, err)
+	}
+	// every call makes another one
+	_, out2 := runVerify(t, "-selfupdate-verify", dir, "-selfupdate-private", "-selfupdate-copy", tmp)
+	if out2 == out || !strings.HasPrefix(out2, "ok private=") {
+		t.Fatalf("second: %q", out2)
+	}
+	// nowhere to make it
+	if code, out := runVerify(t, "-selfupdate-verify", dir, "-selfupdate-private"); code != 1 || !strings.HasPrefix(out, "invalid selfupdate.io_failed: ") {
+		t.Fatalf("no -selfupdate-copy: %d %q", code, out)
+	}
+	if code, out := runVerify(t, "-selfupdate-verify", dir, "-selfupdate-private", "-selfupdate-copy", filepath.Join(tmp, "missing")); code != 1 || !strings.HasPrefix(out, "invalid ") {
+		t.Fatalf("a missing parent: %d %q", code, out)
+	}
+	// the permissions of the data directory come first
+	if code, out := runVerify(t, "-selfupdate-verify", filepath.Join(t.TempDir(), "gone", "updates"), "-selfupdate-private", "-selfupdate-copy", tmp); code != 3 || !strings.HasPrefix(out, "untrusted_dir: ") {
+		t.Fatalf("missing data directory: %d %q", code, out)
+	}
+	if entries, _ := os.ReadDir(tmp); len(entries) != 2 {
+		t.Fatalf("directories left in %s: %v", tmp, entries)
+	}
+}
+
+// -selfupdate-trust-dir (SEC17 中-B): the shell's trust directory is
+// checked in every mode after the data directory; -selfupdate-trust-check
+// checks nothing else. Never the real %LOCALAPPDATA%: a folder in
+// t.TempDir() stands for it.
+func TestSelfUpdateVerifyTrustDir(t *testing.T) {
+	dir := updatesDir(t)
+	k, _ := writePending(t, dir)
+	useKey(t, k)
+	trust := filepath.Join(t.TempDir(), "LectureFlow", "selfupdate")
+
+	if code, out := runVerify(t, "-selfupdate-verify", dir, "-selfupdate-trust-dir", trust, "-selfupdate-trust-check"); code != 0 || out != "ok trusted\n" {
+		t.Fatalf("trust check: %d %q", code, out)
+	}
+	if e, err := dirperm.Check(trust); err != nil || e.Exposed() {
+		t.Fatalf("the trust directory was not made privately: %+v %v", e, err)
+	}
+	code, out := runVerify(t, "-selfupdate-verify", dir, "-app-version", "3.1.0", "-selfupdate-trust-dir", trust)
+	if code != 0 || !strings.HasPrefix(out, "ok version=3.2.0 ") {
+		t.Fatalf("verify with the trust directory: %d %q", code, out)
+	}
+	// in the data directory: refused in every mode, and not made there.
+	// The reason ends with the words the desktop shell recognises
+	// (desktop/src/main/lib/verifyupdate.js OVERLAP_RE, OVERLAP_DIR_RE: it
+	// then says to move the data folder, not to tighten its permissions;
+	// R47 S2): change both together.
+	overlap := regexp.MustCompile(`^untrusted_dir: selfupdate\.untrusted_dir: the update's trust directory .+ cannot vouch for the record \(it lies in the data directory, or the data directory lies in it\)\n$`)
+	in := filepath.Join(filepath.Dir(dir), "electron", "selfupdate")
+	for _, extra := range [][]string{{"-selfupdate-trust-check"}, {"-app-version", "3.1.0"}, {"-selfupdate-previous"}, {"-selfupdate-private", "-selfupdate-copy", t.TempDir()}} {
+		args := append([]string{"-selfupdate-verify", dir, "-selfupdate-trust-dir", in}, extra...)
+		if code, out := runVerify(t, args...); code != 3 || !strings.HasPrefix(out, "untrusted_dir: ") || !overlap.MatchString(out) {
+			t.Fatalf("%v: %d %q", extra, code, out)
+		}
+	}
+	if _, err := os.Lstat(filepath.Dir(in)); !os.IsNotExist(err) {
+		t.Fatalf("something was made in the data directory: %v", err)
+	}
+	// the data directory comes first
+	if code, out := runVerify(t, "-selfupdate-verify", filepath.Join(t.TempDir(), "gone", "updates"), "-selfupdate-trust-dir", trust, "-selfupdate-trust-check"); code != 3 || !strings.HasPrefix(out, "untrusted_dir: ") {
+		t.Fatalf("missing data directory: %d %q", code, out)
+	}
+	// without a trust directory the check covers the data directory only
+	if code, out := runVerify(t, "-selfupdate-verify", dir, "-selfupdate-trust-check"); code != 0 || out != "ok trusted\n" {
+		t.Fatalf("trust check without a trust directory: %d %q", code, out)
+	}
+}
+
+// -selfupdate-install-dir (security audit M-4): the installation directory
+// is checked last, in every mode; refused with its own line and exit 3.
+func TestSelfUpdateVerifyInstallDir(t *testing.T) {
+	dir := updatesDir(t)
+	k, _ := writePending(t, dir)
+	useKey(t, k)
+	install := filepath.Join(filepath.Dir(updatesDir(t)), "LectureFlow") // in a private folder
+	if err := os.MkdirAll(filepath.Join(install, "resources", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// the folders above the temporary folder are this computer's: the
+	// check of the installation itself, without them
+	orig := checkInstallDir
+	t.Cleanup(func() { checkInstallDir = orig })
+	var asked []string
+	checkInstallDir = func(dir string) error {
+		asked = append(asked, dir)
+		if dir == install {
+			if e, err := dirperm.Check(dir); err != nil || e.Write {
+				t.Fatalf("not private: %+v %v", e, err)
+			}
+			return nil
+		}
+		return orig(dir)
+	}
+	if code, out := runVerify(t, "-selfupdate-verify", dir, "-selfupdate-install-dir", install, "-selfupdate-trust-check"); code != 0 || out != "ok trusted\n" {
+		t.Fatalf("a private installation: %d %q", code, out)
+	}
+	code, out := runVerify(t, "-selfupdate-verify", dir, "-app-version", "3.1.0", "-selfupdate-install-dir", install)
+	if code != 0 || !strings.HasPrefix(out, "ok version=3.2.0 ") {
+		t.Fatalf("verify with a private installation: %d %q", code, out)
+	}
+	tmp := t.TempDir()
+	for _, bad := range []string{"LectureFlow", filepath.Join(install, "missing")} {
+		for _, extra := range [][]string{{"-selfupdate-trust-check"}, {"-app-version", "3.1.0", "-selfupdate-copy", tmp}, {"-selfupdate-previous"}, {"-selfupdate-private", "-selfupdate-copy", tmp}} {
+			args := append([]string{"-selfupdate-verify", dir, "-selfupdate-install-dir", bad}, extra...)
+			if code, out := runVerify(t, args...); code != 3 || !strings.HasPrefix(out, "untrusted_install_dir: ") || strings.Count(out, "\n") != 1 {
+				t.Fatalf("%s %v: %d %q", bad, extra, code, out)
+			}
+		}
+	}
+	if ents, _ := os.ReadDir(tmp); len(ents) != 0 {
+		t.Fatalf("something was made: %v", ents)
+	}
+	// the data directory comes first, with its own line
+	n := len(asked)
+	if code, out := runVerify(t, "-selfupdate-verify", filepath.Join(t.TempDir(), "gone", "updates"), "-selfupdate-install-dir", "LectureFlow", "-selfupdate-trust-check"); code != 3 || !strings.HasPrefix(out, "untrusted_dir: ") {
+		t.Fatalf("missing data directory: %d %q", code, out)
+	}
+	// without the flag nothing is asked
+	if code, out := runVerify(t, "-selfupdate-verify", dir, "-selfupdate-trust-check"); code != 0 || out != "ok trusted\n" || len(asked) != n {
+		t.Fatalf("without an installation directory: %d %q %v", code, out, asked)
 	}
 }

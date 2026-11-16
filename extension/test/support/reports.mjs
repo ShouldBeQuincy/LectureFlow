@@ -28,7 +28,8 @@ export async function runSynthetic(kind, opts = {}) {
   const sel = readResults(frames);
   const pageDuration = detection.evidence.mediaDurations.length ? Math.max(...detection.evidence.mediaDurations) : 0;
   const session = await sessionIdFor(match, pageUrl, sel);
-  const lecture = lectureFor(match, sel, pageDuration);
+  // As src/background/detector.js: the page's title (frameTitle) only without a profile.
+  const lecture = lectureFor(match, sel, pageDuration, observed, match ? null : { title: isPanopto ? '' : S.GEN_PAGE_TITLE, url: pageUrl });
   return { frames, webRequests, pageUrl, detection, match, observed, named, session, lecture, downloadPolicy: downloadPolicyFor(match, sel, observed), io };
 }
 

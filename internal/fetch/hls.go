@@ -184,7 +184,7 @@ func inheritQuery(base, u *url.URL) {
 	if u.RawQuery != "" || u.ForceQuery || base.RawQuery == "" {
 		return
 	}
-	if !strings.EqualFold(u.Scheme, base.Scheme) || !strings.EqualFold(u.Host, base.Host) {
+	if !strings.EqualFold(u.Scheme, base.Scheme) || !sameHost(u.Host, base.Host) {
 		return
 	}
 	u.RawQuery = base.RawQuery

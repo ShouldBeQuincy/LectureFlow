@@ -10,12 +10,16 @@
 // stays visible until the answer replaces it). Shared with the resource
 // panel and the workbench: pauseDevice (asks first while transcriptions
 // run) and the names of kinds and combinations.
+// ssh-1b: an SSH server's row ("ssh:<slug>", settings_remote.js) has model
+// and precision only (the server's own recommendation), its state, no
+// device test and a link to Settings → 远程服务器.
 
 import { api } from './api.js';
 import { h, clear, btn, iconBtn, toast, actionsDialog, preserveFocus } from './dom.js';
 import { icon } from './icons.js';
 import * as U from './util.js';
 import { t } from './i18n.js';
+import { isSSHDevice, serverOfDevice, stateChip } from './settings_remote.js';
 
 const NA = '--';
 const MANUAL = '__manual__';
@@ -225,7 +229,9 @@ export function createDeviceList(opts) {
       fkey: `set:dev:${d.id}:pause`,
       onclick: () => togglePause(d),
     });
-    const meta = [U.deviceKindName(d.kind), d.backend === 'openvino' ? 'OpenVINO' : d.backend === 'mlx' ? 'MLX' : d.kind === 'remote' ? '' : d.backend].filter(Boolean).join(' · ');
+    const ssh = isSSHDevice(d.id);
+    const server = ssh ? serverOfDevice(d.id) : null;
+    const meta = [ssh ? t('devices.kind.ssh') : U.deviceKindName(d.kind), d.backend === 'openvino' ? 'OpenVINO' : d.backend === 'mlx' ? 'MLX' : d.kind === 'remote' ? '' : d.backend].filter(Boolean).join(' · ');
     li.append(
       h(
         'div',
@@ -240,7 +246,9 @@ export function createDeviceList(opts) {
             'span',
             { class: 'dev-meta' },
             h('span', null, meta),
-            !d.present ? chip(t('devices.not_present'), 'chip-warn', t('devices.not_present_tip')) : null,
+            // an SSH server says its own state (offline, setup, …) instead of "not present"
+            server && server.state !== 'ready' && server.state !== 'busy' ? stateChip(server.state) : null,
+            !d.present && !server ? chip(t('devices.not_present'), 'chip-warn', t('devices.not_present_tip')) : null,
             !d.enabled ? chip(t('devices.disabled'), 'chip-quiet') : null,
             d.paused ? chip(t('devices.paused'), 'chip-warn') : null,
             fixed ? chip(t('devices.fixed'), 'chip-run') : null,
@@ -250,14 +258,18 @@ export function createDeviceList(opts) {
       ),
       // SPEC-v3 V14 (colab:remote): model and precision live in the Colab
       // settings, and Colab has no device test (it measures every lecture)
-      d.kind === 'remote' ? h('div', { class: 'dev-body' }, remoteFields(d), notes(d)) : h('div', { class: 'dev-body' }, fields(d, isBusy), notes(d), testPanel(d)),
+      d.kind === 'remote'
+        ? h('div', { class: 'dev-body' }, remoteFields(d), notes(d))
+        : ssh
+          ? h('div', { class: 'dev-body' }, sshFields(d, isBusy), notes(d))
+          : h('div', { class: 'dev-body' }, fields(d, isBusy), notes(d), testPanel(d)),
     );
     return li;
   }
 
   // ---- fields: model, precision, parallel tasks ----
 
-  function fields(d, isBusy) {
+  function fields(d, isBusy, parallel = true) {
     const models = (d.options && d.options.models) || [];
     const fw = d.backend !== 'openvino';
     const inList = models.includes(d.model);
@@ -372,7 +384,23 @@ export function createDeviceList(opts) {
       { class: 'dev-fields' },
       field(t('settings.asr.model'), modelCtl),
       field(t('devices.precision'), precCtl, recChip),
-      field(t('devices.max_parallel'), par),
+      parallel ? field(t('devices.max_parallel'), par) : null,
+    );
+  }
+
+  // ssh-1b: an SSH server — model and precision (its own recommendation);
+  // the connection, agent and environment live in Settings → 远程服务器
+  function sshFields(d, isBusy) {
+    return h(
+      'div',
+      { class: 'dev-ssh' },
+      fields(d, isBusy, false),
+      h(
+        'p',
+        { class: 'set-note' },
+        icon('info', { size: 13 }),
+        h('span', null, t('devices.ssh_note'), ' ', h('a', { class: 'set-link', href: '#/settings/remote', dataset: fk(d.id, 'remote') }, t('settings.remote.title'))),
+      ),
     );
   }
 
@@ -412,7 +440,7 @@ export function createDeviceList(opts) {
     if (errors[d.id]) out.push(h('p', { class: 'set-note is-err', role: 'alert' }, icon('circle-alert', { size: 13 }), h('span', null, errors[d.id])));
     if (d.backend === 'openvino' && d.model_ready === false) out.push(note('info', t('devices.prepare_note')));
     else if (d.backend === 'openvino' && d.compile_cached === false) out.push(note('info', t('devices.compile_note')));
-    if (d.backend !== 'openvino' && d.kind !== 'cpu') {
+    if (d.backend !== 'openvino' && d.kind !== 'cpu' && !isSSHDevice(d.id)) {
       const ct = computeTypeNote(d);
       if (ct) out.push(note('info', ct));
     }

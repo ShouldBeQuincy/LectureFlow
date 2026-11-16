@@ -7,7 +7,7 @@
 // audio track). Pure.
 
 import { kindOfCodecs, KIND_AUDIO, KIND_VIDEO, KIND_UNKNOWN, FORMAT_HLS } from './classify.js';
-import { parseHttpUrl, urlKey, extensionOfPath } from './url.js';
+import { urlKey, extensionOfPath, resolveRef, resolveCost } from './url.js';
 
 /**
  * Parses an attribute list: KEY=VALUE pairs separated by commas, where a
@@ -48,16 +48,39 @@ export function parseAttributeList(text) {
 
 const attr = (m, k) => (m.has(k) ? m.get(k).value : undefined);
 
+// An attribute value that ends up in a track, or undefined when it is
+// longer than HLS_LIMITS.attrLength: such a value is treated as absent, not
+// cut, so that no made-up codec list, name or language looks real (and the
+// background does not keep it; SEC28 中-1).
+const keptAttr = (m, k) => {
+  const v = attr(m, k);
+  return v !== undefined && v.length <= HLS_LIMITS.attrLength ? v : undefined;
+};
+
 function num(v) {
   if (v === undefined || v === '') return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
 
-function resolve(uri, base) {
-  const u = parseHttpUrl(uri, base);
-  return u ? urlKey(u.href) : null;
-}
+// A page's playlist is read up to MAX_MANIFEST_BYTES (2 MiB, lib/bgfetch.js),
+// but what it resolves to can be far larger: every address carries the
+// playlist's own address as its base (SEC23c). So each playlist gives at
+// most this many variants, renditions, segments and #EXT-X-MAP addresses,
+// no address (and no base) longer than urlLength, and urlBytes characters
+// of addresses in all; past a limit the rest is left out, quietly, and not
+// resolved at all (SEC25 中-2). For the base, what counts is the part
+// relative addresses read: its path without the query (url.js resolveRef,
+// RFC 3986 §5.2.2), so a long signed query costs nothing (SEC25 中-4).
+export const HLS_LIMITS = Object.freeze({
+  urlLength: 4096, // the playlist's address as a base; any address it gives
+  variants: 256, // #EXT-X-STREAM-INF of one master (real ladders: a few to a few dozen)
+  renditions: 256, // #EXT-X-MEDIA of one master (audio / subtitle languages × groups)
+  segments: 30000, // of one media playlist (4 h in 2 s segments is 7,200)
+  initUris: 256, // #EXT-X-MAP of one media playlist (one per discontinuity at most)
+  urlBytes: 16 * 1024 * 1024, // characters one playlist may resolve (ASCII: bytes; 4 h of 2 s segments signed with 1.3 KB is ~9.4 MB); each attempt costs its longest of address, base read, result
+  attrLength: 256, // an attribute value a track keeps (CODECS, NAME, LANGUAGE, GROUP-ID, CHANNELS; AUDIO and VIDEO with them); real ones are under 100
+});
 
 // Key systems that mean DRM, as opposed to plain AES-128 with a key URL.
 const DRM_KEYFORMAT = /widevine|playready|streamingkeydelivery|fairplay|com\.microsoft|urn:uuid:(edef8ba9|9a04f079|94ce86fb)/i;
@@ -74,7 +97,7 @@ function isDrmKey(m) {
  * Splits text into lines (CRLF, LF or CR), dropping a UTF-8 BOM.
  */
 export function playlistLines(text) {
-  return String(text).replace(/^﻿/, '').split(/\r\n|\n|\r/);
+  return String(text).replace(/^\ufeff/, '').split(/\r\n|\n|\r/);
 }
 
 /**
@@ -93,7 +116,7 @@ export function playlistLines(text) {
  *   playlistType: string,
  * }
  */
-export function parseHls(text, baseUrl) {
+export function parseHls(text, baseUrl, opts = {}) {
   const out = {
     type: 'invalid',
     variants: [],
@@ -106,12 +129,40 @@ export function parseHls(text, baseUrl) {
     endList: false,
     playlistType: '',
   };
+  const L = HLS_LIMITS;
+  const base = typeof baseUrl === 'string' ? baseUrl : undefined;
+  let bytesLeft = L.urlBytes;
+  // opts.budget: { left } shared by one detection (detect.js). Segment and
+  // #EXT-X-MAP addresses, the bulk, also spend it (at most
+  // min(urlBytes, budget.left) here); variants and renditions, which make
+  // the tracks and are few, only spend the playlist's own budget.
+  const shared = opts && opts.budget;
+  const sharedStart = shared ? Math.max(0, Math.min(L.urlBytes, shared.left)) : Infinity;
+  let sharedLeft = sharedStart;
+  // an address, or null when unusable or past the byte budget. Every
+  // attempt is charged (url.js resolveCost), refused ones too, and once the
+  // budget is spent nothing more is resolved (SEC25 中-2).
+  const take = (uri, bulk = false) => {
+    if (bytesLeft <= 0 || (bulk && sharedLeft <= 0) || !uri || uri.length > L.urlLength) return null;
+    const u = resolveRef(uri, base, L.urlLength);
+    const r = u ? urlKey(u.href) : null;
+    const cost = resolveCost(uri, base, L.urlLength, r);
+    if (cost > bytesLeft || (bulk && cost > sharedLeft)) {
+      if (cost > bytesLeft) bytesLeft = 0;
+      if (bulk) sharedLeft = 0;
+      return null;
+    }
+    bytesLeft -= cost;
+    if (bulk) sharedLeft -= cost;
+    return r && r.length <= L.urlLength ? r : null;
+  };
   const lines = playlistLines(text);
   let first = 0;
   while (first < lines.length && lines[first].trim() === '') first++;
   if (first >= lines.length || !lines[first].trim().startsWith('#EXTM3U')) return out;
 
   let pendingVariant = null;
+  let skipUri = false; // the URI line of a variant past the limit
   let pendingSegment = false;
   let duration = 0;
   let sawExtinf = false;
@@ -128,6 +179,11 @@ export function parseHls(text, baseUrl) {
       switch (tag) {
         case '#EXT-X-STREAM-INF': {
           isMaster = true;
+          if (out.variants.length >= L.variants) {
+            pendingVariant = null;
+            skipUri = true;
+            break;
+          }
           const m = parseAttributeList(value);
           const res = /^(\d+)x(\d+)$/i.exec(attr(m, 'RESOLUTION') || '');
           pendingVariant = {
@@ -136,25 +192,26 @@ export function parseHls(text, baseUrl) {
             averageBandwidth: num(attr(m, 'AVERAGE-BANDWIDTH')),
             width: res ? Number(res[1]) : null,
             height: res ? Number(res[2]) : null,
-            codecs: attr(m, 'CODECS') || '',
+            codecs: keptAttr(m, 'CODECS') || '',
             frameRate: num(attr(m, 'FRAME-RATE')),
-            audio: attr(m, 'AUDIO') || '',
-            video: attr(m, 'VIDEO') || '',
+            audio: keptAttr(m, 'AUDIO') || '',
+            video: keptAttr(m, 'VIDEO') || '',
           };
           break;
         }
         case '#EXT-X-MEDIA': {
           isMaster = true;
+          if (out.renditions.length >= L.renditions) break;
           const m = parseAttributeList(value);
           const uriRaw = attr(m, 'URI');
           out.renditions.push({
             type: (attr(m, 'TYPE') || '').toUpperCase(),
-            groupId: attr(m, 'GROUP-ID') || '',
-            name: attr(m, 'NAME') || '',
-            language: attr(m, 'LANGUAGE') || '',
-            uri: uriRaw ? resolve(uriRaw, baseUrl) : null,
+            groupId: keptAttr(m, 'GROUP-ID') || '',
+            name: keptAttr(m, 'NAME') || '',
+            language: keptAttr(m, 'LANGUAGE') || '',
+            uri: take(uriRaw),
             isDefault: (attr(m, 'DEFAULT') || '').toUpperCase() === 'YES',
-            channels: attr(m, 'CHANNELS') || '',
+            channels: keptAttr(m, 'CHANNELS') || '',
           });
           break;
         }
@@ -176,9 +233,9 @@ export function parseHls(text, baseUrl) {
           break;
         }
         case '#EXT-X-MAP': {
+          if (out.initUris.length >= L.initUris) break;
           const m = parseAttributeList(value);
-          const u = attr(m, 'URI');
-          const r = u ? resolve(u, baseUrl) : null;
+          const r = take(attr(m, 'URI'), true);
           if (r) out.initUris.push(r);
           break;
         }
@@ -194,17 +251,21 @@ export function parseHls(text, baseUrl) {
       continue;
     }
     // A URI line.
-    const r = resolve(line, baseUrl);
-    if (pendingVariant) {
+    if (skipUri) {
+      skipUri = false;
+    } else if (pendingVariant) {
+      const r = take(line);
       pendingVariant.uri = r;
       if (r) out.variants.push(pendingVariant);
       pendingVariant = null;
     } else if (pendingSegment) {
+      const r = out.segments.length < L.segments ? take(line, true) : null;
       if (r) out.segments.push(r);
       pendingSegment = false;
     }
   }
 
+  if (shared) shared.left -= sharedStart - sharedLeft;
   if (isMaster) {
     out.type = 'master';
   } else if (sawExtinf || out.endList || out.segments.length > 0) {

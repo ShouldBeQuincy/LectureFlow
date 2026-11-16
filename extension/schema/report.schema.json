@@ -221,6 +221,24 @@
         }
       }
     },
+    "limits": {
+      "description": "Present only when the extension left something out past its limits (docs/extension/limits.md): how many frames, media elements, <source>s, resource entries and request records were left out of the inputs, how many addresses for their length (longUrls) or for the scan's address budget (scanChars), how many other values were cut or left out for their length or number (longValues: a <source>'s type, a selector-read node's tag, id, classes and attribute names), how many single-file tracks past LIMITS.fileTracks, and how many tracks the background gave up past RETAIN_LIMITS.tracksKept (tracks: a replay finds those, `expected` does not list them).",
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "frames": { "type": "integer", "minimum": 1 },
+        "elements": { "type": "integer", "minimum": 1 },
+        "sources": { "type": "integer", "minimum": 1 },
+        "resources": { "type": "integer", "minimum": 1 },
+        "webRequests": { "type": "integer", "minimum": 1 },
+        "longUrls": { "type": "integer", "minimum": 1 },
+        "scanChars": { "type": "integer", "minimum": 1 },
+        "longValues": { "type": "integer", "minimum": 1 },
+        "fileTracks": { "type": "integer", "minimum": 1 },
+        "tracks": { "type": "integer", "minimum": 1 }
+      }
+    },
     "expected": {
       "type": "object",
       "additionalProperties": false,

@@ -35,6 +35,7 @@ import { lectureLabel, lectureTagText, kindSearchText } from './kinds.js';
 import { bindOf, bindSelect, fromFileName, materialGroups, suggestedWeek, weekChoices } from './material_bind.js';
 import { asrNotice } from './asr_ready.js';
 import { downloadsSlot } from './downloads.js';
+import { confirmUpdate, confirmLaunchDrafts } from './update_confirm.js';
 
 const MEDIA_ACCEPT = U.MEDIA_ACCEPT; // extensions only (util.js, security review 2 M3)
 // SYLLABUS.md top-level sections (A8.3) as shown on the syllabus card;
@@ -94,7 +95,7 @@ export function mountCourse(root, route, ctx) {
     ctx,
     onLectures(updated) {
       for (const l of updated) upsertLecture(l);
-      renderLectures();
+      if (!inPlace(updated)) renderLectures();
       reloadCourse();
     },
     onDeleted(ids) {
@@ -281,7 +282,7 @@ export function mountCourse(root, route, ctx) {
       const l = await api.lecture(lid, { quiet: true });
       if (!alive || !l || l.course_id !== id || !lectures) return;
       upsertLecture(l);
-      renderLectures();
+      if (!inPlace([l])) renderLectures();
     } catch (e) {
       if (!alive || !lectures) return;
       if (e.status !== 404) {
@@ -306,6 +307,16 @@ export function mountCourse(root, route, ctx) {
         fn();
       }, ms),
     );
+  }
+
+  // P2 hotspot 3: lectures changed (an SSE refresh, an action's answer)
+  // redraw their rows only (lecture_list.js updateRow) when the list stays
+  // as it is around them; false: the whole list is rendered (a search is
+  // on, which may now show or hide them: updateRow asks `filtered`; a
+  // lecture new to the list, or moved). One event, one drawing.
+  function inPlace(ls) {
+    if (!ls.length || !lecBody.contains(list.table)) return false;
+    return ls.every((l) => list.updateRow(l));
   }
 
   function upsertLecture(l) {
@@ -372,15 +383,20 @@ export function mountCourse(root, route, ctx) {
           'div',
           { class: 'page-actions' },
           acts.includes('launch_drafts')
-            ? btn(t('course.launch_drafts'), { kind: 'primary', icon: 'play', count: course.draft_count, disabled: busy.has('drafts'), fkey: 'course:drafts', onclick: () => courseOp('drafts', () => launchCourseDrafts(course)) })
+            ? btn(t('course.launch_drafts'), { kind: 'primary', icon: 'play', count: course.draft_count, disabled: busy.has('drafts'), fkey: 'course:drafts', fnext: 'course:menu', onclick: () => courseOp('drafts', launchDrafts) })
             : null,
           acts.includes('update_stale')
-            ? btn(t('course.update_stale'), { icon: 'refresh-cw', kind: 'warn', count: course.stale_lecture_count, disabled: busy.has('stale'), fkey: 'course:stale', onclick: () => courseOp('stale', () => updateCourseStale(course)) })
+            ? btn(t('course.update_stale'), { icon: 'refresh-cw', kind: 'warn', count: course.stale_lecture_count, disabled: busy.has('stale'), fkey: 'course:stale', fnext: 'course:menu', onclick: () => courseOp('stale', updateStale) })
             : null,
           menuButton(iconBtn('ellipsis', t('course.menu_label'), { fkey: 'course:menu', menu: true, class: 'icon-btn-bordered' }), () => [
+            // T22 B1: the name and the code are in the course settings; "rename…" opens them on the name
+            { id: 'rename', label: t('course.menu.rename'), icon: 'pencil', onSelect: () => openSettings({ focus: 'name' }) },
             { label: t('course.settings.menu'), icon: 'settings', onSelect: () => openSettings() },
             'sep',
-            ...courseMenuItems(card, { onChanged: () => (reloadCourse(), reloadLectures()) }).filter((it) => !(it && it.id === 'open')),
+            ...courseMenuItems(card, { onChanged: () => (reloadCourse(), reloadLectures()) })
+              .filter((it) => !(it && it.id === 'open'))
+              // T25 X1, T22 G3: the menu's batch operations ask first, as the buttons do
+              .map((it) => (it && it.id === 'launch_drafts' ? { ...it, onSelect: () => courseOp('drafts', launchDrafts) } : it && it.id === 'update_stale' ? { ...it, onSelect: () => courseOp('stale', updateStale) } : it)),
           ]),
         ),
       );
@@ -393,7 +409,7 @@ export function mountCourse(root, route, ctx) {
     const d = parseYMD(course.term_start);
     return h(
       'button',
-      { type: 'button', class: 'page-sub-link' + (d ? '' : ' is-missing'), title: t('course.head.term_start_edit'), dataset: { fkey: 'course:term' }, onclick: () => openSettings() },
+      { type: 'button', class: 'page-sub-link' + (d ? '' : ' is-missing'), title: t('course.head.term_start_edit'), dataset: { fkey: 'course:term' }, onclick: () => openSettings({ focus: 'term' }) },
       icon('calendar', { size: 13 }),
       d ? t('course.head.term_start', { date: fmtMonthDay(d) }) : t('course.head.term_start_missing'),
     );
@@ -401,11 +417,13 @@ export function mountCourse(root, route, ctx) {
 
   // ---- course settings and the file-name rule (P13.3.3, P13.4) ----
 
-  function openSettings() {
+  // o.focus: 'name' from "rename…" (T22 B1)
+  function openSettings(o = {}) {
     if (!course) return;
     openCourseSettings(course, {
+      focus: o.focus,
       lectures: lectures || [],
-      recordingSection: (close) => recordingSection(course, { close, onOpenRule: () => openRule(), onChanged: () => reloadCourse() }),
+      recordingSection: (close, busy) => recordingSection(course, { close, busy, onOpenRule: () => openRule(), onChanged: () => reloadCourse() }),
       onSaved: (c) => courseChanged(c),
     });
   }
@@ -436,6 +454,24 @@ export function mountCourse(root, route, ctx) {
       const r = course && renumberNotice(course, lectures, { onDismissed: (c) => courseChanged(c) });
       if (r) fnNoticeEl.append(r);
     });
+  }
+
+  // T25 X1, T22 G3: "start all drafts" and "update all out-of-date
+  // lectures" say first how many lectures, which stages and (an update) what
+  // they took the last time (update_confirm.js); what runs is unchanged.
+  // Resolve to null when the user did not go on.
+  // R74 low 2a (round 8 WL-01): "start all drafts" asks once, after the
+  // glossary question when the glossary is still being extracted
+  // (launchCourseDrafts asks it first, then opts.ask); not one dialog
+  // before it and the glossary's after. The page has no settings of its
+  // own, so the cost sentence is the default one (no opts.costMode).
+  const withAction = (a) => (lectures || []).filter((l) => (l.lecture_actions || []).includes(a));
+  function launchDrafts() {
+    return launchCourseDrafts(course, { ask: () => confirmLaunchDrafts(withAction('launch').filter((l) => l.draft), course.draft_count) });
+  }
+  async function updateStale() {
+    if (!(await confirmUpdate(withAction('update'), { named: true, count: course.stale_lecture_count }))) return null;
+    return updateCourseStale(course);
   }
 
   async function courseOp(key, fn) {
@@ -835,7 +871,8 @@ export function mountCourse(root, route, ctx) {
 
   renderAll(); // skeleton until the first response
   load();
-  const tick = setInterval(() => alive && lectures && course && renderHead(), 60000); // relative times
+  // relative times: the header, and the rows' "running for", "… ago" (R78 low 3)
+  const tick = setInterval(() => alive && lectures && course && (renderHead(), list.refreshTimes()), 60000);
   const onTitleLang = () => alive && lectures && renderLectures(); // the lecture title language changed in the settings
   window.addEventListener('titlelangchange', onTitleLang);
   const onKinds = () => alive && lectures && (renderLectures(), course && renderMaterials()); // a kind was added or renamed (lecture kinds)

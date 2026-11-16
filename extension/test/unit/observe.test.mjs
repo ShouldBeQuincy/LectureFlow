@@ -288,18 +288,117 @@ test('isolated world: asks the background, hands the page its configuration, kee
   await tick();
   const store = page.sandbox.__lectureflowObserver;
   assert.deepEqual(plain(store.observed), [{ key: KEY, index: 0, url: INFO, values: { downloadUrl: null, podcastUrl: ['https://cdn.example.net/sessions/s/p.mp4?sig=1'], streamUrls: ['https://cdn.example.net/a/master.m3u8'], sessionName: 'CSC1003 Lecture' } }]);
-  // A page posting its own "result": undeclared names, other requests and
+  // A page posting its own "result": a declared request already answered is
+  // not looked at again (SEC18e 中-5); undeclared names, other requests and
   // other profile versions are refused here too.
+  const before = JSON.stringify(store.observed);
   const forge = (r) => page.document.dispatchEvent(new CustomEvent('lectureflow-observed', { detail: JSON.stringify(r) }));
   forge({ key: KEY, index: 0, url: INFO, values: { downloadUrl: 'https://tenant.cloud.panopto.eu/x', UserEmail: SECRET_EMAIL } });
-  assert.deepEqual(plain(Object.keys(store.observed[0].values)), ['downloadUrl']);
+  assert.equal(JSON.stringify(store.observed), before, 'answered once, kept');
   forge({ key: KEY, index: 0, url: 'https://evil.example.com/Panopto/Pages/Viewer/DeliveryInfo.aspx', values: { downloadUrl: 'y' } });
   forge({ key: 'panopto:0.0.1', index: 0, url: INFO, values: { downloadUrl: 'z' } });
   forge({ key: KEY, index: 2, url: INFO, values: { downloadUrl: 'z' } });
   assert.equal(store.observed.length, 1);
-  assert.equal(store.observed[0].values.downloadUrl, 'https://tenant.cloud.panopto.eu/x');
+  assert.equal(store.observed[0].values.downloadUrl, null);
   assert.ok(!JSON.stringify(store).includes(SECRET_EMAIL));
+  // before an answer: a forged result of the declared request is checked as usual
+  const page2 = makePage({});
+  page2.sandbox.chrome = { runtime: { sendMessage: () => Promise.resolve(observeConfig(panopto)) } };
+  page2.run(ISOLATED_SRC);
+  await tick();
+  page2.document.dispatchEvent(new CustomEvent('lectureflow-observed', { detail: JSON.stringify({ key: KEY, index: 0, url: INFO, values: { downloadUrl: 'https://tenant.cloud.panopto.eu/x', UserEmail: SECRET_EMAIL } }) }));
+  assert.deepEqual(plain(Object.keys(page2.sandbox.__lectureflowObserver.observed[0].values)), ['downloadUrl']);
 });
+
+/** A clock for the sandbox: every match (two reads) takes `cost` ms. */
+function sandboxClock(page, cost) {
+  let t = 0;
+  let odd = false;
+  let reads = 0;
+  page.sandbox.performance = {
+    now: () => {
+      reads++;
+      odd = !odd;
+      if (!odd) t += cost.ms;
+      return t;
+    },
+  };
+  return { reads: () => reads };
+}
+
+test('isolated world: forged results are looked at 64 times a page at most (SEC18e 中-5)', async () => {
+  const page = makePage({});
+  const sent = [];
+  page.sandbox.chrome = { runtime: { sendMessage: (m) => (sent.push(m), Promise.resolve(m.cmd === 'observeConfig' ? observeConfig(panopto) : null)) } };
+  const cost = { ms: 1 };
+  const clock = sandboxClock(page, cost);
+  page.run(ISOLATED_SRC);
+  await tick();
+  // a page script floods results on the platform host that never match: each one would run the regex
+  for (let i = 0; i < 1000; i++) {
+    page.document.dispatchEvent(new CustomEvent('lectureflow-observed', { detail: JSON.stringify({ key: KEY, index: 0, url: `https://tenant.cloud.panopto.eu/x/${i}`, values: {} }) }));
+  }
+  assert.ok(clock.reads() <= 64 * 2, `${clock.reads()} clock reads: 64 events at most`);
+  // 64 cheap matches are far within the budget: nothing to report. (Had they
+  // tripped it, the background would record a content script's trip only
+  // for a local profile: src/lib/health.js recordable.)
+  assert.deepEqual(sent.filter((m) => m.cmd === 'regexSlow'), []);
+});
+
+test('isolated world: a regex the main world found slow runs once more here, under this clock, and is reported only if slow (SEC18e 中-6)', async () => {
+  const page = makePage({});
+  const sent = [];
+  page.sandbox.chrome = { runtime: { sendMessage: (m) => (sent.push(m), Promise.resolve(m.cmd === 'observeConfig' ? observeConfig(panopto) : null)) } };
+  const cost = { ms: 1 };
+  const clock = sandboxClock(page, cost);
+  page.run(ISOLATED_SRC);
+  await tick();
+  const notice = (r) => page.document.dispatchEvent(new CustomEvent('lectureflow-observe-slow', { detail: JSON.stringify(r) }));
+  // fast here: nothing reported (a forged notice cannot frame a fast profile)
+  notice({ key: KEY, index: 0, url: 'https://tenant.cloud.panopto.eu/a' });
+  assert.equal(clock.reads(), 2, 'one match');
+  assert.deepEqual(sent.filter((m) => m.cmd === 'regexSlow'), []);
+  // the same regex again: not retested; others refused
+  cost.ms = 300;
+  notice({ key: KEY, index: 0, url: 'https://tenant.cloud.panopto.eu/b' });
+  notice({ key: 'other:1', index: 0, url: 'https://tenant.cloud.panopto.eu/b' });
+  notice({ key: KEY, index: 3, url: 'https://tenant.cloud.panopto.eu/b' });
+  notice({ key: KEY, index: 0, url: 'https://evil.example.com/b' });
+  assert.equal(clock.reads(), 2);
+  assert.ok(page.sandbox.__lectureflowObserver.stopped === undefined, 'not stopped: the scan has nothing to say (SEC18f 低-18)');
+  // a page with a second declared request: slow here, so reported
+  const two = { ...observeConfig(panopto) };
+  two.specs = [two.specs[0], { ...two.specs[0] }];
+  const page2 = makePage({});
+  const sent2 = [];
+  page2.sandbox.chrome = { runtime: { sendMessage: (m) => (sent2.push(m), Promise.resolve(m.cmd === 'observeConfig' ? two : null)) } };
+  sandboxClock(page2, { ms: 300 });
+  page2.run(ISOLATED_SRC);
+  await tick();
+  page2.document.dispatchEvent(new CustomEvent('lectureflow-observe-slow', { detail: JSON.stringify({ key: KEY, index: 1, url: 'https://tenant.cloud.panopto.eu/a' }) }));
+  const slow = plain(sent2.filter((m) => m.cmd === 'regexSlow'));
+  assert.equal(slow.length, 1);
+  assert.deepEqual({ ...slow[0], ms: 0 }, { cmd: 'regexSlow', owner: KEY, source: panopto.observe[0].urlPattern, ms: 0, reason: 'slow' });
+  assert.equal(slow[0].ms, 300);
+  // and kept for the scan: the background's card says why the switch is unknown (SEC18f 低-18)
+  assert.ok(page2.sandbox.__lectureflowObserver.stopped === KEY, String(page2.sandbox.__lectureflowObserver.stopped));
+});
+
+test('main world: a regex too slow stops there and names the regex and address to the isolated world (SEC18e 中-6)', async () => {
+  const page = makePage({ [INFO]: deliveryInfo() });
+  sandboxClock(page, { ms: 300 });
+  page.run(MAIN_SRC);
+  configEvent(page, observeConfig(panopto));
+  await (await page.sandbox.fetch(INFO)).json();
+  await tick();
+  const notices = page.events.filter((e) => e.type === 'lectureflow-observe-slow').map((e) => JSON.parse(e.detail));
+  assert.deepEqual(notices, [{ key: KEY, index: 0, url: INFO }]);
+  // stopped: the next answer is not matched again
+  await (await page.sandbox.fetch(INFO)).json();
+  await tick();
+  assert.equal(page.events.filter((e) => e.type === 'lectureflow-observe-slow').length, 1);
+});
+
 
 test('isolated world: no profile observes here → the page part is told "nothing" and stays inert', async () => {
   const page = makePage({ [INFO]: deliveryInfo() });

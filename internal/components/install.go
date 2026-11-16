@@ -154,7 +154,9 @@ func (m *Manager) finalRel(id, version string) (string, error) {
 // and returns its path.
 func (m *Manager) obtain(ctx context.Context, t *task, it *item, f File) (string, error) {
 	spec := fileSpec{Name: f.Name, SHA256: f.SHA256, Size: f.Size}
-	if m.dl.have(spec) {
+	if ok, err := m.dl.haveVerified(ctx, spec); err != nil {
+		return "", err
+	} else if ok {
 		return m.dl.finalPath(f.SHA256), nil
 	}
 	if it.offline != nil {
@@ -164,7 +166,16 @@ func (m *Manager) obtain(ctx context.Context, t *task, it *item, f File) (string
 	reuse := m.installedFiles(m.st)[f.SHA256]
 	m.mu.Unlock()
 	if reuse != "" && f.Unpack == "" {
-		if fi, err := os.Stat(reuse); err == nil && fi.Size() == f.Size {
+		// the installed copy is hashed again before it is reused, like a
+		// download (security audit L-13); a copy of another size is not
+		// read at all
+		same := false
+		if fi, err := os.Stat(reuse); err == nil && fi.Mode().IsRegular() && fi.Size() == f.Size {
+			if same, err = fileMatches(ctx, reuse, f.Size, f.SHA256); err != nil {
+				return "", err
+			}
+		}
+		if same {
 			os.MkdirAll(m.dl.dir, 0o755)
 			dst := m.dl.finalPath(f.SHA256)
 			if err := linkOrCopy(reuse, dst); err == nil {
@@ -184,7 +195,7 @@ func (m *Manager) obtain(ctx context.Context, t *task, it *item, f File) (string
 	return m.dl.fetch(ctx, spec, m.progress(t, it), func(u sourceURL, reason model.ErrorInfo) {
 		m.setSource(t, it, sourceURL{})
 		m.notice(t, model.ErrorInfo{Code: CodeMirrorFallback,
-			Params: map[string]any{"group": u.Group, "mirror": u.Mirror, "reason": reason.Code}})
+			Params: map[string]any{"group": u.Group, "mirror": redactURL(u.Mirror), "reason": reason.Code}})
 	})
 }
 
@@ -229,10 +240,20 @@ func (m *Manager) installFiles(ctx context.Context, t *task, it *item, c *Compon
 	for _, f := range b.Files {
 		dst := filepath.Join(staging, sub, filepath.FromSlash(f.Name))
 		if f.Unpack == "" {
-			if fi, err := os.Stat(dst); err == nil && fi.Size() == f.Size { // moved before a pause
-				m.fileDone(t, it, f.Size)
-				files = append(files, InstalledFile{Path: sub + "/" + f.Name, SHA256: f.SHA256, Size: f.Size})
-				continue
+			// moved before a pause: hashed again before it is kept (security
+			// audit L-13), deleted and obtained again when it differs
+			if fi, err := os.Stat(dst); err == nil && fi.Size() == f.Size {
+				same, err := fileMatches(ctx, dst, f.Size, f.SHA256)
+				if err != nil {
+					return err
+				}
+				if same {
+					m.fileDone(t, it, f.Size)
+					files = append(files, InstalledFile{Path: sub + "/" + f.Name, SHA256: f.SHA256, Size: f.Size})
+					continue
+				}
+				m.log.Warn("components: a file moved before a pause no longer matches its SHA-256; obtaining it again", "file", f.Name)
+				os.Remove(dst)
 			}
 		}
 		p, err := m.obtain(ctx, t, it, f)
@@ -377,7 +398,10 @@ func (m *Manager) installVenv(ctx context.Context, t *task, it *item, c *Compone
 	if !ok {
 		return cerr(CodeNotInstalled, map[string]any{"id": IDPython}, errors.New("the python component is not installed"))
 	}
-	pyExe := filepath.Join(m.abs(py.Dir), filepath.FromSlash(py.Exe))
+	pyExe, ok := m.exePath(py)
+	if !ok {
+		return cerr(CodeNotInstalled, map[string]any{"id": IDPython}, fmt.Errorf("the python component's receipt names no usable interpreter (%q)", py.Exe))
+	}
 	lock, err := m.lockFile(ctx, t, it, b)
 	if err != nil {
 		return err
@@ -545,7 +569,7 @@ func (m *Manager) fetchSmall(ctx context.Context, spec fileSpec) (string, error)
 			if CodeOf(err) != CodeChecksum {
 				break
 			}
-			m.log.Warn("components: SHA-256 mismatch of a small file", "file", spec.Name, "url", u.URL, "attempt", attempt+1)
+			m.log.Warn("components: SHA-256 mismatch of a small file", "file", spec.Name, "url", redactURL(u.URL), "attempt", attempt+1)
 		}
 	}
 	return "", lastErr

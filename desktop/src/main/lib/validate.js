@@ -25,6 +25,8 @@ const LIMITS = Object.freeze({
   filters: 10,
   extensions: 30,
   extension: 16,
+  droppedPaths: 1000, // preload.js MAX_DROPPED
+  path: 32767, // the longest Windows path
 });
 
 function fail(msg) {
@@ -123,6 +125,19 @@ function validateOpenExternal(args) {
   return new URL(url).href;
 }
 
+/**
+ * validateDroppedPaths: the preload's lf:grant-dropped(paths), the paths
+ * webUtils gave for the files of a drop (T-SEC-08): a list of 1..1000
+ * non-empty strings.
+ */
+function validateDroppedPaths(args) {
+  checkArgCount(args, 1);
+  const paths = args[0];
+  if (!Array.isArray(paths) || paths.length === 0) fail('grantDropped: expected a non-empty list');
+  if (paths.length > LIMITS.droppedPaths) fail(`grantDropped: at most ${LIMITS.droppedPaths} paths`);
+  return paths.map((p, i) => checkString(p, `grantDropped[${i}]`, { min: 1, max: LIMITS.path }));
+}
+
 module.exports = {
   ValidationError,
   LIMITS,
@@ -131,4 +146,5 @@ module.exports = {
   validatePickFiles,
   validateNotify,
   validateOpenExternal,
+  validateDroppedPaths,
 };

@@ -4,6 +4,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,13 +26,29 @@ import (
 // API key: providers are shown with key_hint only (A5.2).
 
 // snapshotRefs counts, per provider id, the current lecture jobs whose
-// snapshot names it (one query for all providers).
+// snapshot names it (one query for all providers). The SQLite store counts
+// the summary, repair and translate jobs by raw snapshot in one GROUP BY
+// (db.JobReader, r7 perf: about 1 ms instead of 15 ms on a 400-lecture
+// library), and each distinct snapshot is parsed once; another store is
+// read in full, with the same counts.
 func (s *Server) snapshotRefs(ctx context.Context) (map[string]int, error) {
+	out := map[string]int{}
+	if jr, ok := s.st.(db.JobReader); ok {
+		bySnap, err := jr.LectureSnapshotCounts(ctx, model.StageSummary, model.StageRepair, model.StageTranslate)
+		if err != nil {
+			return nil, err
+		}
+		for raw, n := range bySnap {
+			if snap, ok := model.ParseLLMSnapshot(raw); ok {
+				out[snap.ProviderID] += n
+			}
+		}
+		return out, nil
+	}
 	jobs, err := s.st.ListCurrentJobsByStatus(ctx, allStatuses...)
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]int{}
 	for _, j := range jobs {
 		if j.Scope != model.ScopeLecture {
 			continue
@@ -57,7 +74,8 @@ func (s *Server) providerView(ctx context.Context, p model.Provider, refs map[st
 		SnapshotRefs: refs[p.ID],
 		Models:       []string{},
 		// thinking per role: DeepSeek and Anthropic only (settings.SupportsThinking)
-		SupportsThinking: settings.SupportsThinking(p),
+		SupportsThinking:   settings.SupportsThinking(p),
+		DefaultBatchClaude: settings.ClaudeBatch(p), // translate batch for a Claude model when the role leaves it empty
 		// cred-enc: "需要重新输入 key" (settings/keys.go)
 		KeyUnreadable:  s.set.KeyUnreadable(p.ID),
 		KeyErrorInfo:   s.set.KeyErrorInfo(p),
@@ -87,7 +105,42 @@ func (s *Server) providerView(ctx context.Context, p model.Provider, refs map[st
 		}
 		v.ModelsError, v.ModelsErrorInfo = pm.Error, pm.ErrorInfo
 	}
+	// T-PERF-03: the account limits the provider's answers reported (the
+	// llm client keeps them; a test's or legacy client may not)
+	if src, ok := s.llmc.(rateLimitSource); ok {
+		if l, ok := src.RateLimits(p.ID); ok {
+			v.RateLimits = RateLimitsView(l, p.MaxConcurrency, p.RPM)
+		}
+	}
 	return v
+}
+
+// rateLimitSource is the part of the llm client (*llm.HTTPClient) that
+// knows the limits its answers reported.
+type rateLimitSource interface {
+	RateLimits(providerID string) (llm.RateLimits, bool)
+}
+
+// RateLimitsView turns observed limits into the provider view's field for
+// the provider's current settings (nil when there is nothing to show).
+func RateLimitsView(l llm.RateLimits, maxConcurrency, rpm int) *ProviderRateLimits {
+	adv, ok := llm.AdviseLimits(l, maxConcurrency, rpm)
+	if !ok {
+		return nil
+	}
+	opt := func(v int64) *int64 {
+		if v <= 0 {
+			return nil
+		}
+		return &v
+	}
+	return &ProviderRateLimits{
+		Model: l.Model, RequestsPerMinute: l.Requests,
+		InputTokensPerMinute: opt(l.InputTokens), OutputTokensPerMinute: opt(l.OutputTokens), TokensPerMinute: opt(l.Tokens),
+		ObservedAt: l.ObservedAt.UTC().Format(time.RFC3339),
+		Advice: ProviderLimitAdvice{MaxConcurrency: adv.MaxConcurrency, RPM: adv.RPM, Below: adv.Below,
+			ConcurrencyBelow: adv.ConcurrencyBelow, RPMBelow: adv.RPMBelow, Measured: adv.Measured},
+	}
 }
 
 func (s *Server) providerViews(ctx context.Context) ([]ProviderView, error) {
@@ -126,6 +179,10 @@ func (s *Server) roleViews() []RoleView {
 			v.Temperature = *params.Temperature
 		}
 		v.Window = params.Window
+		v.MaxTokens = raw.MaxTokens // v3.2.x: as set, nil = automatic
+		if role == model.RoleTranslate {
+			v.Batch = raw.Batch
+		}
 		if _, err := s.set.RoleTarget(role); err != nil {
 			v.Error = err.Error()
 			// P14.3: the coded form (settings.role_not_configured,
@@ -241,13 +298,20 @@ func (s *Server) putASR(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, apiErr(http.StatusBadRequest, "request.bad_json", nil))
 		return
 	}
-	in := s.set.ASR()
 	var sw asrSwitches
-	if json.Unmarshal(body, &in) != nil || json.Unmarshal(body, &sw) != nil {
+	if json.Unmarshal(body, &sw) != nil {
 		s.fail(w, r, apiErr(http.StatusBadRequest, "request.bad_json", nil))
 		return
 	}
-	if err := s.set.SetASR(r.Context(), in); err != nil {
+	// r4 D9: merged into the settings as they are under the settings'
+	// write lock, so a concurrent PUT that changes another field keeps it.
+	err = s.set.UpdateASR(r.Context(), func(in *model.ASRSettings) error {
+		if json.Unmarshal(body, in) != nil {
+			return apiErr(http.StatusBadRequest, "request.bad_json", nil)
+		}
+		return nil
+	})
+	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -265,17 +329,30 @@ func (s *Server) putASR(w http.ResponseWriter, r *http.Request) {
 	s.respondSettings(w, r)
 }
 
-// PUT /api/settings/general GeneralSettings.
+// PUT /api/settings/general GeneralSettings. The body is merged into the
+// current settings (as PUT /api/settings/asr, lead ruling 15; v3.2.x): a
+// field the body leaves out keeps its value, so a page that does not know
+// auto_chapters and llm_idle_timeout_s cannot reset them; null sets one
+// back to its default (on, model.DefaultLLMIdleTimeoutS).
 func (s *Server) putGeneral(w http.ResponseWriter, r *http.Request) {
 	if !s.requireSettings(w) {
 		return
 	}
-	var in model.GeneralSettings
-	if err := decodeJSON(r, &in); err != nil {
-		s.fail(w, r, err)
+	// Read before the merge: the merge runs under the settings' write lock
+	// (r4 D9), which a slow client must not hold.
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		s.fail(w, r, apiErr(http.StatusBadRequest, "request.bad_json", nil))
 		return
 	}
-	if err := s.set.SetGeneral(r.Context(), in); err != nil {
+	err = s.set.UpdateGeneral(r.Context(), func(in *model.GeneralSettings) error {
+		// as decodeJSON: the first JSON value of the body
+		if json.NewDecoder(bytes.NewReader(body)).Decode(in) != nil {
+			return apiErr(http.StatusBadRequest, "request.bad_json", nil)
+		}
+		return nil
+	})
+	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -441,11 +518,28 @@ func (s *Server) probeProvider(w http.ResponseWriter, r *http.Request) {
 	if pm.Models == nil {
 		pm.Models = []string{}
 	}
-	if err := s.set.SetProbedModels(ctx, p.ID, pm); err != nil {
+	stored, err := s.set.SetProbedModelsFor(ctx, p, pm)
+	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			err = notFoundAs(err, "provider.not_found")
 		}
 		s.fail(w, r, err)
+		return
+	}
+	if !stored {
+		// r4 D3: the provider moved to another type, address or key while
+		// the probe ran; its result belongs to the old one and was dropped.
+		// Answer with what is stored now (the page shows the refreshed
+		// settings either way); the provider change already told the pages.
+		cur, _, cerr := s.set.ProbedModels(ctx, p.ID)
+		if cerr != nil {
+			s.fail(w, r, cerr)
+			return
+		}
+		if cur.Models == nil {
+			cur.Models = []string{}
+		}
+		writeJSON(w, http.StatusOK, ProviderModels{Models: cur.Models, ProbedAt: cur.ProbedAt, Error: cur.Error, ErrorInfo: cur.ErrorInfo})
 		return
 	}
 	s.hub.Changed("settings", "")

@@ -45,14 +45,198 @@ export function clear(el) {
 
 // Re-render while keeping keyboard focus on the element with the same
 // data-fkey, so background refreshes (SSE) do not throw the user's focus away.
+// A control that may be gone after the re-render (a row's "启动" becomes
+// "重试" or nothing once launched, 3.2.0 L14) names where the focus goes
+// then in data-fnext: fkeys separated by spaces, tried in order (the first
+// one present, enabled and shown wins). The fallbacks are for keyboard focus
+// only (R19): a control clicked with the mouse has the focus too, and moving
+// it to a segment would open that segment's card (:focus-within) under no
+// pointer.
+//
+// A control still there but disabled (the dashboard disables a button while
+// its request runs) cannot hold the focus, and none of the fallbacks takes
+// it either while the request runs (R21): each of them does something else
+// on Enter (opens a lecture, the review page, "新建课程"), and a key pressed
+// twice or held down would set it off. The focus waits on the page (body),
+// where Enter does nothing; the next re-render settles it: on the control
+// again once it is enabled (the request failed, a dialog was cancelled), or
+// on its fallbacks once it is gone (done). Focus moved elsewhere meanwhile
+// ends the wait, as soon as it moves (a focusin watch, R22): anywhere but
+// into another dialog (a confirmation the action asks for). A move within
+// the dialog the control itself is in (a wizard's next step) ends it too.
+//
+// A control in a popover that shows only while the focus is in it (a stage
+// card, :focus-within; data-fopener on the popover) is drawn anew hidden:
+// with keyboard focus it takes the focus through the popover's opener (the
+// segment), as a dialog gives it back (giveBack; R79 M2). A popover built
+// only when it opens (pipeline.js lazyCards) has the control once its
+// opener has the focus.
+let waitingFor = null; // {key, next, dlg, kb, pop} of the control disabled in place
+
+const findKey = (k) => document.querySelector(`[data-fkey="${CSS.escape(k)}"]`);
+
 export function preserveFocus(fn) {
   const a = document.activeElement;
-  const key = a && a.dataset ? a.dataset.fkey : null;
+  const wait = waiting(a);
+  const key = wait ? wait.key : a && a.dataset ? a.dataset.fkey : null;
+  const next = wait ? wait.next : key && a.dataset.fnext && keyboardFocused(a) ? a.dataset.fnext.split(' ').filter(Boolean) : [];
+  // keyboard focus (R19): only then does a popover's opener take it (pop: its fkey)
+  const kb = wait ? wait.kb : !!key && keyboardFocused(a);
+  const pop = wait ? wait.pop : key ? popoverOpener(a) : null;
   fn();
-  if (key) {
-    const el = document.querySelector(`[data-fkey="${CSS.escape(key)}"]`);
-    if (el && el !== document.activeElement) el.focus({ preventScroll: true });
+  // the view moved the focus itself while it re-rendered (focusin ended
+  // the wait): the focus is where the view put it (R29)
+  if (wait && waitingFor !== wait) return;
+  if (!key) return;
+  const same = findAgain(key, pop, kb);
+  if (same && same.disabled) {
+    startWaiting(key, next, same, kb, pop);
+    // The control drawn anew leaves the focus on the page. A browser does
+    // this itself once the focused element is removed (activeElement is then
+    // body already); this is for a DOM stand-in, which keeps the removed node
+    // as activeElement.
+    const cur = document.activeElement;
+    if (cur && cur !== same && !cur.isConnected && typeof cur.blur === 'function') cur.blur();
+    return;
   }
+  if (wait) waitingFor = null;
+  let el = same && !same.disabled ? same : null;
+  for (let i = 0; !el && i < next.length; i++) {
+    const c = findKey(next[i]);
+    if (c && !c.disabled && shown(c)) el = c;
+  }
+  if (el && el !== document.activeElement) {
+    el.focus({ preventScroll: true });
+    throughOpener(el, kb);
+  }
+}
+
+// kb, pop: how the control had the focus and its popover's opener, for
+// when it is enabled again (preserveFocus)
+function startWaiting(key, next, same, kb = false, pop = null) {
+  waitingFor = { key, next, dlg: dialogOf(same) };
+  Object.assign(waitingFor, { kb, pop });
+  watchFocus();
+}
+
+// ---- a control in a popover (preserveFocus, giveBack) ----
+
+// The fkey of the always-shown opener of the popover el is in (its
+// data-fopener), or null. el may be off the page (drawn anew): its old
+// popover still holds it.
+function popoverOpener(el) {
+  for (let n = el ? el.parentNode : null; n && n.dataset; n = n.parentNode) if (n.dataset.fopener) return n.dataset.fopener;
+  return null;
+}
+
+// The control with fkey key after a redraw. One in a popover built only
+// when it opens is not there yet: with keyboard focus, the popover's opener
+// (pop: its fkey) takes the focus, which opens and builds it, and the
+// control is looked for again. Found disabled (its request runs), the
+// opener does not keep the focus: it waits on the page (R21).
+function findAgain(key, pop, kb) {
+  const el = findKey(key);
+  if (el || !kb || !pop) return el;
+  const o = findKey(pop);
+  if (!o || o.disabled || !shown(o)) return null;
+  o.focus({ preventScroll: true });
+  const again = findKey(key);
+  if (again && again.disabled && document.activeElement === o && typeof o.blur === 'function') o.blur();
+  return again;
+}
+
+// After el.focus(): a control in a popover hidden while the focus is
+// outside it did not take the focus. With keyboard focus its opener takes
+// it first, which shows the popover again, then the control; the focus
+// stays on the opener if the control still cannot take it. A mouse click's
+// focus is not moved there (R19: the card would stay open under no pointer).
+function throughOpener(el, kb) {
+  if (document.activeElement === el || !kb) return;
+  const opener = openerOf(el);
+  if (!opener) return;
+  opener.focus({ preventScroll: true });
+  el.focus({ preventScroll: true });
+}
+
+// The control the focus waits for, when the focus is still where the wait
+// left it (the page, or that control); focus taken elsewhere ends the wait,
+// except into another dialog (a confirmation the action asks for, R22: not
+// the dialog the control is in).
+function waiting(a) {
+  const w = waitingFor;
+  if (!w) return null;
+  // the dialog the control was in is closed: nothing to wait for (R29)
+  if (w.dlg && !w.dlg.isConnected) {
+    waitingFor = null;
+    return null;
+  }
+  if (!a || a === document.body || a === document.documentElement || (a.dataset && a.dataset.fkey === w.key)) return w;
+  const d = dialogOf(a);
+  if (!d || d === w.dlg) waitingFor = null;
+  return null;
+}
+
+// One focusin watch for every wait, added with the first: focus moved by the
+// user (or a view) ends the wait right away, so a later return to the page
+// (a click on its background) does not bring it back to life (R22).
+let focusWatched = false;
+function watchFocus() {
+  if (focusWatched || typeof document.addEventListener !== 'function') return;
+  focusWatched = true;
+  document.addEventListener(
+    'focusin',
+    (e) => {
+      if (waitingFor) waiting(e.target);
+    },
+    true,
+  );
+  // A press with the pointer anywhere but in another dialog (a
+  // confirmation, its backdrop) ends the wait too, also on what takes no
+  // focus (text, the page's background), where no focusin comes: the
+  // control enabled much later (a request that hangs, a review page waiting
+  // to be reviewable) must not take the focus unseen (R29). Not waiting():
+  // that counts a target of body as the focus still in place.
+  document.addEventListener(
+    'pointerdown',
+    (e) => {
+      const w = waitingFor;
+      if (!w) return;
+      const d = dialogOf(e.target);
+      if (!d || d === w.dlg) waitingFor = null;
+    },
+    true,
+  );
+}
+
+function dialogOf(el) {
+  for (let n = el; n; n = n.parentNode) if (n.tagName === 'DIALOG') return n;
+  return null;
+}
+
+// Whether a fallback can take the focus: not hidden, and laid out (no
+// display:none on it or above it). A stand-in without layout counts as shown.
+function shown(el) {
+  if (el.hidden) return false;
+  return typeof el.getClientRects !== 'function' || el.getClientRects().length > 0;
+}
+
+// Whether el has the focus from the keyboard (:focus-visible). A browser
+// (or a test's stand-in) that cannot tell counts as keyboard, the safe side
+// for keyboard users.
+function keyboardFocused(el) {
+  try {
+    return typeof el.matches !== 'function' || el.matches(':focus-visible');
+  } catch {
+    return true;
+  }
+}
+
+// dataset of a control: its focus key and where the focus goes when it is
+// gone after a re-render (preserveFocus)
+function focusData(o) {
+  if (!o.fkey) return undefined;
+  const next = Array.isArray(o.fnext) ? o.fnext.join(' ') : o.fnext;
+  return next ? { fkey: o.fkey, fnext: next } : { fkey: o.fkey };
 }
 
 // ---- texts that change by the second (3.2.0 L12) ----
@@ -119,7 +303,7 @@ export function btn(label, o = {}) {
       title: o.title,
       disabled: o.disabled,
       'aria-label': o.ariaLabel,
-      dataset: o.fkey ? { fkey: o.fkey } : undefined,
+      dataset: focusData(o),
       onclick: o.onclick,
     },
     o.icon ? icon(o.icon, { size: o.size === 'sm' ? 14 : 16 }) : null,
@@ -139,7 +323,7 @@ export function iconBtn(name, label, o = {}) {
       title: o.title || label,
       'aria-haspopup': o.menu ? 'menu' : undefined,
       'aria-pressed': o.pressed == null ? undefined : String(!!o.pressed),
-      dataset: o.fkey ? { fkey: o.fkey } : undefined,
+      dataset: focusData(o),
       onclick: o.onclick,
     },
     icon(name, { size: o.size || 16 }),
@@ -168,18 +352,38 @@ export function errorBlock(message, onRetry) {
 
 // ---- toasts (SPEC §9.8) ----
 // info / success / warn disappear after 4 seconds; error stays until closed.
+// opts.sticky === true (round 8 interface F1): a toast of any kind stays
+// until closed, for a text too long to read in 4 seconds; it keeps its close
+// button, merging, role and kind. A toast once shown sticky stays sticky when
+// the same text is merged into it (and a sticky text merged into a fading
+// toast stops its fading). Without opts a toast behaves as before.
+// A text told again is news: its toast, counted, becomes the newest (the
+// last), as the page shows only the newest few (style.css, round 9 WH-04);
+// merged in place into one hidden behind newer ones, a new failure was
+// neither seen nor read out (R90 M1). Moved, it is added to the live region
+// (#toasts, aria-live) again and read out; a focus inside it (its close
+// button) stays there.
 
 const TOAST_ICONS = { info: 'circle-alert', success: 'circle-check', warn: 'triangle-alert', error: 'circle-alert' };
 
-export function toast(message, kind = 'info') {
+export function toast(message, kind = 'info', opts = {}) {
   const root = document.getElementById('toasts');
   if (!root || !message) return;
+  const sticky = !!opts && opts.sticky === true;
   for (const el of root.children) {
     if (el.dataset.msg === message && el.dataset.kind === kind) {
       const n = Number(el.dataset.count || 1) + 1;
       el.dataset.count = String(n);
       el.querySelector('.toast-count').textContent = `×${n}`;
-      if (kind !== 'error') armToast(el);
+      if (sticky) el._sticky = true;
+      if (el._sticky) clearTimeout(el._timer);
+      else if (kind !== 'error') armToast(el);
+      if (el !== root.children[root.children.length - 1]) {
+        const a = document.activeElement;
+        const inside = !!a && a !== el && el.contains(a);
+        root.append(el);
+        if (inside && a.isConnected && document.activeElement !== a) a.focus({ preventScroll: true });
+      }
       return;
     }
   }
@@ -192,7 +396,8 @@ export function toast(message, kind = 'info') {
     h('button', { type: 'button', class: 'toast-close', 'aria-label': t('common.toast_close'), title: t('common.close'), onclick: () => el.remove() }, icon('x', { size: 14 })),
   );
   root.append(el);
-  if (kind !== 'error') armToast(el);
+  if (sticky) el._sticky = true;
+  else if (kind !== 'error') armToast(el);
 }
 
 function armToast(el) {
@@ -202,11 +407,80 @@ function armToast(el) {
 
 // ---- dialogs (native <dialog>: focus trap and Esc for free) ----
 
-// openDialog(title, build(close) → Node, {wide, className}) → Promise of the
-// value passed to close (null on Esc / cancel).
+// The dialogs openDialog has open, each with the route (location.hash) it
+// was opened on (G3).
+const openDialogs = new Set();
+
+// G3 (T16, T18): a route change (the navigation, the browser's back and
+// forward) closes the dialogs opened on another route, as cancelled; app.js
+// calls it on every route. A dialog opened on the new route stays: one that
+// an action opens together with its navigation. A dialog whose request runs
+// (busy) leaves the page at once; the request goes on, and the dialog
+// resolves with its answer (close(v)), or as cancelled once it ended without
+// one. No focus is given back here: the view of the new route is not drawn
+// yet. → {closed: how many, opener: the control that opened the first of
+// them, or null, restore(fallback)}. restore, for a view that stays (its
+// update() ran): when the focus is still on the page's body (or on a
+// removed node), it goes back to the opener as a closed dialog gives it
+// back (giveBack: found again by its data-fkey when redrawn), else to
+// fallback (R62 N3); a focus the view placed itself is left alone.
+export function closeDialogsOnRoute() {
+  const gone = [...openDialogs].filter((d) => d.hash !== location.hash);
+  for (const d of [...gone].reverse()) d.leave();
+  const first = gone[0] || null;
+  const restore = (fallback) => {
+    if (!first || !focusLost()) return;
+    giveBack(first.prev, first.kb);
+    if (focusLost() && fallback && typeof fallback.focus === 'function') fallback.focus({ preventScroll: true });
+  };
+  return { closed: gone.length, opener: first ? first.prev : null, restore };
+}
+
+// The focus is on the page's body, or on a node no longer in the page.
+function focusLost() {
+  const a = document.activeElement;
+  return !a || a === document.body || !a.isConnected;
+}
+
+// A modal that is no openDialog (wizard.js: the wizard and the syllabus
+// editor ask before they drop unsaved work, so a route change leaves them
+// open) hands the focus back by the same rules (T21 M4). focusOpener() when
+// it opens → back(fallback), to call once it is closed: the opener in place
+// takes the focus without scrolling; one redrawn meanwhile (the navigation
+// on every route, a view on a refresh) is found again as after a dialog
+// (giveBack: data-fkey, data-fnext); and when the route changed and nothing
+// took the focus (the opener went with its page), fallback does (the view),
+// as in closeDialogsOnRoute().restore.
+export function focusOpener() {
+  const prev = document.activeElement;
+  const kb = !!prev && prev !== document.body && keyboardFocused(prev);
+  const hash = location.hash;
+  return (fallback) => {
+    if (prev && prev.isConnected && !prev.disabled && typeof prev.focus === 'function') prev.focus({ preventScroll: true });
+    if (document.activeElement !== prev) giveBack(prev, kb);
+    if (location.hash !== hash && focusLost() && fallback && typeof fallback.focus === 'function') fallback.focus({ preventScroll: true });
+  };
+}
+
+// openDialog(title, build(close, busy) → Node, {wide, className, route})
+// → Promise of the value passed to close (null on Esc / cancel, or when a
+// route change closed it). busy(promise) → the promise: a request the dialog
+// sends, which a route change lets finish (closeDialogsOnRoute); when it
+// fails with the dialog off the page (a route change, or closed by the
+// user meanwhile), its error is toasted (tellFailure). route:
+// false for a dialog that belongs to no page and stays across a route
+// change (R62 N1: the uploads' "which file to keep", whose cancel means
+// "none" while the flow goes on). confirmCancel (round 9 F1): () → boolean
+// or a promise of one, asked only when Esc or a click on the backdrop would
+// cancel the dialog; false keeps it open with the focus on the control it
+// was on, true closes it as without it (null). While it answers, Esc and
+// the backdrop do nothing more. Not asked: the dialog's own close(v) (its
+// "cancel" button decides itself whether to ask), a route change (leave),
+// a request in flight (busy, as before). Without it: as before.
 export function openDialog(title, build, opts = {}) {
   return new Promise((resolve) => {
     const prev = document.activeElement;
+    const kb = !!prev && prev !== document.body && keyboardFocused(prev);
     const dlg = h('dialog', { class: 'dlg' + (opts.wide ? ' dlg-wide' : '') + (opts.className ? ' ' + opts.className : ''), 'aria-label': title });
     // Toasts outside a modal sit behind its backdrop (inert, blurred): while
     // the dialog is open it hosts them, then they go back to where they were
@@ -214,30 +488,192 @@ export function openDialog(title, build, opts = {}) {
     const toasts = document.getElementById('toasts');
     const home = toasts && toasts.parentNode;
     let done = false;
+    let left = false; // closed by a route change while busy: off the page, not resolved yet
+    let pending = 0;
+    const entry = { hash: location.hash, prev, kb, leave: () => leave() };
+    const takeDown = () => {
+      openDialogs.delete(entry);
+      if (toasts && toasts.parentNode === dlg) (home && home.isConnected ? home : document.body).append(toasts);
+      if (dlg.open) dlg.close();
+      dlg.remove();
+    };
     const close = (v) => {
       if (done) return;
       done = true;
-      if (toasts && toasts.parentNode === dlg) (home && home.isConnected ? home : document.body).append(toasts);
-      dlg.close();
-      dlg.remove();
-      if (prev && prev.isConnected && prev.focus) prev.focus();
+      const wasLeft = left;
+      takeDown();
+      if (!wasLeft) giveBack(prev, kb);
       resolve(v);
+    };
+    const leave = () => {
+      if (done || left) return;
+      if (!pending) {
+        done = true;
+        takeDown();
+        resolve(null);
+        return;
+      }
+      left = true;
+      takeDown();
+    };
+    const busy = (p) => {
+      pending++;
+      const end = () => {
+        pending--;
+        // after the dialog's own handling of the answer (close(v)) ran
+        if (left && !pending) setTimeout(() => close(null), 0);
+      };
+      // R62 N5: the dialog shows the error of its request itself; off the
+      // page it cannot, and the error is told as a toast. Off the page: a
+      // route change took it there, or the user closed it while the
+      // request ran (Esc, the backdrop, "cancel": R68). This runs before
+      // the dialog's own handling of the error, so `done` is a close from
+      // before the request ended.
+      const failed = (err) => {
+        if (left || done) tellFailure(err);
+        end();
+      };
+      Promise.resolve(p).then(end, failed);
+      return p;
+    };
+    // opts.confirmCancel asked before Esc or the backdrop cancels (F1); one
+    // question at a time
+    let asking = false;
+    const askCancel = () => {
+      if (done || left || asking) return;
+      const was = document.activeElement;
+      const answer = (ok) => {
+        asking = false;
+        if (done || left) return;
+        if (ok) close(null);
+        // kept open: the focus stays on (or goes back to) the control it was on
+        else if (was && was !== document.activeElement && was.isConnected && dlg.contains(was) && typeof was.focus === 'function') was.focus({ preventScroll: true });
+      };
+      asking = true;
+      let r;
+      try {
+        r = opts.confirmCancel();
+      } catch (err) {
+        asking = false;
+        throw err;
+      }
+      // a promise that fails keeps the dialog open
+      if (r && typeof r.then === 'function') Promise.resolve(r).then(answer, () => answer(false));
+      else answer(r);
     };
     dlg.addEventListener('cancel', (e) => {
       e.preventDefault();
-      close(null);
+      // e.cancelable false: the browser closes it anyway (no user
+      // activation since the last Esc), so it closes as without the question
+      if (typeof opts.confirmCancel !== 'function' || e.cancelable === false) close(null);
+      else askCancel();
     });
     // a click on the backdrop (outside the dialog box) cancels
     dlg.addEventListener('mousedown', (e) => {
       if (e.target !== dlg) return;
       const r = dlg.getBoundingClientRect();
-      if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) close(null);
+      if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) {
+        if (typeof opts.confirmCancel !== 'function') close(null);
+        else {
+          // the focus stays on the control it is on while the question runs
+          e.preventDefault();
+          askCancel();
+        }
+      }
     });
-    dlg.append(h('h2', { class: 'dlg-title', text: title }), build(close));
+    dlg.append(h('h2', { class: 'dlg-title', text: title }), build(close, busy));
     document.body.append(dlg);
     dlg.showModal();
+    if (opts.route !== false) openDialogs.add(entry);
     if (toasts) dlg.append(toasts);
   });
+}
+
+// The error of a request whose dialog left the page while it ran (busy),
+// as an error toast, which stays until closed: the user is elsewhere by
+// now. Not an error the API layer told already (a request not sent
+// quiet: err.reported, api.js), nor a request that was aborted.
+// A network failure (status 0) while the "connection lost" banner of the
+// page shows (index.html #conn-banner) is told as the app tells a request
+// then (app.js onRequestError, T24 G6; R76 L-4; r8-web-dash WD-09): an
+// action's (a write, or a request of no known method) gets a short warning
+// that it did not happen, the same text, so however many fail it is one
+// toast, counted; a read's (err.method GET or HEAD, api.js) none: the
+// banner says that the connection is gone and the page what it lacks.
+function tellFailure(err) {
+  if (!err || err.reported || err.name === 'AbortError' || err.status === -1) return;
+  if (err.status === 0 && connectionBannerShown()) {
+    if (err.method !== 'GET' && err.method !== 'HEAD') toast(t('nav.conn_lost_action'), 'warn');
+    return;
+  }
+  toast(err.message || t('common.unknown_error'), 'error');
+}
+
+function connectionBannerShown() {
+  const b = document.getElementById('conn-banner');
+  return !!b && !b.hidden;
+}
+
+// The focus back to the control that opened a dialog (T6 #1).
+// - Redrawn while the dialog was open (a refresh): the control with its
+//   data-fkey takes it; gone, its data-fnext fallbacks (keyboard focus
+//   only, as in preserveFocus); still there but disabled (its request runs):
+//   the focus waits for it on the page, as in preserveFocus.
+// - A control in a popover that shows only while the focus is in it or the
+//   pointer over it (a stage card, :hover / :focus-within) is hidden once the
+//   dialog has the focus, and focus() on it does nothing. With keyboard
+//   focus, the popover's opener (data-fopener on the popover: the fkey of a
+//   control next to it that is always shown, the stage's segment) takes the
+//   focus first, which shows the popover again, then the control; the focus
+//   stays on the opener if the control still cannot take it. A mouse
+//   click's focus is not moved there (R19: the card would stay open under
+//   no pointer).
+function giveBack(prev, kb) {
+  if (!prev || typeof prev.focus !== 'function') return;
+  let el = prev;
+  const redrawn = !prev.isConnected;
+  const pop = popoverOpener(prev);
+  if (prev.isConnected && prev.disabled && prev.dataset && prev.dataset.fkey) {
+    // disabled in place while the dialog was open (its request runs): the
+    // focus waits for it, as for a control drawn anew disabled (R29)
+    startWaiting(prev.dataset.fkey, kb && prev.dataset.fnext ? prev.dataset.fnext.split(' ').filter(Boolean) : [], prev, kb, pop);
+    return;
+  }
+  if (redrawn) {
+    const key = prev.dataset ? prev.dataset.fkey : null;
+    if (!key) return;
+    el = findAgain(key, pop, kb);
+    if (el && el.disabled) {
+      startWaiting(key, kb && prev.dataset.fnext ? prev.dataset.fnext.split(' ').filter(Boolean) : [], el, kb, pop);
+      return;
+    }
+    if (!el && kb && prev.dataset.fnext) {
+      for (const k of prev.dataset.fnext.split(' ').filter(Boolean)) {
+        const c = findKey(k);
+        if (c && !c.disabled && shown(c)) {
+          el = c;
+          break;
+        }
+      }
+    }
+    if (!el) return;
+  }
+  // a control found anew is where the old one was, or elsewhere (a
+  // fallback): no scrolling, as in preserveFocus; one in a hidden popover
+  // through its opener
+  el.focus(redrawn ? { preventScroll: true } : undefined);
+  throughOpener(el, kb);
+}
+
+// The always-shown control a popover around el names (data-fopener), or null.
+function openerOf(el) {
+  for (let n = el.parentNode; n && n.dataset; n = n.parentNode) {
+    if (!n.dataset.fopener) continue;
+    const scope = n.parentNode && typeof n.parentNode.querySelector === 'function' ? n.parentNode : document;
+    const o = scope.querySelector(`[data-fkey="${CSS.escape(n.dataset.fopener)}"]`);
+    return o && o !== el && !o.disabled ? o : null;
+  }
+  return null;
 }
 
 // focusCancel: the cancel button has the initial focus (always for danger;
@@ -288,16 +724,21 @@ export function inputDialog({ title, label, value = '', okText = t('common.ok'),
 
 // Radio choice; resolves to the chosen value or null. A choice may be
 // {disabled: true, hint} (shown, not selectable); `initial` preselects.
-export function choiceDialog({ title, message, choices, okText = t('common.ok'), cancelText = t('common.cancel'), initial = null, body = null }) {
+export function choiceDialog({ title, message, choices, okText = t('common.ok'), cancelText = t('common.cancel'), initial = null, body = null, route = true }) {
   return openDialog(title, (close) => {
     const name = 'c' + Math.random().toString(36).slice(2);
+    // the choices are named by the question (the message), else the title (T6 #10)
+    const msgId = `${name}-q`;
     const first = initial != null ? choices.findIndex((c) => c.value === initial && !c.disabled) : -1;
+    // the focus starts on the preselected choice, else on the first one
+    // that can be chosen, else (none can: R6) on cancel
+    const focusAt = first >= 0 ? first : choices.findIndex((c) => !c.disabled);
     const ok = h('button', { type: 'submit', class: 'btn btn-primary', disabled: first < 0 }, okText);
     const radios = choices.map((c, i) =>
       h(
         'label',
         { class: 'dlg-choice' + (c.disabled ? ' is-disabled' : '') },
-        h('input', { type: 'radio', name, value: String(i), checked: i === first, disabled: c.disabled, autofocus: i === (first < 0 ? 0 : first), onchange: () => (ok.disabled = false) }),
+        h('input', { type: 'radio', name, value: String(i), checked: i === first, disabled: c.disabled, autofocus: i === focusAt, onchange: () => (ok.disabled = false) }),
         h('span', { class: 'dlg-choice-text' }, h('span', { class: 'dlg-choice-label' }, c.label), c.hint ? h('span', { class: 'dlg-choice-hint' }, c.hint) : null),
       ),
     );
@@ -310,12 +751,12 @@ export function choiceDialog({ title, message, choices, okText = t('common.ok'),
           if (sel) close(choices[Number(sel.value)].value);
         },
       },
-      message ? h('p', { class: 'dlg-msg', text: message }) : null,
+      message ? h('p', { class: 'dlg-msg', id: msgId, text: message }) : null,
       body,
-      h('div', { class: 'dlg-choices', role: 'radiogroup' }, radios),
-      h('div', { class: 'dlg-actions' }, h('button', { type: 'button', class: 'btn', onclick: () => close(null) }, cancelText), ok),
+      h('div', { class: 'dlg-choices', role: 'radiogroup', 'aria-labelledby': message ? msgId : null, 'aria-label': message ? null : title }, radios),
+      h('div', { class: 'dlg-actions' }, h('button', { type: 'button', class: 'btn', autofocus: focusAt < 0, onclick: () => close(null) }, cancelText), ok),
     );
-  });
+  }, { route });
 }
 
 // A row of buttons; resolves to the clicked action's value or null.

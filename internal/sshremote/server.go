@@ -210,7 +210,7 @@ func (s *Server) setState(state string, err error) {
 	s.state = state
 	if err != nil {
 		_, code, _ := connError(err)
-		s.lastErr = &remote.CardError{Code: code, Params: map[string]any{"device": s.rec.Name}, At: s.m.now().UTC()}
+		s.lastErr = &remote.CardError{Code: code, Params: connErrParams(s.rec.Name, err), At: s.m.now().UTC()}
 	} else if state == StateReady {
 		s.lastErr = nil
 	}
@@ -227,7 +227,7 @@ func (s *Server) target(ctx context.Context) (target, error) {
 	s.mu.Lock()
 	rec := s.rec
 	s.mu.Unlock()
-	signer, err := loadSigner(ctx, s.m.o.Store, rec.KeyRef)
+	signer, err := loadSigner(ctx, s.m.o.Store, rec.ID, rec.KeyRef)
 	if err != nil {
 		return target{}, err
 	}
@@ -280,7 +280,7 @@ func (s *Server) session(ctx context.Context, install bool) (*conn, *control, er
 			state = StateOffline
 		}
 		s.setState(state, err)
-		slog.Info("ssh server: not ready", "device", s.devID, "state", state, "err", err)
+		slog.Info("ssh server: not ready", "device", s.devID, "state", state, "code", ConnErrorCode(err), "class", ErrorClass(err))
 		return nil, nil, err
 	}
 	s.mu.Lock()
@@ -340,7 +340,7 @@ func (s *Server) open(ctx context.Context, install bool) (*conn, *control, error
 	}
 	build, err := findAgent(s.m.o.AgentDir, platform)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", errAgent, err)
+		return nil, nil, fmt.Errorf("%w: %w", errAgent, err) // errAgentMissing stays visible to connError
 	}
 	ver, current, err := agentVersion(ctx, c, platform, build)
 	if err != nil {

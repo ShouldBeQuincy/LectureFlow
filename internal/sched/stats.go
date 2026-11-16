@@ -6,6 +6,9 @@ package sched
 import (
 	"context"
 	"log/slog"
+	"slices"
+	"sync"
+	"time"
 
 	"lectureflow/internal/model"
 )
@@ -34,6 +37,7 @@ func (r *run) AddUsage(promptTokens, completionTokens, cacheHitTokens int64) {
 
 // addUsage adds one response's tokens, Requests+1 and, when priced, its cost.
 func (r *run) addUsage(promptTokens, completionTokens, cacheHitTokens int64, cost float64, priced bool) {
+	now := r.clock()
 	r.smu.Lock()
 	r.stats.PromptTokens += promptTokens
 	r.stats.CompletionTokens += completionTokens
@@ -43,6 +47,7 @@ func (r *run) addUsage(promptTokens, completionTokens, cacheHitTokens int64, cos
 		r.stats.EstimatedCost += cost
 	}
 	r.statsDirty = true
+	r.touchLocked(now)
 	r.smu.Unlock()
 }
 
@@ -63,16 +68,36 @@ func ReportUsageCost(ctx context.Context, promptTokens, completionTokens, cacheH
 }
 
 // Update implements StatsSink: mutates non-token fields of the in-memory
-// stats. Token counters and the estimated cost are owned by AddUsage; changes
-// fn makes to them are discarded.
+// stats. Token counters and the estimated cost are owned by AddUsage, the
+// request details and the last activity (v3.2.x P1-c: stats.llm,
+// stats.last_activity_at) by ReportRequest and the run itself, the models of
+// a lecture's translations (stats.mixed_models, v3.2.x P1-b) by state;
+// changes fn makes to them are discarded. fn gets its own copy of stats.llm, so it
+// cannot reach the scheduler's through the pointer either.
 func (r *run) Update(fn func(*model.JobStats)) {
+	now := r.clock()
 	r.smu.Lock()
 	defer r.smu.Unlock()
-	tokens := r.stats
+	owned := r.stats
+	if owned.LLM != nil {
+		c := *owned.LLM
+		c.Attempts = append([]model.LLMAttempt(nil), c.Attempts...)
+		if c.Current != nil {
+			cur := *c.Current
+			c.Current = &cur
+		}
+		r.stats.LLM = &c
+	}
+	r.stats.MixedModels = slices.Clone(owned.MixedModels)
 	fn(&r.stats)
-	r.stats.PromptTokens, r.stats.CompletionTokens, r.stats.CacheHitTokens = tokens.PromptTokens, tokens.CompletionTokens, tokens.CacheHitTokens
-	r.stats.Requests, r.stats.EstimatedCost = tokens.Requests, tokens.EstimatedCost
+	r.stats.PromptTokens, r.stats.CompletionTokens, r.stats.CacheHitTokens = owned.PromptTokens, owned.CompletionTokens, owned.CacheHitTokens
+	r.stats.Requests, r.stats.EstimatedCost = owned.Requests, owned.EstimatedCost
+	r.stats.LLM, r.stats.LastActivityAt = owned.LLM, owned.LastActivityAt
+	// v3.2.x P1-b: the models of the lecture's translations are recorded by
+	// state (sentence retranslation, incremental runs), not by the stage.
+	r.stats.MixedModels = owned.MixedModels
 	r.statsDirty = true
+	r.touchLocked(now)
 }
 
 func (r *run) statsSnapshot() (model.JobStats, bool) {
@@ -86,18 +111,117 @@ func (r *run) statsSnapshot() (model.JobStats, bool) {
 // persistStatsLocked writes the in-memory stats (after applying final, if
 // non-nil). Returns the stats it wrote. Caller holds r.wmu.
 func (s *Scheduler) persistStatsLocked(ctx context.Context, r *run, final func(*model.JobStats)) model.JobStats {
+	st, _ := s.persistStats(ctx, r, final)
+	return st
+}
+
+// persistStats is persistStatsLocked that also reports whether the stats
+// had changed since the last call (and so were written, or will be tried
+// again). Caller holds r.wmu.
+func (s *Scheduler) persistStats(ctx context.Context, r *run, final func(*model.JobStats)) (model.JobStats, bool) {
 	st, dirty := r.statsSnapshot()
 	if final != nil {
 		final(&st)
 		dirty = true
 	}
 	if dirty {
-		if err := s.st.SetJobStats(ctx, r.job.ID, st); err != nil {
-			slog.Warn("job stats", "job", r.job.ID, "err", err)
+		err := s.st.SetJobStats(ctx, r.job.ID, st)
+		statsWriteResult(r, err, final != nil)
+		if err != nil {
 			r.smu.Lock()
 			r.statsDirty = true // try again on the next flush
 			r.smu.Unlock()
 		}
 	}
-	return st
+	return st, dirty
+}
+
+// statsWarnEvery is how often a write of a running job's stats or progress
+// that keeps failing for the same reason is logged again (review R2 item 9:
+// the flusher tries every flush interval, 500 ms, and used to log every
+// failure).
+const statsWarnEvery = time.Minute
+
+// writeLog names the log lines of one kind of flusher write.
+type writeLog struct {
+	fail, again string // the WARN of a failure; the INFO of a success after unlogged failures
+	suffix      string // of the statsWarns key: "" for the stats (the job id alone)
+}
+
+var (
+	statsWriteLog    = writeLog{fail: "job stats", again: "job stats written again"}
+	progressWriteLog = writeLog{fail: "progress write", again: "progress written again", suffix: "/progress"}
+)
+
+// statsWarns holds, by job id (plus the writeLog's suffix), the write
+// failures of a run that are being counted instead of logged. An entry goes
+// when a write succeeds, with the run's last stats write (finish), or for
+// the progress when the run finishes (endProgressWriteLog), so it does not
+// outlive the run.
+var statsWarns = struct {
+	mu sync.Mutex
+	m  map[string]*statsWarn
+}{m: map[string]*statsWarn{}}
+
+type statsWarn struct {
+	reason string    // err.Error() of the last logged failure
+	logged time.Time // when it was logged (the run's clock)
+	quiet  int       // failures since then that were not logged
+}
+
+// statsWriteResult logs the outcome of a stats write (writeResult).
+func statsWriteResult(r *run, err error, last bool) { writeResult(r, statsWriteLog, err, last) }
+
+// writeResult logs the outcome of a flusher write with restraint: the
+// first failure, a failure for another reason, or one at least
+// statsWarnEvery after the last logged one is logged with the number of
+// failures not logged since ("unlogged"); the others are only counted. A
+// success after unlogged failures says how many there were. The run's last
+// write (last) logs a failure always and ends the count.
+func writeResult(r *run, wl writeLog, err error, last bool) {
+	id := r.job.ID
+	key := id + wl.suffix
+	statsWarns.mu.Lock()
+	defer statsWarns.mu.Unlock()
+	w := statsWarns.m[key]
+	if err == nil {
+		if w != nil {
+			if w.quiet > 0 {
+				slog.Info(wl.again, "job", id, "unlogged_failures", w.quiet)
+			}
+			delete(statsWarns.m, key)
+		}
+		return
+	}
+	now := r.clock()
+	reason := err.Error()
+	switch {
+	case w == nil:
+		slog.Warn(wl.fail, "job", id, "err", err)
+	case last || w.reason != reason || now.Sub(w.logged) >= statsWarnEvery:
+		slog.Warn(wl.fail, "job", id, "err", err, "unlogged", w.quiet)
+	default:
+		w.quiet++
+		return
+	}
+	if last {
+		delete(statsWarns.m, key)
+		return
+	}
+	statsWarns.m[key] = &statsWarn{reason: reason, logged: now}
+}
+
+// endProgressWriteLog ends the count of r's progress write failures when
+// the run finishes (no progress write comes after the flusher's): failures
+// not logged yet are told with their number.
+func endProgressWriteLog(r *run) {
+	key := r.job.ID + progressWriteLog.suffix
+	statsWarns.mu.Lock()
+	defer statsWarns.mu.Unlock()
+	if w := statsWarns.m[key]; w != nil {
+		if w.quiet > 0 {
+			slog.Warn(progressWriteLog.fail, "job", r.job.ID, "err", w.reason, "unlogged", w.quiet, "run_finished", true)
+		}
+		delete(statsWarns.m, key)
+	}
 }

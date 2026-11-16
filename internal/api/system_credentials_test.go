@@ -6,12 +6,14 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 
+	"lectureflow/internal/db"
 	"lectureflow/internal/secrets"
 	"lectureflow/internal/settings"
 )
@@ -113,7 +115,9 @@ func TestCredentialsRowUnreadableAndProviderView(t *testing.T) {
 	st := secrets.Status{Protection: secrets.ProtectionDPAPI, KeyFile: "x"}
 	fakeCredentialStatus(t, &st)
 	c, _ := rowNamed(systemRows(t, e), checkCredentials)
-	if c.Status != statusWarn || c.DetailInfo.Code != codeCredentialsUnreadable || c.DetailInfo.Params["n"] != float64(1) || c.HintInfo.Code != codeHintCredentialsReenter {
+	// test-upgrade F6: with a DPAPI key file the hint names the way back
+	// with the original key file (TestCredentialsRowKeyNotice)
+	if c.Status != statusWarn || c.DetailInfo.Code != codeCredentialsUnreadable || c.DetailInfo.Params["n"] != float64(1) || c.HintInfo.Code != codeHintCredentialsRestoreKey {
 		t.Fatalf("unreadable: %+v %+v", c, c.DetailInfo)
 	}
 	st.Replaced = filepath.Join(e.cfg.DataDir, secrets.KeyFileName+".unreadable-20261027-120000")
@@ -135,8 +139,133 @@ func TestCredentialsRowUnreadableAndProviderView(t *testing.T) {
 		t.Fatalf("provider view %+v", v)
 	}
 	_, raw := e.do("GET", "/api/providers", nil)
-	if strings.Contains(string(raw), fake) || strings.Contains(string(raw), secrets.Prefix) {
+	if strings.Contains(string(raw), fake) || strings.Contains(string(raw), secrets.Prefix) || strings.Contains(string(raw), secrets.PrefixV2) {
 		t.Fatal("the provider list holds the key or the ciphertext")
+	}
+}
+
+// test-upgrade F6: the row says why the stored credentials cannot be
+// decrypted (the key file missing, or replaced and kept: in this start
+// from the status, at later starts from KVCredentialKeyNotice), and on
+// Windows (DPAPI key file) the hint names putting the original file back
+// as secrets.key.unreadable-…; the Keychain (macOS desktop) keeps the
+// hint to enter them again. Never a key, a ciphertext or a part of them.
+func TestCredentialsRowKeyNotice(t *testing.T) {
+	e := newEnv(t)
+	e.srv.diag.waitStartup()
+	t.Cleanup(secrets.ResetForTest)
+	ctx := context.Background()
+	if err := secrets.SetKey(bytes.Repeat([]byte{3}, secrets.KeySize)); err != nil {
+		t.Fatal(err)
+	}
+	const fake = "sk-test-api-key-notice-6262"
+	name, typ, base, key := "Lost key", "openai", "https://llm.example.org", fake
+	if _, err := e.set.CreateProvider(ctx, settings.ProviderInput{Name: &name, Type: &typ, BaseURL: &base, APIKey: &key}); err != nil {
+		t.Fatal(err)
+	}
+	if err := secrets.SetKey(bytes.Repeat([]byte{4}, secrets.KeySize)); err != nil { // the new key
+		t.Fatal(err)
+	}
+	if err := e.set.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	keyFile := filepath.Join(e.cfg.DataDir, secrets.KeyFileName)
+	st := secrets.Status{Protection: secrets.ProtectionDPAPI, KeyFile: keyFile, Created: true}
+	fakeCredentialStatus(t, &st)
+	check := func(what, detail, hint string) SystemCheck {
+		t.Helper()
+		clearCredentialRows()
+		c, _ := rowNamed(systemRows(t, e), checkCredentials)
+		if c.Status != statusWarn || c.DetailInfo == nil || c.DetailInfo.Code != detail || c.HintInfo == nil || c.HintInfo.Code != hint {
+			t.Fatalf("%s: %+v detail %+v hint %+v", what, c, c.DetailInfo, c.HintInfo)
+		}
+		if c.DetailInfo.Params["n"] != float64(1) {
+			t.Fatalf("%s: n %v", what, c.DetailInfo.Params)
+		}
+		if hint == codeHintCredentialsRestoreKey && c.HintInfo.Params["dir"] != filepath.Dir(keyFile) {
+			t.Fatalf("%s: hint params %v", what, c.HintInfo.Params)
+		}
+		return c
+	}
+	// this start found no key file and made one
+	c := check("missing", codeCredentialsKeyMissing, codeHintCredentialsRestoreKey)
+	if !strings.Contains(c.Detail, "secrets.key") || !strings.Contains(c.Hint, "secrets.key.unreadable-restored") {
+		t.Fatalf("texts %q / %q", c.Detail, c.Hint)
+	}
+	// a later start: nothing recorded, nothing known
+	st.Created = false
+	check("later, no note", codeCredentialsUnreadable, codeHintCredentialsRestoreKey)
+	// a later start after a start that recorded why
+	note, _ := json.Marshal(CredentialKeyNotice{Kind: KeyNoticeMissing})
+	if err := e.st.SetKV(ctx, KVCredentialKeyNotice, string(note)); err != nil {
+		t.Fatal(err)
+	}
+	check("later, missing", codeCredentialsKeyMissing, codeHintCredentialsRestoreKey)
+	kept := keyFile + ".unreadable-20261101-090000"
+	note, _ = json.Marshal(CredentialKeyNotice{Kind: KeyNoticeReplaced, Kept: kept})
+	if err := e.st.SetKV(ctx, KVCredentialKeyNotice, string(note)); err != nil {
+		t.Fatal(err)
+	}
+	if c := check("later, replaced", codeCredentialsReplaced, codeHintCredentialsRestoreKey); c.DetailInfo.Params["path"] != kept {
+		t.Fatalf("replaced: %v", c.DetailInfo.Params)
+	}
+	// this start's replacement wins over an older note
+	st.Replaced = keyFile + ".unreadable-20261111-100000"
+	if c := check("replaced now", codeCredentialsReplaced, codeHintCredentialsRestoreKey); c.DetailInfo.Params["path"] != st.Replaced {
+		t.Fatalf("replaced now: %v", c.DetailInfo.Params)
+	}
+	// a damaged note is ignored
+	st.Replaced = ""
+	if err := e.st.SetKV(ctx, KVCredentialKeyNotice, "{not json"); err != nil {
+		t.Fatal(err)
+	}
+	check("bad note", codeCredentialsUnreadable, codeHintCredentialsRestoreKey)
+	// the macOS desktop app (Keychain, no key file): as before
+	st = secrets.Status{Protection: secrets.ProtectionKeychain}
+	check("keychain", codeCredentialsUnreadable, codeHintCredentialsReenter)
+
+	clearCredentialRows()
+	_, raw := e.do("GET", "/api/system", nil)
+	if strings.Contains(string(raw), fake) || strings.Contains(string(raw), secrets.Prefix) || strings.Contains(string(raw), fake[len(fake)-8:]) {
+		t.Fatal("the diagnostics hold the key or the ciphertext")
+	}
+}
+
+// test-upgrade F9: while a clean-up of old credential values has not
+// completed (db.KVScrubPending), the row is a warning with the hint that
+// the next start finishes it, not the plain "encrypted".
+func TestCredentialsRowScrubPending(t *testing.T) {
+	e := newEnv(t)
+	e.srv.diag.waitStartup()
+	ctx := context.Background()
+	st := secrets.Status{Protection: secrets.ProtectionDPAPI, KeyFile: filepath.Join(e.cfg.DataDir, secrets.KeyFileName)}
+	fakeCredentialStatus(t, &st)
+	if c, _ := rowNamed(systemRows(t, e), checkCredentials); c.Status != statusOK || c.DetailInfo.Code != codeCredentialsDPAPI {
+		t.Fatalf("control: %+v", c)
+	}
+	if err := e.st.SetKV(ctx, db.KVScrubPending, "1"); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []secrets.Protection{secrets.ProtectionDPAPI, secrets.ProtectionKeychain} {
+		st.Protection = p
+		c, _ := rowNamed(systemRows(t, e), checkCredentials)
+		if c.Status != statusWarn || c.DetailInfo == nil || c.DetailInfo.Code != codeCredentialsScrubPending ||
+			c.HintInfo == nil || c.HintInfo.Code != codeHintCredentialsScrub || !strings.Contains(c.Hint, "下次启动") {
+			t.Fatalf("%s: %+v", p, c)
+		}
+	}
+	// a key that cannot be set up stays the error it is
+	st = secrets.Status{Protection: secrets.ProtectionNone, Err: "test failure"}
+	if c, _ := rowNamed(systemRows(t, e), checkCredentials); c.Status != statusError || c.DetailInfo.Code != codeCredentialsNone {
+		t.Fatalf("none: %+v", c)
+	}
+	// the clean-up done (the next start clears the mark)
+	st = secrets.Status{Protection: secrets.ProtectionDPAPI, KeyFile: "x"}
+	if err := e.st.SetKV(ctx, db.KVScrubPending, ""); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := rowNamed(systemRows(t, e), checkCredentials); c.Status != statusOK || c.DetailInfo.Code != codeCredentialsDPAPI {
+		t.Fatalf("done: %+v", c)
 	}
 }
 
@@ -154,6 +283,59 @@ func TestDataDirLocationRow(t *testing.T) {
 	c, _ := rowNamed(systemRows(t, e), checkDataDirLocation)
 	if c.Status != statusWarn || c.DetailInfo == nil || c.DetailInfo.Code != codeDataDirNoACL || c.DetailInfo.Params["fs"] != "exFAT" || c.HintInfo.Code != codeHintDataDirMove {
 		t.Fatalf("exFAT: %+v", c)
+	}
+}
+
+// Security review SEC3 L4: a data directory near the path length limit
+// still shows that it is in a cloud service's sync folder, or on a drive
+// that keeps no permissions (the security notes come first); so does one
+// too long for the file budget only (R66 F2: it works with long path
+// support); one past {hard} shows that (no process starts there).
+func TestDataDirLocationRowNearLimitKeepsSecurityNotes(t *testing.T) {
+	e := newEnv(t)
+	e.srv.diag.waitStartup()
+	oldLimited, oldFS := dataDirPathLimited, dataDirFSType
+	dataDirPathLimited = true
+	noACL := false
+	dataDirFSType = func(string) (string, bool) {
+		if noACL {
+			return "exFAT", true
+		}
+		return "NTFS", false
+	}
+	t.Cleanup(func() { dataDirPathLimited, dataDirFSType = oldLimited, oldFS; clearCredentialRows() })
+	synced := func(n int) string {
+		base := filepath.Join(t.TempDir(), "Dropbox", "d")
+		if len(base) >= n {
+			t.Fatalf("the temp dir is already %d characters", len(base))
+		}
+		return base + strings.Repeat("a", n-len(base))
+	}
+	near, over, hard := dataDirPathMax-dataDirPathMargin+1, dataDirPathMax+1, dataDirPathHard+1
+	for _, tc := range []struct {
+		name  string
+		dir   string
+		noACL bool
+		code  string
+		hint  string
+	}{
+		{"synced, near", synced(near), false, codeDataDirCloudSync, codeHintDataDirMove},
+		{"synced, too long for the files", synced(over), false, codeDataDirCloudSync, codeHintDataDirMove},
+		{"synced, at {hard}", synced(dataDirPathHard), false, codeDataDirCloudSync, codeHintDataDirMove},
+		{"synced, past {hard}", synced(hard), false, codeDataDirPathTooLongToStart, codeHintDataDirShorter},
+		{"no permissions, near", longDir(t, near), true, codeDataDirNoACL, codeHintDataDirMove},
+		{"no permissions, too long for the files", longDir(t, over), true, codeDataDirNoACL, codeHintDataDirMove},
+		{"no permissions, past {hard}", longDir(t, hard), true, codeDataDirPathTooLongToStart, codeHintDataDirShorter},
+		{"too long for the files alone", longDir(t, over), false, codeDataDirPathTooLong, codeHintDataDirShorter},
+		{"synced and no permissions, near", synced(near), true, codeDataDirCloudSync, codeHintDataDirMove},
+		{"near alone", longDir(t, near), false, codeDataDirPathNearLimit, codeHintDataDirShorter},
+	} {
+		noACL = tc.noACL
+		e.srv.dataDir = tc.dir
+		c, i := rowNamed(systemRows(t, e), checkDataDirLocation)
+		if i < 0 || c.Status != statusWarn || c.DetailInfo == nil || c.DetailInfo.Code != tc.code || c.HintInfo == nil || c.HintInfo.Code != tc.hint {
+			t.Fatalf("%s: %+v", tc.name, c)
+		}
 	}
 }
 
@@ -232,7 +414,7 @@ func TestDiagnosticsExportHoldsNoCredential(t *testing.T) {
 		t.Fatalf("%d %s", res.StatusCode, body)
 	}
 	for name, data := range unzipAll(t, body) {
-		for _, needle := range []string{keyA, keyB, secrets.Prefix} {
+		for _, needle := range []string{keyA, keyB, secrets.Prefix, secrets.PrefixV2} {
 			if strings.Contains(data, needle) {
 				t.Errorf("%s holds %q", name, needle)
 			}

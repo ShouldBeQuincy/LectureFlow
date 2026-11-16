@@ -10,7 +10,9 @@ package main
 //	GET    /api/downloads[?course_id=]  {"items": [Download]}, newest first
 //	POST   /api/downloads/{id}/cancel   200 Download | 409 downloads.not_cancellable {state}
 //	POST   /api/downloads/{id}/retry    200 Download | 409 downloads.needs_refresh,
-//	                                    downloads.not_retryable {state}
+//	                                    downloads.not_retryable {state}, or the
+//	                                    task's own error {code, params} when no
+//	                                    retry is offered (fetch.Retryable)
 //	DELETE /api/downloads/{id}          204 | 409 downloads.active {state}
 //	                                    unknown id: 404 downloads.not_found
 //	GET/PATCH /api/app/settings         + download_concurrency (1–6, default 3) and
@@ -25,10 +27,15 @@ package main
 // about 45 s, merges, creates its lecture draft and is done. The other
 // scenarios have no downloads, so their pages look as before. A change
 // sends SSE "changed {kind: downloads, id}" (progress about once a
-// second). The allowed actions follow internal/fetch: cancel while queued,
-// downloading, merging or needing a refresh; retry and remove when
-// failed; remove when done or cancelled; nothing while importing. A
+// second). The allowed actions are internal/fetch's (fetch.AllowedActions):
+// cancel while queued, downloading, merging or needing a refresh; retry and
+// remove when failed, remove only when a retry would fail again
+// (fetch.Retryable); remove when done or cancelled; nothing while importing. A
 // retried task waits in the queue for a moment, then downloads to the end.
+//
+// The scenario "download_errors" (?mock=download_errors, download_errors.go)
+// has one failed or needs_refresh task for every task error code of
+// internal/fetch instead, so that each reason's text can be seen.
 //
 // The download settings are per mock instance, like the App settings
 // (v3_settings.go); this file serves GET/PATCH /api/app/settings before
@@ -48,6 +55,7 @@ import (
 	"time"
 
 	"lectureflow/internal/api"
+	"lectureflow/internal/fetch"
 	"lectureflow/internal/model"
 )
 
@@ -90,7 +98,7 @@ type dlState struct {
 	ticking bool
 }
 
-var dlStates sync.Map // *store → *dlState
+var dlStates sync.Map // dlKey → *dlState
 
 type dlSettings struct {
 	mu          sync.Mutex
@@ -123,18 +131,29 @@ const (
 	dlCourseOS     = "01JC0000000000000000002120" // COMP2120 Operating Systems
 )
 
+// dlKey: the two scenarios share the main store but not their tasks.
+type dlKey struct {
+	s  *store
+	sc string
+}
+
 // dlStateFor returns the scenario's tasks moved on to now (nil outside the
-// scenario); s.mu held.
+// scenarios "downloads" and "download_errors"); s.mu held.
 func (m *mock) dlStateFor(r *http.Request, s *store) *dlState {
-	if scenario(r) != dlScenario {
+	sc := scenario(r)
+	if sc != dlScenario && sc != dlErrScenario {
 		return nil
 	}
 	var st *dlState
-	if v, ok := dlStates.Load(s); ok {
+	if v, ok := dlStates.Load(dlKey{s, sc}); ok {
 		st = v.(*dlState)
 	} else {
-		st = newDLState(s, time.Now())
-		dlStates.Store(s, st)
+		if sc == dlErrScenario {
+			st = newDLErrorState(time.Now())
+		} else {
+			st = newDLState(s, time.Now())
+		}
+		dlStates.Store(dlKey{s, sc}, st)
 	}
 	s.dlNotify(st.advance(s, time.Now()))
 	m.dlTick(s, st)
@@ -202,7 +221,7 @@ func (st *dlState) settle() {
 		if t.State == "queued" {
 			queued = append(queued, t)
 		}
-		t.AllowedActions = dlActions(t.State)
+		t.AllowedActions = dlActions(t)
 	}
 	sort.Slice(queued, func(i, j int) bool { return queued[i].seq < queued[j].seq })
 	for i, t := range queued {
@@ -210,16 +229,14 @@ func (st *dlState) settle() {
 	}
 }
 
-func dlActions(state string) []string {
-	switch state {
-	case "queued", "downloading", "merging", "needs_refresh":
-		return []string{"cancel"}
-	case "failed":
-		return []string{"retry", "remove"}
-	case "done", "cancelled":
-		return []string{"remove"}
+// dlActions: internal/fetch's own (a failure a retry cannot fix offers
+// remove only: fetch.AllowedActions, T18 N2 and M1).
+func dlActions(t *dlTask) []string {
+	code := ""
+	if t.Error != nil {
+		code = t.Error.Code
 	}
-	return []string{} // importing
+	return fetch.AllowedActions(t.State, code)
 }
 
 func dlEnded(state string) bool { return state == "done" || state == "failed" || state == "cancelled" }
@@ -398,6 +415,10 @@ func (m *mock) dlRetry(w http.ResponseWriter, r *http.Request, s *store) {
 		return
 	case t.State != "failed":
 		codedError(w, http.StatusConflict, "downloads.not_retryable", map[string]any{"state": t.State})
+		return
+	case t.Error != nil && !fetch.Retryable(t.Error.Code):
+		// as fetch.Queue.Retry: the task's own reason, 409
+		codedError(w, http.StatusConflict, t.Error.Code, t.Error.Params)
 		return
 	}
 	now := time.Now()

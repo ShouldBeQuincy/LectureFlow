@@ -75,6 +75,10 @@ type Status struct {
 	// the system protects keys (Windows); it is protected from now on (sec3
 	// I2: someone who can write the data directory could have put it there).
 	PlainKeyFile bool
+	// PlainKeptFile is a kept key file (Recovered) without that protection
+	// where the system protects keys ("" when none; the last one found):
+	// its key opens values just the same, and it stays as it is (sec3 T5).
+	PlainKeptFile string
 	// Recovered counts the kept, earlier key files (KeyFileName.unreadable-*)
 	// that open again: their keys are fallbacks, the values sealed with them
 	// are sealed again with the data key.
@@ -252,9 +256,14 @@ func useFallbacks(path string, current []byte, extra [][]byte, st *Status) error
 		if err != nil {
 			continue
 		}
-		if k, _, err := decodeKeyFile(b); err == nil && !bytes.Equal(k, current) {
+		if k, prot, err := decodeKeyFile(b); err == nil && !bytes.Equal(k, current) {
 			fb = append(fb, k)
 			st.Recovered++
+			if prot == ProtectionFile && osProtection != ProtectionNone {
+				// reported like a plain data key file (sec3 I2, T5): its
+				// key opens values just the same
+				st.PlainKeptFile = f
+			}
 		}
 	}
 	return SetFallbackKeys(fb...)

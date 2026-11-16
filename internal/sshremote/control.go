@@ -50,7 +50,7 @@ func openControl(ctx context.Context, c *conn, cmd string, retain time.Duration,
 	onMachine, onSample func(map[string]any)) (*control, error) {
 	sess, err := c.client.NewSession()
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errLost, err)
+		return nil, wrapNet(errLost, err)
 	}
 	in, err := sess.StdinPipe()
 	if err != nil {
@@ -65,7 +65,7 @@ func openControl(ctx context.Context, c *conn, cmd string, retain time.Duration,
 	sess.Stderr = io.Discard
 	if err := sess.Start(cmd); err != nil {
 		sess.Close()
-		return nil, fmt.Errorf("%w: %v", errLost, err)
+		return nil, wrapNet(errLost, err)
 	}
 	ctl := &control{sess: sess, in: in, pending: map[int64]chan remote.AgentEvent{}, jobs: map[string]chan remote.AgentEvent{},
 		dead: make(chan struct{}), onMachine: onMachine, onSample: onSample}
@@ -221,7 +221,7 @@ func (ctl *control) call(ctx context.Context, req remote.Request) (remote.AgentE
 		ctl.mu.Lock()
 		delete(ctl.pending, req.Seq)
 		ctl.mu.Unlock()
-		ctl.fail(fmt.Errorf("%w: %v", errLost, err))
+		ctl.fail(wrapNet(errLost, err))
 		return remote.AgentEvent{}, errLost
 	}
 	select {
@@ -269,7 +269,7 @@ func (ctl *control) pinger() {
 		_, err := ctl.call(ctx, remote.Request{Op: remote.OpPing})
 		cancel()
 		if err != nil && ctl.alive() {
-			ctl.fail(fmt.Errorf("%w: ping: %v", errLost, err))
+			ctl.fail(wrapNet(errLost, err))
 			return
 		}
 	}

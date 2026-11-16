@@ -339,6 +339,9 @@ func (s *Server) deviceView(ctx context.Context, dc *deviceCtx, d model.ASRDevic
 	if v.Label == "" {
 		v.Label = d.ID
 	}
+	if model.IsSSHDevice(d.ID) {
+		s.sshDeviceOptions(&v) // ssh-1b: the server's own recommendation (handlers_remote.go)
+	}
 	if v.Backend == model.BackendOpenVINO {
 		ready := devices.OVModelReady(s.cfg, s.dataDir, d.Model, d.Precision) // component dir first (v3)
 		cached := devices.CompileCached(s.dataDir, model.OVDeviceName(d.ID), d.Model, d.Precision)

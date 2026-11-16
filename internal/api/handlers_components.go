@@ -773,7 +773,7 @@ func (s *Server) importComponent(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, r, err)
 			return
 		}
-		src, _, err := s.checkSourcePath(pr.path)
+		src, _, err := s.checkSourcePath(r.Context(), pr.path)
 		if err != nil {
 			s.fail(w, r, err)
 			return
@@ -836,14 +836,18 @@ func (s *Server) storedSources(ctx context.Context) (SourcesSetting, error) {
 	if json.Unmarshal([]byte(v), &st) != nil {
 		return def, nil
 	}
-	// a stored mirror the current manifest no longer has falls back to default
+	// a stored mirror the current manifest no longer has falls back to
+	// default. A custom package index on plain http (saved before that was
+	// refused) is kept as the user saved it: the page shows it, and an
+	// install with it fails with components.sources_invalid (the manager
+	// checks it) instead of quietly using another index.
 	if s.comps != nil {
 		groups := s.comps.SourceGroups()
 		for _, g := range []struct {
 			name string
 			c    *SourceChoice
 		}{{components.GroupPyPI, &st.PyPI}, {components.GroupModels, &st.Models}} {
-			if checkSourceChoice(g.name, *g.c, groups) != "" {
+			if sourceChoiceShape(g.name, *g.c, groups) != "" {
 				*g.c = SourceChoice{Mode: "default"}
 			}
 		}
@@ -891,8 +895,23 @@ func normSourceChoice(c *SourceChoice) {
 	}
 }
 
-// checkSourceChoice returns the invalid field of a choice, or "".
+// checkSourceChoice returns the invalid field of a choice, or "": its shape
+// (sourceChoiceShape), and a custom package index must not be plain http
+// to another computer (components.InsecureCustomSource; security audit
+// M-1).
 func checkSourceChoice(group string, c SourceChoice, groups map[string]components.SourceGroup) string {
+	if f := sourceChoiceShape(group, c, groups); f != "" {
+		return f
+	}
+	if c.Mode == "mirror" && c.MirrorID == "" && components.InsecureCustomSource(group, c.CustomURL) {
+		return "custom_url"
+	}
+	return ""
+}
+
+// sourceChoiceShape returns the field of a choice that is malformed or names
+// a mirror the manifest does not have, or "".
+func sourceChoiceShape(group string, c SourceChoice, groups map[string]components.SourceGroup) string {
 	switch c.Mode {
 	case "default":
 		return ""
@@ -901,11 +920,7 @@ func checkSourceChoice(group string, c SourceChoice, groups map[string]component
 		return "mode"
 	}
 	if c.MirrorID == "" {
-		if c.CustomURL == "" || len(c.CustomURL) > 2048 {
-			return "custom_url"
-		}
-		u, err := url.Parse(c.CustomURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || strings.ContainsAny(c.CustomURL, " \t\r\n") {
+		if !components.CustomURLOK(c.CustomURL) {
 			return "custom_url"
 		}
 		return ""

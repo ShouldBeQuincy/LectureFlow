@@ -17,7 +17,7 @@
   },
   "profile": {
     "id": "panopto",
-    "version": "1.1.1",
+    "version": "1.1.2",
     "reviewed": true
   },
   "inputs": {
@@ -89,7 +89,7 @@
         ],
         "observed": [
           {
-            "key": "panopto:1.1.1",
+            "key": "panopto:1.1.2",
             "index": 0,
             "url": "https://tenant.cloud.panopto.eu/Panopto/Pages/Viewer/DeliveryInfo.aspx",
             "values": {
@@ -416,7 +416,7 @@
     },
     "profile": {
       "id": "panopto",
-      "version": "1.1.1",
+      "version": "1.1.2",
       "sessionIdSource": "profile",
       "lecture": {
         "titleShape": "XXX0000/X00/00 Xxx Xxx 00 00:00:00 XXX 0000",

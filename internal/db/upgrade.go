@@ -13,8 +13,10 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/url"
 	"os"
@@ -22,8 +24,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
-	"lectureflow/internal/secrets"
 )
 
 var (
@@ -116,6 +116,57 @@ type FileInfo struct {
 // finds the same upgrade still to do (a migration failed or was
 // interrupted) does not make another one.
 const KVUpgradeBackup = "upgrade.backup"
+
+// HeaderVersionHeadroom: how far above SchemaVersion a user_version read
+// from a file header is still believed (HeaderUserVersion). A newer
+// LectureFlow adds a few migrations per release; a number far beyond is a
+// damaged header, not a newer database.
+const HeaderVersionHeadroom = 1000
+
+// HeaderUserVersion reads the schema version (user_version) straight from
+// the header of the database file at path: the 4 bytes big-endian at offset
+// 60 of a file that starts with "SQLite format 3\x00". It parses no schema,
+// so it answers for a database whose schema this SQLite cannot read (one
+// written by a newer LectureFlow). ok is false when the file cannot be read,
+// is not an SQLite database, or its header is damaged: the fixed bytes at
+// offsets 18–23 (format versions 1 or 2; payload fractions 64, 32, 32) and
+// the page size at offset 16 (a power of two from 512 to 32768, or 1 for
+// 65536) must be valid, and the version must lie in 0 to SchemaVersion +
+// HeaderVersionHeadroom; otherwise a damaged file whose magic survived
+// would be taken for one from a newer version. A version changed in a WAL
+// that was not checkpointed yet is not seen here.
+func HeaderUserVersion(path string) (version int, ok bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+	var h [100]byte
+	if _, err := io.ReadFull(f, h[:]); err != nil {
+		return 0, false
+	}
+	if string(h[:16]) != "SQLite format 3\x00" || !validHeader(h) {
+		return 0, false
+	}
+	v := int(int32(binary.BigEndian.Uint32(h[60:64])))
+	if v < 0 || v > SchemaVersion()+HeaderVersionHeadroom {
+		return 0, false
+	}
+	return v, true
+}
+
+// validHeader checks the fields of an SQLite file header that have fixed or
+// few valid values (https://www.sqlite.org/fileformat.html, 1.3).
+func validHeader(h [100]byte) bool {
+	if h[18] < 1 || h[18] > 2 || h[19] < 1 || h[19] > 2 {
+		return false
+	}
+	if h[21] != 64 || h[22] != 32 || h[23] != 32 {
+		return false
+	}
+	ps := binary.BigEndian.Uint16(h[16:18])
+	return ps == 1 || (ps >= 512 && ps <= 32768 && ps&(ps-1) == 0)
+}
 
 // InspectFile reads FileInfo of the database at path on a read-only
 // connection: the file is not changed.
@@ -216,12 +267,13 @@ func countSecretRows(ctx context.Context, q queryer, kvKeys []string) (int, erro
 		return 0, err
 	} else if ok {
 		var n int
-		if err := q.QueryRowContext(ctx, `SELECT count(*) FROM kv WHERE substr(value, 1, ?) = ?`, len(secrets.Prefix), secrets.Prefix).Scan(&n); err != nil {
+		// sealed by its owner, either format (secrets.Prefixes, sec3 L3)
+		if err := q.QueryRowContext(ctx, `SELECT count(*) FROM kv WHERE `+sealedPrefixSQL("value"), sealedPrefixArgs()...).Scan(&n); err != nil {
 			return 0, err
 		}
 		total += n
 		for _, k := range kvKeys {
-			if err := q.QueryRowContext(ctx, `SELECT count(*) FROM kv WHERE key = ? AND substr(value, 1, ?) <> ?`, k, len(secrets.Prefix), secrets.Prefix).Scan(&n); err != nil {
+			if err := q.QueryRowContext(ctx, `SELECT count(*) FROM kv WHERE key = ? AND NOT `+sealedPrefixSQL("value"), append([]any{k}, sealedPrefixArgs()...)...).Scan(&n); err != nil {
 				return 0, err
 			}
 			total += n
@@ -242,9 +294,9 @@ func scrubSecretRows(ctx context.Context, q queryer, kvKeys []string) error {
 				return err
 			}
 		}
-		// any row its owner sealed (secrets.Prefix; e.g. ssh-mvp's
-		// remote.ssh.key.*) is a credential too
-		if _, err := q.ExecContext(ctx, `DELETE FROM kv WHERE substr(value, 1, ?) = ?`, len(secrets.Prefix), secrets.Prefix); err != nil {
+		// any row its owner sealed (either format, secrets.Prefixes; e.g.
+		// ssh-mvp's remote.ssh.key.*) is a credential too
+		if _, err := q.ExecContext(ctx, `DELETE FROM kv WHERE `+sealedPrefixSQL("value"), sealedPrefixArgs()...); err != nil {
 			return err
 		}
 	}

@@ -11,8 +11,10 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +28,7 @@ import (
 	"lectureflow/internal/model"
 	"lectureflow/internal/procutil"
 	"lectureflow/internal/pyenv"
+	"lectureflow/internal/relocate"
 	"lectureflow/internal/resources"
 	"lectureflow/internal/sched"
 	"lectureflow/internal/settings"
@@ -147,6 +150,22 @@ type Server struct {
 	// trOffers caches whether a lecture's asr stage offers "修复断句"
 	// (textrepair.go).
 	trOffers textRepairOffers
+
+	// grants are the desktop path uploads' one-time grants (pathgrant.go).
+	grants *pathGrants
+	// evalSymlinks and statSource are checkSourcePath's file system calls
+	// (filepath.EvalSymlinks, os.Stat); tests replace them to see that a
+	// refused path is never touched.
+	evalSymlinks func(string) (string, error)
+	statSource   func(string) (fs.FileInfo, error)
+	// statDir, checkMove and checkImportSource are the data directory
+	// endpoints' first file system calls on a page's path (os.Stat in
+	// volumeFree, relocate.CheckMove, relocate.CheckImportSource); tests
+	// replace them to see that a refused path (one the folder dialog did not
+	// pick, network or local: folderRefused) is never touched.
+	statDir           func(string) (fs.FileInfo, error)
+	checkMove         func(ctx context.Context, src, dst, locationFile string) (relocate.MovePlan, error)
+	checkImportSource func(ctx context.Context, dir string) (relocate.SourceInfo, error)
 }
 
 // New builds the server and starts the startup diagnostics run (SPEC §17.1,
@@ -162,14 +181,20 @@ func newServer(d Deps, tweak func(*Server)) *Server {
 		maxUpload: 4 << 30,
 		minFree:   2 << 30,
 		freeSpace: diskFree,
-		runCmd:    runCommand,
 		staticFS:  web.FS,
 		now:       time.Now,
 		testConn:  llm.TestConnection,
 		probe:     llm.ProbeModels,
 		balSeen:   map[string]string{},
 	}
+	s.runCmd = s.runDiagnostic // (tests replace it)
 	s.extractPDF = s.runExtractPDF
+	s.grants = newPathGrants()
+	s.evalSymlinks = filepath.EvalSymlinks
+	s.statSource = os.Stat
+	s.statDir = os.Stat
+	s.checkMove = relocate.CheckMove
+	s.checkImportSource = relocate.CheckImportSource
 	s.colabReach = s.reachColab
 	s.findClip = func(ctx context.Context) (devices.ClipSource, bool, error) {
 		src, ok, err := devices.FindClipSource(ctx, s.st, s.dataDir)
@@ -209,6 +234,7 @@ func newServer(d Deps, tweak func(*Server)) *Server {
 		s.hub.setClientsHook(s.res.SetClients)
 	}
 	s.hub.setJobHook(s.jobEvent)
+	s.hub.setJobStats(s.jobEventStats)
 	if s.set != nil {
 		// Every settings or provider write (A5): the settings page and the
 		// resource watcher refetch.
@@ -243,8 +269,13 @@ func (s *Server) WaitInvalidations() { s.inval.wait() }
 
 // Handler returns the router: the API under /api/ and the front end at /,
 // behind the security headers and, in desktop mode, the Host and token
-// checks (desktop.go).
+// checks (desktop.go), all behind the slow-request log (slowlog.go).
 func (s *Server) Handler() http.Handler {
+	return s.handlerChain(s.routes(), slowRequestThreshold, nil, time.Now)
+}
+
+// routes is the router of Handler without the middleware.
+func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	h := func(pattern string, fn http.HandlerFunc) { mux.HandleFunc(pattern, fn) }
 
@@ -370,7 +401,7 @@ func (s *Server) Handler() http.Handler {
 		writeError(w, http.StatusNotFound, "api.not_found", map[string]any{"method": r.Method, "path": r.URL.Path})
 	})
 	mux.Handle("/", s.static())
-	return s.secure(mux)
+	return mux
 }
 
 // ---- static front end ----
@@ -609,20 +640,60 @@ func (s *Server) kick() {
 	}
 }
 
-// runCommand runs a short diagnostic command and returns its output. The
+// runDiagnostic is the server's runCmd: runCommandIn with the worker
+// directory as the Python calls' working directory.
+func (s *Server) runDiagnostic(ctx context.Context, name string, args ...string) (string, string, error) {
+	dir := ""
+	if s.cfg != nil {
+		dir = s.cfg.WorkerDir
+	}
+	return runCommandIn(ctx, dir, name, args...)
+}
+
+// runCommand is runCommandIn without a working directory for Python calls.
+func runCommand(ctx context.Context, name string, args ...string) (string, string, error) {
+	return runCommandIn(ctx, "", name, args...)
+}
+
+// runCommandIn runs a short diagnostic command and returns its output. The
 // Python checks and self-tests run through it, so it has pyenv's
 // environment (no usage reporting); so does the upload's ffprobe
 // (media.Check). Like every helper program it ends with LectureFlow, also
-// on a crash (procutil.Tied; test-chaos 1).
-func runCommand(ctx context.Context, name string, args ...string) (string, string, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Env = pyenv.Environ()
+// on a crash (procutil.Tied; test-chaos 1). A Python call runs in
+// workerDir (diagCommand).
+func runCommandIn(ctx context.Context, workerDir, name string, args ...string) (string, string, error) {
+	cmd := diagCommand(ctx, workerDir, name, args...)
 	var out, errb strings.Builder
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
 	cmd.WaitDelay = 2 * time.Second
 	err := procutil.Run(cmd, procutil.Tied)
 	return out.String(), errb.String(), err
+}
+
+// diagCommand is runCommandIn's command. A Python call (its first argument
+// is one of pyenv's isolation switches: -I for the import checks' code, -s
+// for a worker script, as every check, self-test and cuDNN check of the
+// diagnostics starts) runs in workerDir when that is an absolute path, not
+// in the service's current directory: the folder the user started
+// LectureFlow from in web mode, where Windows would look for a DLL loaded
+// by name (-I keeps it off sys.path already; SEC47 info-5). The worker
+// directory, rather than an empty private one: it is LectureFlow's own and
+// holds only the worker scripts, a script's directory is sys.path[0]
+// anyway (whoever can write there changes the code that runs), and it
+// exists in every mode without a temporary directory to make and clean
+// up. Other commands (ffprobe, ffmpeg, `python --version`, which runs no
+// Python code) keep the current directory: their arguments may hold
+// relative paths. (nvidia-smi does not run here: the scheduler's, the
+// device detection's and the resource sampler's run in nvidia-smi's own
+// directory, procutil.CommandInExeDir.)
+func diagCommand(ctx context.Context, workerDir, name string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = pyenv.Environ()
+	if len(args) > 0 && (args[0] == "-I" || args[0] == "-s") && filepath.IsAbs(workerDir) {
+		cmd.Dir = workerDir
+	}
+	return cmd
 }
 
 // stagesOf returns the lecture/material/course stage list of a scope.

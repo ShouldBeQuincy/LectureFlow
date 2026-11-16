@@ -11,6 +11,13 @@ const {
   TOKEN_HEADER, classifyNavigation, shouldInjectToken, isRequestAllowed, isPermissionAllowed,
   isDownloadAllowed, withSecurityHeaders, isServerUrl,
 } = require('./lib/security');
+const { PATH_GRANT_HEADER } = require('./lib/pathgrant');
+
+// Headers only the main process may send: a page that sets one of them has
+// it dropped (the token is added back below; a path grant is sent by the
+// main process's own calls only, apiclient.js, which use Node's fetch and
+// never pass through this session; security review SEC24 L5).
+const SHELL_ONLY_HEADERS = new Set([TOKEN_HEADER.toLowerCase(), PATH_GRANT_HEADER.toLowerCase()]);
 
 function originOf(url) {
   try {
@@ -43,7 +50,7 @@ function hardenSession(ses, ctx) {
   webRequest.onBeforeSendHeaders((details, callback) => {
     const headers = {};
     for (const [k, v] of Object.entries(details.requestHeaders)) {
-      if (k.toLowerCase() !== TOKEN_HEADER.toLowerCase()) headers[k] = v; // never forward a page-made token header
+      if (!SHELL_ONLY_HEADERS.has(k.toLowerCase())) headers[k] = v; // never forward a page-made token or path-grant header
     }
     const token = ctx.getToken();
     if (token && shouldInjectToken(details.url, ctx.getPort())) headers[TOKEN_HEADER] = token;

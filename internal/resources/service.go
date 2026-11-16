@@ -14,7 +14,9 @@ import (
 	"lectureflow/internal/colab"
 	"lectureflow/internal/db"
 	"lectureflow/internal/devices"
+	"lectureflow/internal/llm"
 	"lectureflow/internal/model"
+	"lectureflow/internal/remote"
 	"lectureflow/internal/sched"
 	"lectureflow/internal/settings"
 	"lectureflow/internal/tariff"
@@ -32,6 +34,14 @@ const TempWarnC = 85
 
 // DefaultInterval is the A10 sampling interval.
 const DefaultInterval = 2 * time.Second
+
+// NVIDIARecheck is how long the answer of Deps.HasNVIDIA is kept before it
+// is asked again (T046); a new device detection (Deps.Detection's At)
+// asks again at once.
+const NVIDIARecheck = 5 * time.Minute
+
+// nvidiaAskTimeout bounds one Deps.HasNVIDIA call (a kv read).
+const nvidiaAskTimeout = 5 * time.Second
 
 // balanceTimeout bounds one balance query even with a client without timeout.
 const balanceTimeout = 15 * time.Second
@@ -55,6 +65,17 @@ type Deps struct {
 	// when set and valid, else the embedded file.
 	Holidays  func() tariff.HolidaySet
 	NvidiaSMI string // executable; "" = "nvidia-smi"
+	// HasNVIDIA reports whether this computer has an NVIDIA GPU (T046,
+	// SPEC-ext: what the machine cannot have is neither shown nor
+	// checked). false: sampling does not run nvidia-smi and the GPU area
+	// stays unavailable without an error. It is asked at the first sample,
+	// again after NVIDIARecheck and whenever Detection's At changes (a
+	// driver installed later is picked up). nil = always true (as before).
+	// An error means the answer could not be had (r4 D10): it is not kept,
+	// the last answer stands (nothing known yet: false for this sample) and the next sample
+	// asks again. It is asked with a context of its own (not cancelled with
+	// the request that triggered the sample), bounded by nvidiaAskTimeout.
+	HasNVIDIA func(ctx context.Context) (bool, error)
 	// RunCmd runs a command and returns its stdout; nil = os/exec.
 	RunCmd func(ctx context.Context, name string, args ...string) (stdout string, err error)
 	HTTP   *http.Client // balance queries; nil = a client with a 10 s timeout
@@ -88,6 +109,11 @@ type Deps struct {
 	// = not configured or switched off (Snapshot.Remote omitted). nil = no
 	// remote area. It never contacts Colab.
 	Remote func(ctx context.Context) (colab.Status, bool)
+	// RemoteCards are the SSH inference servers' cards (ssh-1b:
+	// sshremote.Manager.Cards; nil = none, the SSH servers are off). They
+	// follow Colab's card in Snapshot.Remotes; a running lecture without a
+	// title gets the one the device cards show.
+	RemoteCards func(ctx context.Context) []remote.Card
 }
 
 // Service samples the GPU while front ends are connected (A10), caches
@@ -121,6 +147,12 @@ type Service struct {
 	// logged (apple.go).
 	platform func() (unsupported []string, unified bool)
 	appleErr string
+	// nvKnown, nvHas, nvAt and nvDetAt cache Deps.HasNVIDIA (sampleMu):
+	// the answer, when it was asked and the detection time it saw.
+	nvKnown bool
+	nvHas   bool
+	nvAt    time.Time
+	nvDetAt time.Time
 
 	ctx     context.Context // cancelled by Stop (or Start's context)
 	cancel  context.CancelFunc
@@ -187,8 +219,18 @@ func New(d Deps) *Service {
 	if s.run == nil {
 		s.run = execRun
 	}
+	// The balance query carries the provider's key (Authorization: Bearer):
+	// a redirect is followed only within the origin, as with the LLM
+	// clients (llm.CheckRedirect; AUD1 I-2). net/http's own policy keeps
+	// Authorization on a redirect to the same host name, from https down
+	// to http or to another port included. A client given without a
+	// policy gets this one (a copy; the caller's is left as it is).
 	if s.client == nil {
-		s.client = &http.Client{Timeout: 10 * time.Second}
+		s.client = &http.Client{Timeout: 10 * time.Second, CheckRedirect: llm.CheckRedirect}
+	} else if s.client.CheckRedirect == nil {
+		cp := *s.client
+		cp.CheckRedirect = llm.CheckRedirect
+		s.client = &cp
 	}
 	if s.exe == "" {
 		s.exe = "nvidia-smi"
@@ -339,7 +381,7 @@ func (s *Service) tick() {
 	}
 }
 
-// sampleLocked runs nvidia-smi, reads the Intel devices' PDH counters and
+// sampleLocked runs nvidia-smi (with an NVIDIA GPU, T046), reads the Intel devices' PDH counters and
 // the upper area's readings (system.go) and starts due balance queries.
 // sampleMu held.
 func (s *Service) sampleLocked(ctx context.Context) {
@@ -353,6 +395,16 @@ func (s *Service) sampleLocked(ctx context.Context) {
 }
 
 func (s *Service) sampleGPU(ctx context.Context) {
+	if !s.nvidiaPresent(ctx) {
+		// T046: no NVIDIA GPU, no nvidia-smi process; the card is simply
+		// unavailable (no error to show).
+		now := s.d.Now()
+		s.mu.Lock()
+		s.sampled, s.lastAt = true, now
+		s.gpuOK, s.gpu, s.gpuErr, s.hist = false, Sample{}, "", nil
+		s.mu.Unlock()
+		return
+	}
 	cctx, cancel := context.WithTimeout(ctx, cmdTimeout)
 	out, err := s.run(cctx, s.exe, QueryArgs...)
 	cancel()
@@ -381,6 +433,49 @@ func (s *Service) sampleGPU(ctx context.Context) {
 		}
 	}
 	s.hist = pruneHistory(s.hist, now)
+}
+
+// nvidiaPresent returns the cached answer of Deps.HasNVIDIA, asking again
+// on the first call, after NVIDIARecheck (or a clock step back) and when
+// the device detection ran again. sampleMu held.
+func (s *Service) nvidiaPresent(ctx context.Context) bool {
+	if s.d.HasNVIDIA == nil {
+		return true
+	}
+	now := s.d.Now()
+	var detAt time.Time
+	if s.d.Detection != nil {
+		detAt = s.d.Detection().At
+	}
+	if s.nvKnown && detAt.Equal(s.nvDetAt) &&
+		now.Sub(s.nvAt) < NVIDIARecheck && !now.Before(s.nvAt) {
+		return s.nvHas
+	}
+	// r4 D10: GET /api/resources samples with the request's context; a
+	// page closed meanwhile must not turn the read into "no NVIDIA" kept
+	// for NVIDIARecheck. The answer is about the computer, not the request.
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nvidiaAskTimeout)
+	has, err := s.d.HasNVIDIA(actx)
+	cancel()
+	if err != nil {
+		slog.Debug("resources: NVIDIA GPU check failed; asking again at the next sample", "err", err)
+		if s.nvKnown {
+			return s.nvHas
+		}
+		// Nothing known yet: skip nvidia-smi for this sample, keep nothing.
+		// The alternative, "has one" (the first-start rule of cmd
+		// hasNVIDIAFunc), would run nvidia-smi on a computer without one and
+		// show its error in the resource bar; skipping only leaves the GPU
+		// area empty for one sample period, and a computer that does have
+		// one is sampled as soon as the check answers (review R57 D-1). The
+		// first-start rule itself stays in hasNVIDIAFunc's answer.
+		return false
+	}
+	if !s.nvKnown || has != s.nvHas {
+		slog.Info("resources: NVIDIA GPU sampling", "enabled", has)
+	}
+	s.nvKnown, s.nvHas, s.nvAt, s.nvDetAt = true, has, now, detAt
+	return has
 }
 
 // pruneHistory keeps the points of the last Window, at most HistoryMax.
@@ -514,6 +609,10 @@ func (s *Service) build(ctx context.Context) Snapshot {
 			remote = &st
 		}
 	}
+	var sshCards []remoteCard
+	if s.d.RemoteCards != nil {
+		sshCards = s.titledCards(ctx, s.d.RemoteCards(ctx), devIn.titles)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -550,7 +649,7 @@ func (s *Service) build(ctx context.Context) Snapshot {
 		}
 	}
 	snap := Snapshot{GPU: g, Providers: make([]Provider, 0, len(ps)), Remote: remote}
-	snap.Remotes = remoteCards(remote, devIn)
+	snap.Remotes = append(remoteCards(remote, devIn), sshCards...)
 	if withDevices {
 		snap.Devices, snap.Power, snap.Policy = s.deviceCards(devIn, g, asr)
 	}

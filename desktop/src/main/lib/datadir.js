@@ -22,7 +22,7 @@ const MAX_PATH_CHARS = 4096;
 function parseLocation(raw, pathMod = path) {
   let v;
   try {
-    v = JSON.parse(String(raw).replace(/^﻿/, ''));
+    v = JSON.parse(String(raw).replace(/^\ufeff/, ''));
   } catch {
     return { ok: false, reason: 'not_json' };
   }

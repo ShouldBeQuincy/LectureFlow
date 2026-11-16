@@ -25,6 +25,7 @@ import { h, btn, confirmDialog } from './dom.js';
 import { icon } from './icons.js';
 import { t } from './i18n.js';
 import * as U from './util.js';
+import { api } from './api.js';
 import { obApi, desktop } from './onboarding_api.js';
 import { planSummary, planSpaceText } from './components_ui.js';
 import { localComponents } from './onboarding_mode.js';
@@ -119,11 +120,15 @@ export function storageStep(env) {
     }
     S.checking = false;
     if (!alive) return;
+    // A pick that will not be used (the check failed or refused it, or the
+    // user declines below) is given up at once, not left to expire.
     if (!r) {
+      api.forgetFolderPick(path);
       env.rerender();
       return;
     }
     if (!r.ok || !fits(r.free_bytes)) {
+      api.forgetFolderPick(path);
       S.cand = r;
       env.rerender();
       return;
@@ -141,6 +146,7 @@ export function storageStep(env) {
       ),
       okText: t('onboarding.storage.change'),
     });
+    if (!ok) api.forgetFolderPick(path);
     if (!ok || !alive) return;
     // saved first: the onboarding state goes into the moved database
     await env.setData({ storage_moved_to: r.path || path });
@@ -153,6 +159,9 @@ export function storageStep(env) {
     } catch {
       delete env.data.storage_moved_to; // shown by the error handler
       env.save();
+      // refused: the service returned the pick's grant, and "change
+      // location" asks for the folder again, so the pick is given up
+      api.forgetFolderPick(path);
     }
     env.rerender();
   }

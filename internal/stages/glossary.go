@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"lectureflow/internal/ctxbuild"
 	"lectureflow/internal/db"
 	"lectureflow/internal/glossary"
+	"lectureflow/internal/llm"
 	"lectureflow/internal/model"
 	"lectureflow/internal/sched"
 	"lectureflow/internal/state"
@@ -67,6 +69,10 @@ func errTermSource(source string) error {
 //     collapsed, zh is trimmed;
 //   - dropped: fewer than 2 characters, more than 6 words, only digits or
 //     punctuation (ctxbuild.DropTerm);
+//   - dropped whole, never cut (AUD5 low-1): an en or zh over the length
+//     limits (ctxbuild.TermTooLong): it is text rather than a term, and the
+//     glossary goes into every later request of the course; such entries
+//     are counted in one service-log line that does not quote them;
 //   - existing source=manual or locked (v2 G1): untouched; existing with
 //     empty zh and a new non-empty zh: zh filled in, unless the zh was set by
 //     the janitor or the user (zh_source, G6 rule 3: "" from fix_zh means
@@ -92,8 +98,9 @@ func MergeTerms(ctx context.Context, d Deps, courseID string, found []FoundTerm,
 		return MergeResult{}, errTermSource(source)
 	}
 	var res MergeResult
+	overlong := 0
 	err := d.Store.Tx(ctx, func(tx db.Store) error {
-		res = MergeResult{}
+		res, overlong = MergeResult{}, 0
 		c, err := tx.GetCourse(ctx, courseID)
 		if err != nil {
 			return err
@@ -117,6 +124,10 @@ func MergeTerms(ctx context.Context, d Deps, courseID string, found []FoundTerm,
 			en := strings.Join(strings.Fields(f.En), " ")
 			zh := strings.TrimSpace(f.Zh)
 			if ctxbuild.DropTerm(en) {
+				continue
+			}
+			if ctxbuild.TermTooLong(en, zh) {
+				overlong++
 				continue
 			}
 			key := ctxbuild.EnKey(en)
@@ -195,6 +206,11 @@ func MergeTerms(ctx context.Context, d Deps, courseID string, found []FoundTerm,
 	if err != nil {
 		return MergeResult{}, err
 	}
+	if overlong > 0 {
+		// counts only: the entries are course material (or injected text)
+		slog.Warn("glossary: over-long extracted terms dropped", "course", courseID, "source", source,
+			"count", overlong, "max_en", ctxbuild.TermEnMaxChars, "max_zh", ctxbuild.TermZhMaxChars)
+	}
 	if res.Changed() {
 		d.events().Changed("terms", courseID)
 		d.invalidate(ctx, courseID, state.StaleCause{Kind: state.StaleGlossary})
@@ -208,11 +224,20 @@ func MergeTerms(ctx context.Context, d Deps, courseID string, found []FoundTerm,
 // a repeat of a kept term is still passed on (it may fill an empty zh in
 // MergeTerms, which applies every rule again). total is the number of
 // distinct usable terms the model returned.
+//
+// An entry over the length limits (ctxbuild.TermTooLong) is not usable and
+// never counts toward n or total, so it cannot push real terms out; it is
+// still passed on so that MergeTerms, which drops it, logs it with the
+// course.
 func firstTerms(found []FoundTerm, n int) (kept []FoundTerm, total int) {
 	seen := map[string]bool{}
 	for _, f := range found {
 		en := strings.Join(strings.Fields(f.En), " ")
 		if ctxbuild.DropTerm(en) {
+			continue
+		}
+		if ctxbuild.TermTooLong(en, f.Zh) {
+			kept = append(kept, f)
 			continue
 		}
 		k := ctxbuild.EnKey(en)
@@ -230,12 +255,13 @@ func firstTerms(found []FoundTerm, n int) (kept []FoundTerm, total int) {
 	return kept, total
 }
 
-// distinctTerms counts the distinct usable en_keys of found.
+// distinctTerms counts the distinct usable en_keys of found (entries over
+// the length limits are not usable).
 func distinctTerms(found []FoundTerm) int {
 	seen := map[string]bool{}
 	for _, f := range found {
 		en := strings.Join(strings.Fields(f.En), " ")
-		if !ctxbuild.DropTerm(en) {
+		if !ctxbuild.DropTerm(en) && !ctxbuild.TermTooLong(en, f.Zh) {
 			seen[ctxbuild.EnKey(en)] = true
 		}
 	}
@@ -299,7 +325,7 @@ func (s *glossaryStage) Run(ctx context.Context, courseID string, progress func(
 	}
 	progress(0.3)
 	req := ctxbuild.GlossarySeedRequest(text)
-	a, err := askJSON(ctx, d.LLM, config.RoleGlossary, req.System, req.User, checkTermsAnswer)
+	a, err := askJSON(llm.WithJSONSchema(ctx, ctxbuild.SchemaTerms), d.LLM, config.RoleGlossary, req.System, req.User, checkTermsAnswer)
 	if err != nil {
 		if isUnusable(err) {
 			return fmt.Errorf("术语提取失败：%w", err)

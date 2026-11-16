@@ -129,6 +129,33 @@ func kitFromManifest(manifestPath, workerDir, agentVersion, platform, engine, mo
 	return k, k.Validate()
 }
 
+// KitSize is what installing a kit downloads and takes on the server
+// (ssh-1b: the wizard's install step says it before starting).
+type KitSize struct {
+	DownloadBytes  int64 `json:"download_bytes"`
+	InstalledBytes int64 `json:"installed_bytes"`
+}
+
+// kitSizeFromManifest adds up the manifest's sizes of the python runtime,
+// the engine's environment and the model of platform (the worker scripts
+// are a few hundred kB and left out).
+func kitSizeFromManifest(manifestPath, platform, engine, modelName, precision string) (KitSize, error) {
+	var ks KitSize
+	m, err := components.LoadManifest(manifestPath)
+	if err != nil {
+		return ks, err
+	}
+	for _, id := range []string{"python", venvComponent(engine), components.ModelID(engine, modelName, precision)} {
+		b := m.Component(id).Build(platform)
+		if b == nil {
+			return ks, fmt.Errorf("the manifest has no %s for %s", id, platform)
+		}
+		ks.DownloadBytes += b.DownloadSize
+		ks.InstalledBytes += max(b.InstalledSize, b.DownloadSize)
+	}
+	return ks, nil
+}
+
 // addWorker adds this build's worker scripts.
 func addWorker(k *remote.KitSpec, workerDir string) error {
 	for _, name := range WorkerFiles {

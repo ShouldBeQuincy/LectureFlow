@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"lectureflow/internal/bridge"
+	lfmedia "lectureflow/internal/media"
 )
 
 // A task's directory, {data_dir}/downloads/{id}/:
@@ -59,6 +60,13 @@ type runSnapshot struct {
 	// net is the run's address policy and HTTP client (local.go; nil
 	// outside a run: Queue.netOf).
 	net *taskNet
+	// guard is the run's session of the guard proxy, through which aria2c
+	// makes every connection of the run's downloads (guard.go; set by
+	// download for as long as aria2c works for the run).
+	guard *guardSession
+	// watch looks at the free space and the task directory's size while
+	// aria2c writes (disklimit.go; set by download).
+	watch *diskWatch
 }
 
 // trackPlan is t{i}/ready.json: how to join an HLS or DASH track.
@@ -123,12 +131,15 @@ func downloadsComplete(dir string, records []trackRecord) bool {
 	return true
 }
 
-// process runs a task to done; any error is how it stopped.
-func (q *Queue) process(ctx context.Context, t *task, s runSnapshot) error {
+// process runs a task to done; any error is how it stopped. A failure
+// that leaves nothing worth keeping takes the task's files with it
+// (discardAfter).
+func (q *Queue) process(ctx context.Context, t *task, s runSnapshot) (err error) {
 	dir, err := filepath.Abs(q.taskDir(s.id))
 	if err != nil {
 		return writeFailure(err)
 	}
+	defer func() { q.discardAfter(ctx, err, s.id, dir) }()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return writeFailure(err)
 	}
@@ -141,7 +152,7 @@ func (q *Queue) process(ctx context.Context, t *task, s runSnapshot) error {
 			if allExpired(s.cookies, q.o.Now()) {
 				return &failure{refresh: true, code: CodeCredentialsExpired}
 			}
-			if err := q.checkSpace(s); err != nil {
+			if err := q.checkSpace(s, dir); err != nil {
 				return err
 			}
 			if err := q.download(ctx, t, s, dir); err != nil {
@@ -158,7 +169,10 @@ func (q *Queue) process(ctx context.Context, t *task, s runSnapshot) error {
 	return q.importMedia(ctx, t, s, media)
 }
 
-func (q *Queue) checkSpace(s runSnapshot) error {
+// checkSpace is the check before a download (disklimit.go): the reserve
+// and what the reported sizes still lack beyond the bytes in the task's
+// directory dir.
+func (q *Queue) checkSpace(s runSnapshot, dir string) error {
 	if q.o.MinFree < 0 {
 		return nil
 	}
@@ -169,12 +183,7 @@ func (q *Queue) checkSpace(s runSnapshot) error {
 	if err != nil {
 		return nil // unknown: do not block the user
 	}
-	need := q.o.MinFree
-	for _, r := range s.records {
-		if r.SizeBytes > 0 {
-			need += r.SizeBytes
-		}
-	}
+	need := q.o.MinFree + missingBytes(s.records, dir)
 	if free < need {
 		return &failure{code: CodeNoSpace, params: map[string]any{"free_bytes": free, "keep_bytes": q.o.MinFree}}
 	}
@@ -183,6 +192,16 @@ func (q *Queue) checkSpace(s runSnapshot) error {
 
 // download fetches every track that is not there yet, in parallel.
 func (q *Queue) download(ctx context.Context, t *task, s runSnapshot, dir string) error {
+	// a proxy aria2c cannot use: the task fails before any request of its
+	// own and before aria2c is started (local.go upstream); the URLs a
+	// playlist leads to are judged one by one later (resolver.checkHost)
+	for _, raw := range s.urls {
+		if u, err := url.Parse(raw); err == nil {
+			if _, err := q.netOf(s).addr.p.upstream(u); err != nil {
+				return asFailure(err)
+			}
+		}
+	}
 	inst, err := q.eng.acquire(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -194,6 +213,19 @@ func (q *Queue) download(ctx context.Context, t *task, s runSnapshot, dir string
 		return &failure{code: CodeEngineFailed, detail: err.Error()}
 	}
 	defer q.eng.release()
+	// aria2c reaches the servers through the guard proxy alone, judged by
+	// the task's own rules; the session ends with the downloads, and its
+	// connections with it
+	sess, err := inst.guard.open(q.netOf(s).addr)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return &failure{code: CodeEngineFailed, detail: err.Error()}
+	}
+	defer sess.close()
+	s.guard = sess
+	s.watch = q.newDiskWatch(dir)
 	lay := layoutOf(s.records)
 	gctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -260,18 +292,40 @@ func (q *Queue) progressDone(t *task, i int, dir string, lay trackLayout) {
 	q.progress(t, i, n, n)
 }
 
+// dirSize is the bytes of the regular files under dir (not following
+// links or junctions; a file gone meanwhile, or a directory that cannot be
+// read, counts nothing).
+//
+// A partial download aria2c is writing (name.part: fetchItems) is measured
+// on its own (Lstat): on Windows the directory listing's size
+// (DirEntry.Info) lags behind for a file another handle still writes, so
+// aria2c's partial files counted as nearly empty (SEC43 low-2, the size
+// limit's check). Every other file is complete, and the listing's size,
+// which Windows gives without a system call per file, is right: one Lstat
+// per file made a look at 20,000 segments take about half a second, in
+// diskWatch's lock, every Options.SpaceInterval (SEC43b low-6).
 func dirSize(dir string) int64 {
 	var total int64
-	_ = filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
-		if err == nil && d.Type().IsRegular() {
-			if fi, err := d.Info(); err == nil {
-				total += fi.Size()
-			}
+	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() {
+			return nil
+		}
+		var fi os.FileInfo
+		if strings.HasSuffix(d.Name(), ".part") {
+			fi, err = lstatFile(p)
+		} else {
+			fi, err = d.Info()
+		}
+		if err == nil {
+			total += fi.Size()
 		}
 		return nil
 	})
 	return total
 }
+
+// lstatFile is os.Lstat (a test counts dirSize's calls).
+var lstatFile = os.Lstat
 
 func defaultExt(kind string) string {
 	if kind == bridge.KindAudio {
@@ -280,9 +334,25 @@ func defaultExt(kind string) string {
 	return ".mp4"
 }
 
+// fileTrackExt is the extension of a file track's local file, t{i}{ext},
+// which becomes the lecture's media{ext} and the end of its
+// original_filename: the URL's when it is a lecture media extension
+// (media.Exts, the check of an upload's name), else the kind's default
+// (AUD3 low-3). Never .part, .tmp or .aria2, which findFinal takes for an
+// unfinished download (AUD3 info-1), nor .exe, .html or a playlist's. The
+// content decides how it is read (media.Check, ffmpeg's probe with the
+// whitelists), not the name.
+func fileTrackExt(rawURL, kind string) string {
+	def := defaultExt(kind)
+	if e := extOf(rawURL, def); lfmedia.AllowedName("t" + e) {
+		return e
+	}
+	return def
+}
+
 func (q *Queue) downloadFile(ctx context.Context, inst *instance, t *task, s runSnapshot, dir string, i int, r trackRecord) error {
 	u := s.urls[i]
-	name := trackName(i) + extOf(u, defaultExt(r.Kind))
+	name := trackName(i) + fileTrackExt(u, r.Kind)
 	items := []fetchItem{{url: u, name: name}}
 	return q.fetchItems(ctx, inst, s, dir, items, s.conns, 1, func(done, total int64) { q.progress(t, i, done, total) })
 }
@@ -445,7 +515,7 @@ func (q *Queue) fetchDASHPart(ctx context.Context, inst *instance, s runSnapshot
 	}
 	part := trackPart{Dir: filepath.ToSlash(filepath.Join(trackDirRel(sub), rel)), Ext: d.ext}
 	if d.single != "" {
-		name := "src" + extOf(d.single, d.ext)
+		name := singleFileName(d.single, d.ext)
 		if err := q.fetchItems(ctx, inst, s, dir, []fetchItem{{url: d.single, name: name}}, s.conns, 1, report); err != nil {
 			return part, err
 		}
@@ -479,7 +549,7 @@ func (q *Queue) fetchPart(ctx context.Context, inst *instance, s runSnapshot, su
 	}
 	part := trackPart{Dir: filepath.ToSlash(filepath.Join(trackDirRel(sub), rel))}
 	if uri, minSize, ok := m.singleFile(); ok {
-		name := "src" + extOf(uri, ".mp4")
+		name := singleFileName(uri, ".mp4")
 		if err := q.fetchItems(ctx, inst, s, dir, []fetchItem{{url: uri, name: name}}, s.conns, 1, report); err != nil {
 			return part, err
 		}
@@ -505,6 +575,18 @@ func (q *Queue) fetchPart(ctx context.Context, inst *instance, s runSnapshot, su
 }
 
 func trackDirRel(sub string) string { return filepath.Base(sub) }
+
+// singleFileName is the local name of the one file of an HLS byte-range
+// playlist or of a DASH SegmentBase Representation: "src" and the URL's
+// extension when it is a media file's, def without one, else the neutral
+// .seg (hlsPartExt, the rule of the segments' names). Never .tmp, which a
+// failure for want of space takes for a temporary file and deletes
+// (removeTempFiles) while ready.json still names it, so that every retry's
+// merge failed (SEC43b info-8); nor .part or .aria2 (aria2c's), nor a
+// playlist's. The "*.tmp is temporary" rule stays one for every writer
+// (writeFileAtomic, the joins, ffmpeg's outputs, the angle) rather than a
+// list of their names to keep in step.
+func singleFileName(rawURL, def string) string { return "src" + hlsPartExt(rawURL, def) }
 
 func writeFileAtomic(path string, b []byte) error {
 	tmp := path + ".tmp"
@@ -605,6 +687,9 @@ func asFailure(err error) *failure {
 	if f := localFailure(err); f != nil {
 		return f
 	}
+	if f := proxyFailure(err); f != nil {
+		return f
+	}
 	var ne net.Error
 	if errors.As(err, &ne) || isTLSError(err) {
 		return netFailure(err)
@@ -703,6 +788,16 @@ func (q *Queue) fetchItems(ctx context.Context, inst *instance, s runSnapshot, d
 	}
 	report(doneBytes, estimate(0, 0, 0))
 	res := q.newResolver(s)
+	// every download is given the guard proxy with the run's session: no
+	// session, no download (a caller outside download: one for this call)
+	sess := s.guard
+	if sess == nil {
+		var err error
+		if sess, err = inst.guard.open(q.netOf(s).addr); err != nil {
+			return engineFailure(inst, err)
+		}
+		defer sess.close()
+	}
 	tick := time.NewTicker(q.o.PollInterval)
 	defer tick.Stop()
 	for len(pending) > 0 || len(active) > 0 {
@@ -734,6 +829,10 @@ func (q *Queue) fetchItems(ctx context.Context, inst *instance, s runSnapshot, d
 				if h := requestHeaders(finals[k], s.cookies, s.referer, q.o.Now()); len(h) > 0 {
 					opts["header"] = h
 				}
+				// aria2c's proxy is the guard, whatever the URL (guard.go)
+				for name, v := range sess.options() {
+					opts[name] = v
+				}
 				gid, err := inst.rpc.addURIDetached(ctx, finals[k], opts)
 				if err != nil {
 					stopAll()
@@ -759,6 +858,13 @@ func (q *Queue) fetchItems(ctx context.Context, inst *instance, s runSnapshot, d
 				return ctx.Err()
 			}
 			return engineFailure(inst, err)
+		}
+		// the guard refused a connection (a redirect to this computer, the
+		// local network or a site LectureFlow does not handle): the task
+		// fails with the rule's code, whatever aria2c makes of the refusal
+		if err := sess.refused(); err != nil {
+			stopAll()
+			return asFailure(err)
 		}
 		var activeDone, activeTotal int64
 		for _, st := range sts {
@@ -787,7 +893,7 @@ func (q *Queue) fetchItems(ctx context.Context, inst *instance, s runSnapshot, d
 				_ = inst.rpc.removeResult(ctx, st.GID)
 			case "error":
 				stopAll()
-				return ariaFailure(st)
+				return sess.failureOf(st)
 			case "removed", "":
 				stopAll()
 				return &failure{code: CodeEngineFailed, detail: "aria2c dropped a download"}
@@ -797,6 +903,17 @@ func (q *Queue) fetchItems(ctx context.Context, inst *instance, s runSnapshot, d
 			}
 		}
 		report(doneBytes+activeDone, estimate(activeDone, activeTotal, len(active)))
+		// the disk (disklimit.go): what these files will hold, the free
+		// space and the task's directory (after the report: a task stopped
+		// here keeps the progress its files hold)
+		if err := q.overDeclared(doneBytes, activeDone, activeTotal); err != nil {
+			stopAll()
+			return err
+		}
+		if err := s.watch.check(); err != nil {
+			stopAll()
+			return err
+		}
 	}
 	return nil
 }

@@ -103,10 +103,11 @@ LectureFlow 是一个运行在你自己电脑上的讲座工具。把课程录�
 ## 隐私
 
 - **录音和转写都在你自己的电脑上完成**，不会上传到任何地方。
-- 只有当你配置了模型服务之后，转写出的文字才会发送给**你自己选择**的服务商，用于修复、摘要和翻译；也可以选择“只转写”，完全不用任何在线服务。
+- 只有当你配置了模型服务之后，转写出的文字才会发送给**你自己选择**的服务商，用于修复、摘要和翻译；整理讲座标题时，还会连同摘要发送讲座的原始文件名（由浏览器扩展送来的讲座，就是页面或平台上的标题）。也可以选择“只转写”，完全不用任何在线服务。
 - 使用 Google Colab 后端时，录音会上传到 Google 的服务器，选择时会明确提示。LectureFlow 还会用你自己的授权向 Google 查询 Colab 账户的计算单元余额和可以借用的显卡；只在运行时使用期间，读取它的内存与 GPU 读数，显示在资源栏里。
 - 保存的 API key 与 Colab 授权用系统账户的凭据保护（Windows 的 DPAPI、macOS 的钥匙串）加密存放。把数据目录搬到另一台电脑或另一个系统账户后，需要重新输入。
 - LectureFlow 不收集任何使用数据，没有遥测，没有账户。
+- 网页模式（不经桌面版，直接运行服务程序再用浏览器打开）没有访问令牌，这台电脑上的其他账户或程序都能访问它（它只监听本机地址，局域网里的其他电脑访问不到）；多人共用的电脑上请使用桌面版。
 - 浏览器扩展只和你电脑上的 LectureFlow 通信，只在你送入讲座时读取录播网站的 Cookie，详见[扩展隐私声明](docs/extension/privacy.md)。
 
 ## 转写后端
@@ -144,7 +145,7 @@ LectureFlow 是一个运行在你自己电脑上的讲座工具。把课程录�
 
 ## 开始使用
 
-1. 从 [Releases](https://github.com/ShouldBeQuincy/LectureFlow/releases) 下载对应系统的安装包：Windows 用 `LectureFlow-Setup-3.2.0-x64.exe`（或便携版），Apple Silicon Mac 用 `LectureFlow-3.2.0-arm64.dmg`。新版本的变化见[发布说明](docs/release-notes/3.2.0.md)。
+1. 从 [Releases](https://github.com/ShouldBeQuincy/LectureFlow/releases) 下载对应系统的安装包：Windows 用 `LectureFlow-Setup-3.3.0-x64.exe`（或便携版），Apple Silicon Mac 用 `LectureFlow-3.3.0-arm64.dmg`。新版本的变化见[发布说明](docs/release-notes/3.3.0.md)。
 2. 安装包目前没有代码签名，系统会弹出安全提示，放行方法见 [docs/install.md](docs/install.md)。
 3. 打开 LectureFlow，跟着引导走几步：选择语言、检测电脑、选择费用档位、下载组件。每一步都可以跳过，之后再回来。
 4. 添加一门课程：填写课程名称和开课日期，可以顺便粘贴课程大纲、上传课件（不是必须的，但能明显提高专业术语的准确度）。

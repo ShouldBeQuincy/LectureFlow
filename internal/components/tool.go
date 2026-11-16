@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"lectureflow/internal/dirperm"
 	"lectureflow/internal/model"
 )
 
@@ -143,20 +144,34 @@ func (m *Manager) checkTool(ctx context.Context, t *task, it *item, c *Component
 
 // runTool runs a tool with the process environment minus the variables
 // that would redirect its Python (ToolBaseEnv), plus vars. Its working
-// directory is the system's temporary directory: on Windows, ending
-// gcloud.cmd leaves the programs it started running for a moment, and a
-// working directory inside the data directory would keep that from being
-// moved or removed meanwhile.
+// directory is a new empty directory only this account can open, made
+// below the system's temporary directory for each run and removed
+// afterwards. Not the temporary directory itself: cmd.exe (gcloud.cmd)
+// looks for the programs a script calls in the working directory first,
+// so a file someone put there would run (security audit L-13). Not inside
+// the data directory: on Windows, ending gcloud.cmd leaves the programs it
+// started running for a moment, which would keep a working directory there
+// from being moved or removed meanwhile. Every path the tool gets is
+// absolute (exe, the {dir} / {tmp} / {exe:ID} variables).
 func (m *Manager) runTool(ctx context.Context, exe string, args, vars []string) (string, error) {
+	wd, err := dirperm.MkdirTempPrivate(os.TempDir(), "lectureflow-tool-")
+	if err != nil {
+		return "", asCoded(err, nil)
+	}
+	defer func() {
+		if err := removeAllRetry(wd); err != nil {
+			m.log.Warn("components: cannot remove the tool's working directory", "dir", wd, "error", err)
+		}
+	}()
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Env = append(ToolBaseEnv(os.Environ()), vars...)
-	cmd.Dir = os.TempDir()
+	cmd.Dir = wd
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	cmd.WaitDelay = 5 * time.Second
 	hideWindow(cmd)
-	err := cmd.Run()
+	err = cmd.Run()
 	return out.String(), err
 }
 
@@ -226,11 +241,15 @@ func (m *Manager) expandEnv(v, toolDir, tmp string, st *state) (string, bool) {
 		case strings.HasPrefix(inner, "exe:"):
 			isPath = true
 			e, found := st.Active[strings.TrimPrefix(inner, "exe:")]
-			if !found || e.Exe == "" {
+			p, good := "", false
+			if found {
+				p, good = m.exePath(e)
+			}
+			if !good {
 				ok = false
 				return tm
 			}
-			return filepath.Join(m.abs(e.Dir), filepath.FromSlash(e.Exe))
+			return p
 		}
 		ok = false
 		return tm
@@ -252,11 +271,11 @@ func (m *Manager) ToolPath(id string) (string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e, ok := m.st.Active[id]
-	if !ok || e.Kind != KindTool || e.Exe == "" {
+	if !ok || e.Kind != KindTool {
 		return "", false
 	}
-	p := filepath.Join(m.abs(e.Dir), filepath.FromSlash(e.Exe))
-	if !fileExists(p) {
+	p, ok := m.exePath(e)
+	if !ok || !fileExists(p) {
 		return "", false
 	}
 	return p, true

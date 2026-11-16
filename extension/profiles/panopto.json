@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "panopto",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "name": "Panopto",
   "maintainers": ["@ShouldBeQuincy"],
   "match": {
@@ -48,7 +48,7 @@
     {
       "role": "primary-audio",
       "label": { "zh-CN": "主讲音频", "en": "Lecture audio", "zh-TW": "主講音訊", "yue-Hant-HK": "主講聲音", "ru": "Аудио лекции", "hi": "लेक्चर का ऑडियो" },
-      "hint": { "zh-CN": "只要转写时最小", "en": "Smallest; enough to transcribe", "zh-TW": "檔案最小，轉錄用它就夠", "yue-Hant-HK": "檔案最細，轉錄有佢就夠", "ru": "Самый маленький; для расшифровки хватит", "hi": "सबसे छोटा; ट्रांसक्रिप्शन के लिए काफ़ी" },
+      "hint": { "zh-CN": "文件最小，只转写用它就够", "en": "Smallest; enough to transcribe", "zh-TW": "檔案最小，轉錄用它就夠", "yue-Hant-HK": "檔案最細，轉錄有佢就夠", "ru": "Самый маленький; для расшифровки хватит", "hi": "सबसे छोटा; ट्रांसक्रिप्शन के लिए काफ़ी" },
       "detect": {
         "urlPattern": "/sessions/[0-9a-f-]{36}/[0-9a-f-]{36}(-[0-9a-f-]{36})?\\.hls/master\\.m3u8$",
         "kind": "audio",

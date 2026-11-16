@@ -118,8 +118,9 @@ func scanProvider(sc interface{ Scan(...any) error }) (model.Provider, error) {
 	var key string
 	err := sc.Scan(&p.ID, &p.Name, &p.Type, &p.BaseURL, &key, &p.MaxConcurrency, &p.RPM, &p.BalanceAPI,
 		&in, &hit, &out, &cur, &p.CreatedAt, &tariff, &offpeak)
-	// cred-enc (sealed.go): the plain key; "" when no key opens it
-	p.APIKey = openProviderKey(p.ID, key)
+	// cred-enc (sealed.go): the plain key; "" when no key opens it for this
+	// provider and the origin of its base_url (sec3 L3)
+	p.APIKey = openProviderKey(p.ID, p.BaseURL, key)
 	p.PriceInput, p.PriceCacheHit, p.PriceOutput, p.Currency = floatPtr(in), floatPtr(hit), floatPtr(out), strPtr(cur)
 	p.Tariff, p.OffpeakOnly = strPtr(tariff), offpeak != 0
 	return p, err
@@ -151,7 +152,7 @@ func (s *sqlStore) InsertProvider(ctx context.Context, p model.Provider) error {
 	if p.CreatedAt == "" {
 		p.CreatedAt = Now()
 	}
-	key, err := sealStored(p.APIKey) // cred-enc: stored sealed
+	key, err := sealStored(p.APIKey, SealPurposeProviderKey, ProviderKeyBinding(p.ID, p.BaseURL)) // cred-enc: stored sealed
 	if err != nil {
 		return err
 	}
@@ -162,14 +163,14 @@ func (s *sqlStore) InsertProvider(ctx context.Context, p model.Provider) error {
 	return duplicate(err)
 }
 
-// storedProviderKey is the provider's api_key column as stored (sealed).
-func (s *sqlStore) storedProviderKey(ctx context.Context, id string) (string, error) {
-	var v string
-	err := s.q.QueryRowContext(ctx, `SELECT api_key FROM provider WHERE id = ?`, id).Scan(&v)
+// storedProviderKey is the provider's api_key column as stored (sealed)
+// and the base_url it is bound to (sec3 L3).
+func (s *sqlStore) storedProviderKey(ctx context.Context, id string) (key, baseURL string, err error) {
+	err = s.q.QueryRowContext(ctx, `SELECT api_key, base_url FROM provider WHERE id = ?`, id).Scan(&key, &baseURL)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil // affectedOrNotFound reports the missing row
+		return "", "", nil // affectedOrNotFound reports the missing row
 	}
-	return v, err
+	return key, baseURL, err
 }
 
 const updateProviderSet = `UPDATE provider SET name = ?, type = ?, base_url = ?, max_concurrency = ?,
@@ -187,24 +188,48 @@ func updateProviderArgs(p model.Provider) []any {
 // the old one on the secure path (secure_delete, VACUUM, TRUNCATE
 // checkpoint), so the old key leaves no copy in free pages or the WAL.
 // Inside a transaction (VACUUM cannot run there) it is a plain UPDATE.
+//
+// sec3 I4: an empty APIKey never removes a stored key that cannot be
+// decrypted here (the provider was read with "" for it): it stays as it
+// is, so a key file that is put back still opens it. Removing a key, any
+// key, is UpdateProviderClearKey. sec3 L3: the key is sealed bound to the
+// origin of p.BaseURL; a key kept while the origin changes is sealed again
+// for the new one (the caller passed it on purpose: settings clears it
+// instead, sec2-app L2).
 func (s *sqlStore) UpdateProvider(ctx context.Context, p model.Provider) error {
-	old, err := s.storedProviderKey(ctx, p.ID)
+	old, oldBase, err := s.storedProviderKey(ctx, p.ID)
 	if err != nil {
 		return err
 	}
 	key := old
-	plainOld, unreadable := openStored(old)
-	// a plain stored key (written without a data key) is sealed now, also
-	// when it stays the same; its plain copy goes on the secure path
-	changed := unreadable || plainOld != p.APIKey || (old != "" && !secrets.IsSealed(old) && secrets.HasKey())
+	plainOld, unreadable, current := openStoredCurrent(old, SealPurposeProviderKey, ProviderKeyBinding(p.ID, oldBase))
+	var changed bool
+	switch {
+	case old == "":
+		changed = p.APIKey != ""
+	case unreadable:
+		changed = p.APIKey != "" // I4: "" keeps the key to enter again
+	default:
+		// a plain stored key (written without a data key), an enc:v1: one
+		// or one of an earlier key is sealed (bound) now, also when it stays
+		// the same; its old copy goes on the secure path
+		changed = plainOld != p.APIKey || (!current && secrets.HasKey()) ||
+			BaseURLOrigin(oldBase) != BaseURLOrigin(p.BaseURL)
+	}
 	if changed {
-		if key, err = sealStored(p.APIKey); err != nil {
+		if key, err = sealStored(p.APIKey, SealPurposeProviderKey, ProviderKeyBinding(p.ID, p.BaseURL)); err != nil {
 			return err
 		}
 	}
+	return s.writeProvider(ctx, p, key, changed && old != "")
+}
+
+// writeProvider writes p's columns and api_key = key; secure: the old key
+// leaves the database (secure path unless inside a transaction).
+func (s *sqlStore) writeProvider(ctx context.Context, p model.Provider, key string, secure bool) error {
 	args := append(updateProviderArgs(p), key, p.ID)
 	q := updateProviderSet + `, api_key = ? WHERE id = ?`
-	if !changed || old == "" || s.tx != nil {
+	if !secure || s.tx != nil {
 		res, err := s.q.ExecContext(ctx, q, args...)
 		return affectedOrNotFound(res, duplicate(err))
 	}
@@ -228,7 +253,8 @@ func (s *sqlStore) UpdateProvider(ctx context.Context, p model.Provider) error {
 // UpdateProviderKeepKey writes p except its key: the stored key stays as it
 // is, also one that cannot be decrypted here (settings: a provider whose key
 // has to be entered again keeps it while other fields change, so a key file
-// that is put back still opens it).
+// that is put back still opens it). The key stays bound to the origin it
+// was sealed for: with p.BaseURL on another origin it no longer opens.
 func (s *sqlStore) UpdateProviderKeepKey(ctx context.Context, p model.Provider) error {
 	res, err := s.q.ExecContext(ctx, updateProviderSet+` WHERE id = ?`, append(updateProviderArgs(p), p.ID)...)
 	return affectedOrNotFound(res, duplicate(err))
@@ -239,11 +265,30 @@ type ProviderKeyKeeper interface {
 	UpdateProviderKeepKey(ctx context.Context, p model.Provider) error
 }
 
+// UpdateProviderClearKey writes p except its key and removes the stored
+// key, whatever it is (plain, sealed, or one that cannot be decrypted
+// here), in the same statement, on the secure path (inside a transaction
+// a plain UPDATE: the caller runs ScrubFreedSecrets after it). sec3 I4:
+// the explicit "clear the key" (settings: base_url moved to another
+// origin, sec2-app L2), since UpdateProvider keeps an unreadable key.
+func (s *sqlStore) UpdateProviderClearKey(ctx context.Context, p model.Provider) error {
+	old, _, err := s.storedProviderKey(ctx, p.ID)
+	if err != nil {
+		return err
+	}
+	return s.writeProvider(ctx, p, "", old != "")
+}
+
+// ProviderKeyClearer is the optional Store method UpdateProviderClearKey.
+type ProviderKeyClearer interface {
+	UpdateProviderClearKey(ctx context.Context, p model.Provider) error
+}
+
 // DeleteProvider deletes the provider; one with a key on the secure path
 // (L5) unless inside a transaction (the caller then runs
 // ScrubFreedSecrets after it).
 func (s *sqlStore) DeleteProvider(ctx context.Context, id string) error {
-	old, err := s.storedProviderKey(ctx, id)
+	old, _, err := s.storedProviderKey(ctx, id)
 	if err != nil {
 		return err
 	}

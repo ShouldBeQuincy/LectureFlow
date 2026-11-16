@@ -33,7 +33,15 @@ type LLMSnapshot struct {
 	// PromptVersion is the prompt version of the stage (v2 G5.5); 0 (absent,
 	// snapshots written before v2) means version 1. Compared by SameSnapshot.
 	PromptVersion int `json:"prompt_version,omitempty"`
+	// Source (v3.2.x P1-b, lead freeze): SnapshotSourceManual when the user
+	// named provider, model and params for one retry instead of taking the
+	// role's setting; "" otherwise. Display only ("临时指定"); not compared.
+	Source string `json:"source,omitempty"`
 }
+
+// SnapshotSourceManual is LLMSnapshot.Source of a snapshot the user wrote
+// by hand for one retry (model choice manual).
+const SnapshotSourceManual = "manual"
 
 // SnapshotPromptVersion returns the prompt version of an LLM snapshot
 // (1 when it has none).
@@ -210,7 +218,8 @@ func SameSnapshot(stage, a, b string) bool {
 func sameParams(a, b RoleParams) bool {
 	eqF := func(x, y *float64) bool { return (x == nil) == (y == nil) && (x == nil || *x == *y) }
 	eqI := func(x, y *int) bool { return (x == nil) == (y == nil) && (x == nil || *x == *y) }
-	return eqF(a.Temperature, b.Temperature) && eqI(a.Window, b.Window) && ThinkingLevel(a) == ThinkingLevel(b)
+	return eqF(a.Temperature, b.Temperature) && eqI(a.Window, b.Window) && ThinkingLevel(a) == ThinkingLevel(b) &&
+		eqI(a.MaxTokens, b.MaxTokens) // Batch is not compared (see RoleParams)
 }
 
 // SnapshotWindow returns the translate context window x of a translate

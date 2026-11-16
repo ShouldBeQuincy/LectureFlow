@@ -17,7 +17,7 @@
 // detection-like result, the tracks a bulk send takes, row states. Pure.
 
 import { parseHttpUrl, hostMatches, withoutQuery } from './url.js';
-import { profileRegex, profileMatchesUrl, applyProfile, lectureFor, downloadPolicyFor, profilePermissionOrigins } from './profile.js';
+import { profileRegex, regexOwner, profileStopped, profileMatchesUrl, applyProfile, lectureFor, downloadPolicyFor, profilePermissionOrigins } from './profile.js';
 import { profileKey, parsePointer, readPointer, cleanObservedRecord, grantedHostPatterns } from './observe.js';
 import { isBlockedUrl } from './blocklist.js';
 import { groupOf, ACTIVE_STATES, presetSelection } from './send.js';
@@ -31,7 +31,7 @@ export function inpageModeFor(profile, rawUrl) {
   if (ip.player && profileMatchesUrl(profile, rawUrl)) return 'player';
   if (ip.list) {
     try {
-      if (profileRegex(ip.list.pathPattern).test(u.pathname)) return 'list';
+      if (profileRegex(ip.list.pathPattern, regexOwner(profile)).test(u.pathname)) return 'list';
     } catch {
       return '';
     }
@@ -64,13 +64,15 @@ export function inpageMatches(granted, profiles) {
  * ruling 7): its method and path, plus the urlPattern of the observe entry
  * it names and the profile's page hosts. The request is made only from a
  * frame on one of those hosts, to that frame's own origin, at exactly the
- * declared path, and only when that address matches the pattern.
+ * declared path, and only when that address matches the pattern. A
+ * profile that is not reviewed (a local import) may only GET (FB1 L-2):
+ * its spec says getOnly, and sessionInfoRequest refuses anything else.
  */
-export function sessionInfoSpec(profile) {
+export function sessionInfoSpec(profile, { reviewed = false } = {}) {
   const info = profile && profile.sessionInfo;
   const obs = info && (profile.observe || [])[info.observe];
   if (!info || !obs) return null;
-  return { method: info.method, path: info.path, form: { ...(info.form || {}) }, urlPattern: obs.urlPattern, hosts: [...profile.match.hosts] };
+  return { method: info.method, path: info.path, form: { ...(info.form || {}) }, urlPattern: obs.urlPattern, hosts: [...profile.match.hosts], getOnly: !reviewed, owner: regexOwner(profile) };
 }
 
 /** The pointers a sessionInfo answer is read with (those of its observe entry). */
@@ -105,19 +107,19 @@ export function inpageConfig(found) {
           header: list.header || [],
         }
       : null,
-    sessionInfo: sessionInfoSpec(p),
+    sessionInfo: sessionInfoSpec(p, { reviewed: !!found.reviewed }),
     pointers: sessionInfoPointers(p),
     presets: p.presets || null,
   };
 }
 
-/** A row's session id from its attribute value ("" when it does not look like one). */
-export function rowSessionId(raw, list) {
+/** A row's session id from its attribute value ("" when it does not look like one); owner: the profile's key. */
+export function rowSessionId(raw, list, owner = '') {
   const v = String(raw ?? '').trim();
   if (!v) return '';
   let id = v;
   if (list.idPattern) {
-    const m = profileRegex(list.idPattern).exec(v);
+    const m = profileRegex(list.idPattern, owner).exec(v);
     if (!m) return '';
     id = m.length > 1 ? m[1] || '' : m[0];
   }
@@ -139,6 +141,7 @@ export function sessionInfoRequest(info, sessionId, frameUrl) {
   const base = parseHttpUrl(frameUrl);
   if (!info || !base || !sessionId || typeof info.path !== 'string' || !SESSION_PATH.test(info.path)) return null;
   if (info.method !== 'GET' && info.method !== 'POST') return null;
+  if (info.getOnly && info.method !== 'GET') return null;
   if (Array.isArray(info.hosts) && !info.hosts.some((h) => hostMatches(h, base.hostname))) return null;
   const url = new URL(info.path, base.origin);
   // nothing normalised away: exactly the declared path, on the frame's origin
@@ -146,7 +149,7 @@ export function sessionInfoRequest(info, sessionId, frameUrl) {
   if (info.urlPattern !== undefined) {
     let ok = false;
     try {
-      ok = profileRegex(info.urlPattern).test(withoutQuery(url.href));
+      ok = profileRegex(info.urlPattern, typeof info.owner === 'string' ? info.owner : '').test(withoutQuery(url.href));
     } catch {
       ok = false;
     }
@@ -174,6 +177,19 @@ export function extractPointers(obj, pointers) {
 }
 
 /**
+ * The answer to an in-page card's "session.load" (src/background/main.js):
+ * { ok: true, result } or the error the card shows. A profile the runtime
+ * guard stopped reads nothing any more: the error then says so
+ * (policyStopped), and the bulk card shows why instead of a bare "could not
+ * read" (SEC22 L-D). The session is not sent either way.
+ */
+export function sessionLoadReply(args) {
+  const result = sessionResult(args);
+  if (result) return { ok: true, result };
+  return { ok: false, error: { code: 'ext.info_failed', params: { status: 0 } }, policyStopped: profileStopped(args.found.profile) };
+}
+
+/**
  * A detection-like result for one listed session from its sessionInfo
  * values: what the popup and the send path use (src/lib/send.js), with no
  * generic tracks. Returns null when the values do not fit the profile.
@@ -181,7 +197,7 @@ export function extractPointers(obj, pointers) {
 export function sessionResult({ found, sessionId, values, frameUrl, locale = 'en' }) {
   const profile = found.profile;
   const info = profile.sessionInfo;
-  const req = sessionInfoRequest(sessionInfoSpec(profile), sessionId, frameUrl);
+  const req = sessionInfoRequest(sessionInfoSpec(profile, { reviewed: !!found.reviewed }), sessionId, frameUrl);
   if (!req) return null;
   const rec = cleanObservedRecord(profile, { key: profileKey(profile), index: info.observe, url: req.url, values });
   if (!rec) return null;
@@ -205,6 +221,7 @@ export function sessionResult({ found, sessionId, values, frameUrl, locale = 'en
     sessionSource: 'profile',
     lecture: lectureFor(match, {}, 0, observed),
     downloadPolicy: downloadPolicyFor(match, {}, observed),
+    policyStopped: profileStopped(profile),
     tracks: [],
     named,
     summary: null,
@@ -239,17 +256,22 @@ export function rowState(item) {
   return 'new';
 }
 
-/** Counts for the bulk card's summary line. */
+/**
+ * Counts for the bulk card's summary line. A lecture that needs a refresh
+ * is not being fetched (T26 G5): refresh counts it apart.
+ */
 export function bulkCounts(rows, items, picked) {
   const byId = new Map((items || []).map((i) => [i.sessionId, i]));
   let imported = 0;
   let active = 0;
+  let refresh = 0;
   for (const r of rows) {
     const s = rowState(byId.get(r.sessionId));
     if (s === 'imported') imported++;
-    else if (s === 'active' || s === 'refresh') active++;
+    else if (s === 'active') active++;
+    else if (s === 'refresh') refresh++;
   }
-  return { total: rows.length, imported, active, toSend: rows.filter((r) => picked.has(r.sessionId)).length };
+  return { total: rows.length, imported, active, refresh, toSend: rows.filter((r) => picked.has(r.sessionId)).length };
 }
 
 export { groupOf };

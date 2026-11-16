@@ -10,8 +10,10 @@ import (
 	"strings"
 	"testing"
 	"unicode"
+	"unicode/utf8"
 
 	"lectureflow/internal/fetch"
+	"lectureflow/internal/media"
 	"lectureflow/internal/model"
 )
 
@@ -80,7 +82,7 @@ func TestLectureTitleEdges(t *testing.T) {
 		}
 		var l Lecture
 		decodeInto(t, b, &l)
-		if l.Title != tc.title || l.TitleSource != tc.sourc || l.OriginalFilename != tc.name {
+		if l.Title != tc.title || l.TitleSource != tc.sourc || l.OriginalFilename != media.StripBidi(tc.name) || !noBidi(l.OriginalFilename) {
 			t.Errorf("%q (title field %q): title %q source %s original %q, want %q %s", tc.name, tc.field, l.Title, l.TitleSource, l.OriginalFilename, tc.title, tc.sourc)
 		}
 	}
@@ -136,5 +138,56 @@ func TestImportDownloadTitleEdges(t *testing.T) {
 		if l.Title != tc.want || !noBidi(l.Title) {
 			t.Errorf("%q / %q: title %q, want %q", tc.title, tc.filename, l.Title, tc.want)
 		}
+		if !noBidi(l.OriginalFilename) {
+			t.Errorf("%q: original_filename %q keeps a bidi control", tc.filename, l.OriginalFilename)
+		}
+	}
+}
+
+// test-media I8: a stored title is cut to maxLectureTitleRunes characters
+// on a character boundary, kept on one line, and keeps no white space or
+// dangling joiner from the cut; titles within the limit are unchanged.
+func TestCleanLectureTitleLimits(t *testing.T) {
+	long := strings.Repeat("密码学", 100) // 300 characters, 900 bytes
+	if got := cleanLectureTitle(long); utf8.RuneCountInString(got) != maxLectureTitleRunes || got != string([]rune(long)[:maxLectureTitleRunes]) {
+		t.Errorf("long title: %d characters %q", utf8.RuneCountInString(got), got)
+	}
+	for _, tc := range []struct{ in, want string }{
+		{"Week 1", "Week 1"},
+		{"\tWeek 1\n", "Week 1"},
+		{"Week 1\nStream Ciphers", "Week 1 Stream Ciphers"},
+		{"Week 1\u2028Hashing\r\n", "Week 1 Hashing"},
+		{"a\u202e\u2066b\u2069\u200f", "ab"},
+		{"مرحبا Week 2", "مرحبا Week 2"}, // right-to-left text itself stays
+		{strings.Repeat("x", maxLectureTitleRunes-1) + " y", strings.Repeat("x", maxLectureTitleRunes-1)},
+		{strings.Repeat("x", maxLectureTitleRunes-1) + "\u200d\U0001F469", strings.Repeat("x", maxLectureTitleRunes-1)},
+		{strings.Repeat("é", maxLectureTitleRunes), strings.Repeat("é", maxLectureTitleRunes)},
+	} {
+		if got := cleanLectureTitle(tc.in); got != tc.want {
+			t.Errorf("cleanLectureTitle(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	for _, s := range []string{long, "x\u202e" + long} {
+		if got := cleanLectureTitle(s); !utf8.ValidString(got) || !noBidi(got) {
+			t.Errorf("invalid result %q", got)
+		}
+	}
+
+	// through the API: an upload's long file name and a PATCH
+	e := newEnv(t)
+	c := e.course("C")
+	res, b := e.upload("/api/courses/"+c.ID+"/lectures", nil, strings.Repeat("Lecture ", 40)+".mp4", []byte("fake media"))
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("upload: %d %s", res.StatusCode, b)
+	}
+	var l Lecture
+	decodeInto(t, b, &l)
+	if n := utf8.RuneCountInString(l.Title); n > maxLectureTitleRunes || strings.HasSuffix(l.Title, " ") {
+		t.Errorf("uploaded title %d characters %q", n, l.Title)
+	}
+	var got Lecture
+	e.call("PATCH", "/api/lectures/"+l.ID, map[string]any{"title": " Stream\nCiphers " + long}, http.StatusOK, &got)
+	if n := utf8.RuneCountInString(got.Title); n != maxLectureTitleRunes || !strings.HasPrefix(got.Title, "Stream Ciphers 密码学") {
+		t.Errorf("patched title %d characters %q", n, got.Title)
 	}
 }

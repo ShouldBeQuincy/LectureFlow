@@ -9,13 +9,12 @@ const path = require('node:path');
 const { app, dialog, Menu } = require('electron');
 
 const { resolveDataDir } = require('./lib/datadir');
-const { refuseDebugging } = require('./lib/debugflags');
+const { devEnvToDrop, startRefusal } = require('./lib/debugflags');
 const { LOCALE_FILE, createShellTranslator, loadTranslator, readLocaleMemo } = require('./lib/i18n');
 const { buildMenuTemplate } = require('./lib/menu');
 const { isBackgroundLaunch } = require('./lib/nmhost');
 const { resolveServerCommand } = require('./lib/serverutil');
-const { describeInstallation } = require('./lib/updatefiles');
-const { updateFeedFrom, updateFeedNote } = require('./lib/updatefeed');
+const { describeInstallation, installDirOf, portableExecutable } = require('./lib/updatefiles');
 const { runVerify } = require('./lib/verifyupdate');
 const { createLogger } = require('./logger');
 const {
@@ -32,57 +31,78 @@ const APP_ID = 'org.lectureflow.desktop';
 const LOCK_RETRY_MS = 500;
 const LOCK_RETRIES = 40;
 
-/**
- * loadUpdater: electron-updater in the packaged app, only when the build
- * configured an update repository (LECTUREFLOW_UPDATE_REPO at build time ->
- * resources/app-update.yml, see scripts/lib/updaterepo.js). Without it the
- * updater is never loaded: no update checks, /api/app/update stays "none".
- * Unpackaged builds have no update feed; tests may point
- * LECTUREFLOW_FAKE_UPDATER at a module that stands in for it.
- * Called by the shell only when the service says in-app updates
- * (internal/selfupdate) are not configured (updatepath.js).
- * Returns { updater, note }: note is logged by the caller.
- */
-function loadUpdater(log) {
-  if (!app.isPackaged) {
-    const fake = process.env.LECTUREFLOW_FAKE_UPDATER;
-    return { updater: fake ? require(path.resolve(fake)) : null, note: null };
-  }
-  const feed = updateFeedFrom({ resourcesPath: process.resourcesPath, readFile: (p) => fs.readFileSync(p, 'utf8') });
-  const note = updateFeedNote(feed);
-  if (!feed.enabled) return { updater: null, note };
-  try {
-    const { autoUpdater } = require('electron-updater');
-    autoUpdater.logger = { info: (m) => log.info(`updater: ${m}`), warn: (m) => log.warn(`updater: ${m}`), error: (m) => log.warn(`updater: ${m}`), debug() {} };
-    return { updater: autoUpdater, note };
-  } catch (err) {
-    return { updater: null, note: `updates unavailable: ${err.message}` };
-  }
-}
+const PACKAGED_UPDATER_NOTE = 'updates: the service did not offer in-app updates (signed update.json); the packaged app does not load electron-updater, so automatic updates are off';
 
 /**
- * refuseDebugSwitches: the packaged app does not start with a debugging
- * switch (--remote-debugging-port and the like, see lib/debugflags.js)
- * unless LECTUREFLOW_E2E_ALLOW_DEBUG=1. Returns true when it is quitting.
- * Runs first, before anything else of the app exists.
+ * loadUpdater: the updater of the electron-updater path (updatepath.js),
+ * which the shell takes only when the service says in-app updates
+ * (internal/selfupdate) are not configured, or does not know them.
+ * The packaged app never loads electron-updater (security audit FB1 L-8:
+ * its updates carry no signature of the maintainer's own, and a service
+ * that answers 404 / 503 would have switched a build to it), whatever
+ * resources/app-update.yml says: no update checks, /api/app/update stays
+ * "none". Development has no update feed; tests may point
+ * LECTUREFLOW_FAKE_UPDATER at a module that stands in for it (ignored and
+ * dropped from the environment when packaged, lib/debugflags.js).
+ * Returns { updater, note }: note is logged by the caller.
  */
-function refuseDebugSwitches() {
-  const refused = refuseDebugging({
-    isPackaged: app.isPackaged,
-    argv: process.argv.slice(1),
-    env: process.env,
-    hasSwitch: (s) => app.commandLine.hasSwitch(s),
-  });
-  if (!refused.length) return false;
-  // app.getLocale() is not available before "ready" on Windows; ICU's default is.
-  const { t } = loadTranslator(Intl.DateTimeFormat().resolvedOptions().locale);
+function loadUpdater() {
+  if (app.isPackaged) return { updater: null, note: PACKAGED_UPDATER_NOTE };
+  const fake = process.env.LECTUREFLOW_FAKE_UPDATER;
+  return { updater: fake ? require(path.resolve(fake)) : null, note: null };
+}
+
+/** refuseStart: the message box of a refused start, then exit code 2. Returns true. */
+function refuseStart(title, body) {
   try {
-    dialog.showErrorBox(t('debug.refused.title'), t('debug.refused.body', { switches: refused.map((s) => `--${s}`).join(', ') }));
+    dialog.showErrorBox(title, body);
   } catch {
     // no dialog: still refuse
   }
   app.exit(2);
   return true;
+}
+
+/**
+ * refuseDebugSwitches: the packaged app does not start with a switch it
+ * does not use itself (--remote-debugging-port, --proxy-server and every
+ * other one, see lib/debugflags.js), nor with ELECTRON_DISABLE_SANDBOX in
+ * its environment (Electron then runs without the sandbox, and together
+ * with app.enableSandbox() the app crashes silently as its window opens).
+ * LECTUREFLOW_E2E_ALLOW_DEBUG=1 lets the switches through, not the latter.
+ * lib/debugflags.js startRefusal decides whether and with which box; this
+ * only shows it. Returns true when it is quitting.
+ * Runs first, before anything else of the app exists (before
+ * app.enableSandbox() and any window).
+ */
+function refuseDebugSwitches() {
+  const refusal = startRefusal({
+    isPackaged: app.isPackaged,
+    argv: process.argv.slice(1),
+    env: process.env,
+    hasSwitch: (s) => app.commandLine.hasSwitch(s),
+    platform: process.platform,
+  });
+  if (!refusal) return false;
+  // app.getLocale() is not available before "ready" on Windows; ICU's default is.
+  const { t } = loadTranslator(Intl.DateTimeFormat().resolvedOptions().locale);
+  return refuseStart(t(refusal.title), t(refusal.body, refusal.params));
+}
+
+/**
+ * dropDevEnvironment: the packaged app removes the development variables of
+ * its environment (lib/debugflags.js devEnvToDrop) before anything reads
+ * it, so they reach neither this process's code nor the service. It also
+ * drops PORTABLE_EXECUTABLE_FILE when this is not the portable build (an
+ * uninstaller lies next to the exe, lib/updatefiles.js portableExecutable),
+ * so that every reader (updates, the extension's launcher) agrees.
+ */
+function dropDevEnvironment() {
+  for (const k of devEnvToDrop({ isPackaged: app.isPackaged, env: process.env })) delete process.env[k];
+  if (app.isPackaged && process.env.PORTABLE_EXECUTABLE_FILE !== undefined
+    && !portableExecutable({ isPackaged: app.isPackaged, platform: process.platform, execPath: process.execPath, env: process.env })) {
+    delete process.env.PORTABLE_EXECUTABLE_FILE;
+  }
 }
 
 /**
@@ -131,10 +151,12 @@ function installationForUpdates() {
 }
 
 /**
- * restoreHelper (--lf-restore): this process is the backed-up copy of the
- * previous Windows installation, started by a freshly installed version
- * that failed. It waits for that version to quit, puts itself back in its
- * place and starts it (SelfUpdateApplier.restoreFromBackup). No window.
+ * restoreHelper (--lf-restore): this process is a copy of a freshly
+ * installed version of the Windows installation that failed, which that
+ * version put into a private temporary folder next to a checked copy of
+ * the backup of the previous installation. It waits for the failed version
+ * to quit, puts that checked copy into the installation's place and starts
+ * it (SelfUpdateApplier.restoreFromBackup). No window.
  */
 async function restoreHelper(resolved, log) {
   if (!app.isPackaged || !resolved.dataDir) {
@@ -161,6 +183,7 @@ async function restoreHelper(resolved, log) {
 
 function main() {
   if (refuseDebugSwitches()) return;
+  dropDevEnvironment();
   app.enableSandbox();
   noSpellcheckDownloads(app); // no dictionary download from Google's CDN (websecurity.js)
   const isDev = !app.isPackaged;
@@ -244,9 +267,13 @@ function run({ log, isDev, background }) {
       onLocaleChange: setMenu,
       log,
       isDev,
-      loadUpdater: () => loadUpdater(log),
+      loadUpdater,
       selfUpdateFor: install ? (dataDir) => new SelfUpdateApplier({ install, currentVersion: app.getVersion(), dataDir, ops, log }) : null,
       background,
+      installDir: installDirOf(install), // who else can change it (security audit M-4)
+      // a copy that cannot update itself: the service offers no download
+      // and leaves a pending update to the copy it belongs to
+      noSelfUpdate: !!(install && install.unsupported),
     });
     shellCtl.init();
   });

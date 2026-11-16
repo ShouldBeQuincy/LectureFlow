@@ -18,6 +18,9 @@ package settings
 //   - UpdateProvider keeps the stored key while other fields change (a key
 //     file that is put back opens it again), unless a new key is entered or
 //     base_url moves to another origin (the key is cleared, sec2-app L2).
+//     db.UpdateProvider itself keeps such a key when it is given an empty
+//     one (sec3 I4: also the tariff preset's transaction); clearing it is
+//     db.ProviderKeyClearer.
 
 import (
 	"context"
@@ -118,7 +121,7 @@ func (s *Service) KeyErrorInfo(p model.Provider) *model.ErrorInfo {
 	switch {
 	case s.KeyUnreadable(p.ID):
 		return &model.ErrorInfo{Code: CodeProviderKeyUnreadable, Params: map[string]any{"provider": p.Name},
-			Detail: fmt.Sprintf("提供商「%s」保存的 API key 无法在这台电脑或这个账户上解密（数据目录可能来自别的电脑或账户），请重新输入", p.Name)}
+			Detail: fmt.Sprintf("提供商「%s」保存的 API key 无法在这台电脑或这个账户上解密（数据目录可能来自别的电脑或账户），需要重新输入。输入之前，请先确认这个提供商的地址是你设置的；如果不是，先把地址改回正确的再输入", p.Name)}
 	case s.KeyUnprotected(p.ID):
 		return &model.ErrorInfo{Code: CodeProviderKeyUnprotected, Params: map[string]any{"provider": p.Name},
 			Detail: fmt.Sprintf("提供商「%s」的 API key 以明文保存（保存时无法建立加密密钥），诊断页有详情", p.Name)}
@@ -126,15 +129,21 @@ func (s *Service) KeyErrorInfo(p model.Provider) *model.ErrorInfo {
 	return nil
 }
 
-// updateProviderRow writes p. keepUnreadable: no new key was entered and
-// the origin did not change; a key that cannot be decrypted then stays
-// stored as it is (db.ProviderKeyKeeper) instead of being overwritten
-// with the empty APIKey p was read with.
-func (s *Service) updateProviderRow(ctx context.Context, p model.Provider, keepUnreadable bool) error {
-	if keepUnreadable && p.APIKey == "" && s.KeyUnreadable(p.ID) {
-		if k, ok := s.st.(db.ProviderKeyKeeper); ok {
-			return k.UpdateProviderKeepKey(ctx, p)
+// updateProviderRow writes p. clearKey: base_url moved to another origin
+// without a new key (sec2-app L2): the stored key is removed whatever it
+// is, also one that cannot be decrypted here (db.ProviderKeyClearer, sec3
+// I4). Otherwise db.UpdateProvider keeps a key that cannot be decrypted
+// when p carries none (the empty APIKey it was read with; sec3 I4), so the
+// right key file still opens it.
+func (s *Service) updateProviderRow(ctx context.Context, p model.Provider, clearKey bool) error {
+	if clearKey {
+		p.APIKey = ""
+		if c, ok := s.st.(db.ProviderKeyClearer); ok {
+			return c.UpdateProviderClearKey(ctx, p)
 		}
+		// a Store without the method (a test's wrapper): a readable key is
+		// removed by the empty APIKey; an unreadable one stays bound to the
+		// old origin, where it no longer opens (sec3 L3)
 	}
 	return s.st.UpdateProvider(ctx, p)
 }

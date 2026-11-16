@@ -46,6 +46,7 @@
 .track-name { font-weight: 500; overflow-wrap: anywhere; }
 .track[data-disabled="true"] .track-name { color: var(--text-3); }
 .track-sub { font-size: var(--fs-xs); color: var(--text-3); overflow-wrap: anywhere; }
+.track-sub.track-warn { color: var(--warn); }
 .track-size { font-size: var(--fs-sm); color: var(--text-2); white-space: nowrap; padding-top: 1px; }
 
 /* course and send */
@@ -55,7 +56,24 @@
 /* the three choices: beside their label while they fit, else on a line of their own */
 .field-wrap { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3) var(--sp-5); }
 .field-wrap > .seg { flex: 1 1 250px; min-width: 0; }
-.send { display: flex; flex-direction: column; gap: var(--sp-4); }
+/* The course and the send button stay in sight when the card is taller
+   than its window (Chrome's popup stops at 600 px; T26 J6): they stick to
+   the bottom edge of what scrolls (which must have no bottom padding, or
+   they stick above it), over that window's background (--send-bg; the
+   in-page card sets its own). Only where enough is left above them: the
+   scroller says so with data-send-sticky (sendcard.js fitSend; SEC42 中-1),
+   and its scroll padding keeps a focused control out from under them
+   (--send-h; SEC42 中-2). */
+.send {
+  display: flex; flex-direction: column; gap: var(--sp-4);
+  margin-top: calc(-1 * var(--sp-2));
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--border-1);
+  background: var(--send-bg, var(--bg-content));
+}
+[data-send-sticky="true"] { scroll-padding-bottom: var(--send-h, 0px); }
+[data-send-sticky="true"] .send { position: sticky; bottom: 0; z-index: 1; }
+.no-course { display: flex; flex-direction: column; gap: var(--sp-3); }
 .btn-block { width: 100%; height: 36px; }
 .data-note { font-size: var(--fs-xs); color: var(--text-3); text-align: center; }
 
@@ -91,6 +109,10 @@
 }
 .seg button:first-child { border-left: 0; }
 .seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; }
+/* a choice that cannot be made looks it (T26 G4); the chosen one stays
+   marked while the card is busy sending */
+.seg button:disabled { cursor: not-allowed; }
+.seg button:disabled:not([aria-pressed="true"]) { background: var(--bg-sunken); color: var(--text-3); }
 .seg button:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
 
 /* the override warning: its own view over the card */

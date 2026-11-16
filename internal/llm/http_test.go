@@ -256,9 +256,21 @@ func TestPermanentStatusesNotRetried(t *testing.T) {
 // blockingServer never answers; its handlers return when the client hangs up
 // or the test ends.
 func blockingServer(t *testing.T, n *atomic.Int32) *httptest.Server {
+	return blockingServerEntered(t, n, nil)
+}
+
+// blockingServerEntered is blockingServer that also signals entered (when
+// not nil; never blocking) once a request reached the handler.
+func blockingServerEntered(t *testing.T, n *atomic.Int32, entered chan<- struct{}) *httptest.Server {
 	stop := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n.Add(1)
+		if entered != nil {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+		}
 		_, _ = io.Copy(io.Discard, r.Body) // lets the server notice the client hanging up
 		select {
 		case <-r.Context().Done():
@@ -332,12 +344,26 @@ func TestCancelDuringBackoff(t *testing.T) {
 
 func TestCancelDuringRequest(t *testing.T) {
 	var n atomic.Int32
-	srv := blockingServer(t, &n)
-	c, pool, _ := newClient(t, srv.URL)
+	entered := make(chan struct{}, 1)
+	srv := blockingServerEntered(t, &n, entered)
+	c, pool, rec := newClient(t, srv.URL)
 	ctx, cancel := context.WithCancel(context.Background())
-	time.AfterFunc(50*time.Millisecond, cancel)
+	t.Cleanup(cancel)
+	// Cancelled once the request is at the server (a fixed delay could fire
+	// before it got there on a loaded machine). Without a request, cancelled
+	// after 10 s and the attempt count below fails. The goroutine ends when
+	// Complete returns (cancel below), also when the test fails (review T6).
+	go func() {
+		select {
+		case <-entered:
+		case <-ctx.Done():
+		case <-time.After(10 * time.Second):
+		}
+		cancel()
+	}()
 	start := time.Now()
 	_, err := c.Complete(ctx, config.RoleTranslate, "s", "u", true)
+	cancel()
 	if err != context.Canceled {
 		t.Errorf("err %v", err)
 	}
@@ -346,6 +372,9 @@ func TestCancelDuringRequest(t *testing.T) {
 	}
 	if n.Load() != 1 {
 		t.Errorf("cancelled request retried: %d attempts", n.Load())
+	}
+	if len(rec.waits) != 0 {
+		t.Errorf("backoff waits after the cancel: %v", rec.waits)
 	}
 	if a, r := pool.counts(); a != r {
 		t.Errorf("pool slot leaked: acquired %d released %d", a, r)

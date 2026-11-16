@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -54,6 +55,10 @@ type fakeAria struct {
 	// noBitTorrent, noMetalink: built without them, like the macOS build;
 	// their options are then unknown and refused (exit 28).
 	noBitTorrent, noMetalink bool
+	// noAsyncDNS: built without c-ares, like the macOS build: --async-dns
+	// is refused like the options above (SEC11 low-1; aria2c registers it
+	// only with Async DNS, assumed: no build without it was at hand).
+	noAsyncDNS bool
 	// hostsAt resolves test names (host → address; no DNS in the tests).
 	hostsAt map[string]string
 }
@@ -88,7 +93,8 @@ var (
 func (f *fakeAria) checkOptions(args []string) error {
 	for _, a := range args {
 		name, _, _ := strings.Cut(strings.TrimPrefix(a, "--"), "=")
-		if (f.noBitTorrent && slices.Contains(btOptions, name)) || (f.noMetalink && slices.Contains(metalinkOptions, name)) {
+		if (f.noBitTorrent && slices.Contains(btOptions, name)) || (f.noMetalink && slices.Contains(metalinkOptions, name)) ||
+			(f.noAsyncDNS && name == "async-dns") {
 			return &errUnrecognized{opt: a}
 		}
 	}
@@ -103,6 +109,48 @@ type fakeAdd struct {
 	MaxConn string
 	UA      string // the user-agent option ("" = aria2c's own)
 	Headers []string
+	// Proxy holds the proxy options given (all-proxy, http-proxy,
+	// https-proxy, ftp-proxy, no-proxy), when given. Like aria2c the fake
+	// makes the download's requests, redirects included, through the proxy
+	// of the URL's protocol (else all-proxy) unless no-proxy names the
+	// host; without one it connects directly (proxyFor).
+	Proxy map[string]string
+	// global holds the same options of the command line: a download's own
+	// option comes first, like aria2c's.
+	global map[string]string
+}
+
+// proxyOptionNames are aria2c's proxy options.
+var proxyOptionNames = []string{"all-proxy", "http-proxy", "https-proxy", "ftp-proxy", "no-proxy"}
+
+// option is a proxy option of the download: its own, else the command
+// line's.
+func (a fakeAdd) option(name string) string {
+	if v, ok := a.Proxy[name]; ok {
+		return v
+	}
+	return a.global[name]
+}
+
+// proxyFor is the proxy of a request of the download, as aria2c picks it:
+// the protocol's own option, else all-proxy; none for a host of no-proxy
+// (a host or a domain suffix; the tests use no address ranges).
+func (a fakeAdd) proxyFor(r *http.Request) (*url.URL, error) {
+	v := a.option(r.URL.Scheme + "-proxy")
+	if v == "" {
+		v = a.option("all-proxy")
+	}
+	if v == "" {
+		return nil, nil
+	}
+	host := strings.ToLower(r.URL.Hostname())
+	for _, n := range strings.Split(a.option("no-proxy"), ",") {
+		n = strings.ToLower(strings.TrimSpace(n))
+		if n != "" && (host == n || strings.HasSuffix(host, "."+strings.TrimPrefix(n, "."))) {
+			return nil, nil
+		}
+	}
+	return url.Parse(v)
 }
 
 type fakeDL struct {
@@ -124,6 +172,14 @@ type fakeDL struct {
 // leak that ruling 5 prevents).
 func newFakeAria() *fakeAria {
 	f := &fakeAria{dls: map[string]*fakeDL{}, hostsAt: map[string]string{}}
+	f.hc = f.client(fakeAdd{})
+	return f
+}
+
+// client is the HTTP client of a download: through its proxy when it was
+// given one (fakeAdd.proxyFor), else directly, a test name at the address
+// hostsAt gives it. Redirects are followed as aria2c follows them.
+func (f *fakeAria) client(a fakeAdd) *http.Client {
 	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if host, port, err := net.SplitHostPort(addr); err == nil {
 			f.mu.Lock()
@@ -135,7 +191,12 @@ func newFakeAria() *fakeAria {
 		}
 		return (&net.Dialer{}).DialContext(ctx, network, addr)
 	}
-	f.hc = &http.Client{Transport: &http.Transport{Proxy: nil, DialContext: dial}, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+	tr := &http.Transport{Proxy: nil, DialContext: dial}
+	if len(a.Proxy) > 0 || len(a.global) > 0 {
+		// (a transport of its own: its connections end with the download)
+		tr = &http.Transport{Proxy: a.proxyFor, DialContext: dial, DisableKeepAlives: true}
+	}
+	return &http.Client{Transport: tr, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
 			return errors.New("too many redirects")
 		}
@@ -144,7 +205,6 @@ func newFakeAria() *fakeAria {
 		}
 		return nil
 	}}
-	return f
 }
 
 // argValue returns the value of --name=value.
@@ -322,6 +382,23 @@ func (f *fakeAria) dispatch(method string, params []json.RawMessage) (any, *rpcE
 				a.Headers = append(a.Headers, s)
 			}
 		}
+		f.mu.Lock()
+		args := f.args
+		f.mu.Unlock()
+		for _, name := range proxyOptionNames {
+			if v, ok := opts[name].(string); ok {
+				if a.Proxy == nil {
+					a.Proxy = map[string]string{}
+				}
+				a.Proxy[name] = v
+			}
+			if v := argValue(args, name); v != "" {
+				if a.global == nil {
+					a.global = map[string]string{}
+				}
+				a.global[name] = v
+			}
+		}
 		if !filepath.IsAbs(a.Dir) || a.Out == "" {
 			return nil, &rpcError{Code: 1, Message: "dir must be absolute and out set"}
 		}
@@ -419,7 +496,11 @@ func (f *fakeAria) download(ctx context.Context, d *fakeDL) {
 	if have > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", have))
 	}
-	res, err := f.hc.Do(req)
+	hc := f.hc
+	if len(d.add.Proxy) > 0 || len(d.add.global) > 0 {
+		hc = f.client(d.add)
+	}
+	res, err := hc.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
 			f.finish(d, "removed", "", "")
@@ -534,6 +615,7 @@ func runFakeAriaProcess() int {
 	f.likeAria2c = true
 	have := parseFeatures(fakeVersion(features))
 	f.noBitTorrent, f.noMetalink = !have.bitTorrent, !have.metalink
+	f.noAsyncDNS = !hasFeature(fakeVersion(features), "Async DNS")
 	if err := f.start(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		var ue *errUnrecognized

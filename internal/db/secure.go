@@ -32,7 +32,7 @@ func (s *sqlStore) SetSecretKV(ctx context.Context, key, value string) error {
 	}
 	if isSealedKV(key) { // cred-enc: stored sealed (sealed.go)
 		var err error
-		if value, err = sealStored(value); err != nil {
+		if value, err = sealKV(key, value); err != nil {
 			return err
 		}
 	}
@@ -150,6 +150,10 @@ func secureWrite(ctx context.Context, d *sql.DB, write func(context.Context, *sq
 // checkpoint) has not completed: freed pages or old WAL frames may still
 // hold a replaced credential (sec3 I3).
 const kvScrubPending = "secrets.scrub_pending"
+
+// KVScrubPending is kvScrubPending for the diagnostics (test-upgrade F9:
+// while it is set, the credentials row says the clean-up is pending).
+const KVScrubPending = kvScrubPending
 
 // setScrubPending sets kvScrubPending when the database has a kv table.
 func setScrubPending(ctx context.Context, c *sql.Conn) bool {

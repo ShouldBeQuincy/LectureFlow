@@ -52,7 +52,13 @@ const (
 const (
 	recordVersion     = 1
 	proxyRefreshAhead = 5 * time.Minute // upstream common.py TOKEN_REFRESH_MARGIN
-	releaseTimeout    = 60 * time.Second
+	// proxyStaleUse: after a transient failure of the refresh, the current
+	// proxy token still serves a step that begins at least this long
+	// before the token ends (runtime). Below it a step could outlast the
+	// token (an audio upload takes a minute or more) and be refused as if
+	// the runtime were gone: the failure goes to the retry instead.
+	proxyStaleUse  = 2 * time.Minute
+	releaseTimeout = 60 * time.Second
 )
 
 // sessionRecord is kv colab.session: no token, only what releasing needs.
@@ -75,6 +81,7 @@ type liveSession struct {
 	rec        sessionRecord
 	rt         *runtimeClient
 	proxyExp   time.Time
+	proxyStale bool   // rt's token was kept after a failed refresh (logged once per token)
 	kernelID   string // the first kernel (the memory probe's)
 	workerHash string
 	setupDone  bool
@@ -99,12 +106,91 @@ type liveSession struct {
 	// removals: finished lectures' directories being removed in the
 	// background (removal.go); a release waits for them.
 	removals []*removal
+	// busyDirs (T051): job directories whose files are being deleted in
+	// the background, or could not all be deleted. A later attempt of the
+	// same lecture on this runtime writes to a directory of its own
+	// (jobDirFor), so a deletion still under way never reaches its files.
+	busyDirs map[string]bool
+	// handBackReason: the reason of the hand-back that set the session
+	// stopping (handBack): a release that overtakes the hand-back's own
+	// (QueueDrained, Tick's retry) records it instead of its own, unless
+	// the user asked for the release (userRelease).
+	handBackReason string
 }
 
-func (b *Backend) persist(ctx context.Context, rec sessionRecord) {
+// persist saves s's record (kv colab.session) while s is the backend's
+// session: a late write of a session that was released since must neither
+// bring its record back nor overwrite the record of a session borrowed
+// meanwhile (SEC2 H1). recMu orders it with every other write of the
+// record and of the lost runtimes.
+func (b *Backend) persist(ctx context.Context, s *liveSession) {
+	b.recMu.Lock()
+	defer b.recMu.Unlock()
+	b.mu.Lock()
+	if b.sess != s {
+		b.mu.Unlock()
+		return
+	}
+	rec := s.rec
+	b.mu.Unlock()
+	b.writeRecord(ctx, rec)
+}
+
+func (b *Backend) writeRecord(ctx context.Context, rec sessionRecord) {
 	raw, _ := json.Marshal(rec)
 	if err := b.o.KV.SetKV(context.WithoutCancel(ctx), KVSession, string(raw)); err != nil {
 		b.log.Warn("colab: saving the session record", "err", err)
+	}
+}
+
+// persistNew saves the record of a session just created. A record already
+// there is a session nothing released yet (its release failed or waits for
+// a credential, or a crash left it behind): it is kept among the lost
+// runtimes first, so that the new record does not overwrite the only trace
+// of it (SEC2 H1).
+func (b *Backend) persistNew(ctx context.Context, s *liveSession) {
+	b.recMu.Lock()
+	defer b.recMu.Unlock()
+	if old, err := b.loadRecord(ctx); err == nil && old != nil && old.NotebookHash != s.rec.NotebookHash {
+		b.mu.Lock()
+		b.addLostLocked(lostOf(*old), nil)
+		b.leftover = nil // the lost runtime stands for it on the card now (leftoverLocked)
+		b.mu.Unlock()
+		b.saveLostRecLocked(ctx)
+		b.log.Warn("colab: a session not released yet is kept among the runtimes to release", "accelerator", old.Accelerator)
+	}
+	b.mu.Lock()
+	if b.sess != s {
+		b.mu.Unlock()
+		return
+	}
+	rec := s.rec
+	b.mu.Unlock()
+	b.writeRecord(ctx, rec)
+}
+
+// dropSession forgets s when it is still the backend's session (locked,
+// when set, runs under mu right then) and deletes the session record when
+// it is the record of notebook hash nbh: a record written since by another
+// session, or one kept for a later release, is not this caller's to delete
+// (SEC2 H1). s nil: no live session is concerned (cleanupLeftover).
+func (b *Backend) dropSession(ctx context.Context, s *liveSession, nbh string, locked func()) {
+	b.recMu.Lock()
+	defer b.recMu.Unlock()
+	b.mu.Lock()
+	if s != nil && b.sess == s {
+		b.sess = nil
+	}
+	if locked != nil {
+		locked()
+	}
+	b.mu.Unlock()
+	ctx = context.WithoutCancel(ctx)
+	if rec, err := b.loadRecord(ctx); err != nil || rec == nil || rec.NotebookHash != nbh {
+		return
+	}
+	if err := deleteKV(ctx, b.o.KV, KVSession); err != nil {
+		b.log.Warn("colab: deleting the session record", "err", err)
 	}
 }
 
@@ -124,6 +210,7 @@ func (b *Backend) loadRecord(ctx context.Context) (*sessionRecord, error) {
 // newRuntime is the client of an assignment's runtime.
 func (b *Backend) newRuntime(p proxyInfo) *runtimeClient {
 	return &runtimeClient{hc: b.o.HTTPClient, up: b.o.UploadClient, base: p.URL, token: p.Token, agent: b.o.ClientAgent, dial: b.o.Dial,
+		timeout: b.o.RuntimeTimeout,
 		slow: func(method, endpoint string, took time.Duration) {
 			b.log.Info("colab: slow request to the runtime", "method", method, "endpoint", endpoint, "ms", took.Milliseconds())
 		}}
@@ -132,7 +219,9 @@ func (b *Backend) newRuntime(p proxyInfo) *runtimeClient {
 // acquire returns the running session, borrowing a runtime first when
 // there is none: assign with exponential back-off while Colab refuses for
 // capacity (412) or fails transiently (waiting_for remote_queue), up to the
-// user's limit; then boot until the Jupyter server answers.
+// user's limit; then boot until the Jupyter server answers. A failed boot
+// returns the session with the error: the caller releases it (jobErr). A
+// session released by someone else meanwhile gives IsBusy.
 func (b *Backend) acquire(ctx context.Context, set Settings, jp *jobProgress) (*liveSession, error) {
 	b.mu.Lock()
 	if s := b.sess; s != nil {
@@ -171,9 +260,14 @@ func (b *Backend) acquire(ctx context.Context, set Settings, jp *jobProgress) (*
 	}, ready: make(chan struct{})}
 	b.sess = s
 	b.samples.Reset()
+	// A new session: the last one's error is over (v3.2.x: it used to stay
+	// on the card until the app quit), and nothing is known about the new
+	// runtime yet.
+	b.clearErrLocked()
+	b.pollFail, b.reach = false, reachState{}
 	b.mu.Unlock()
 	defer close(s.ready)
-	b.persist(ctx, s.rec)
+	b.persistNew(ctx, s)
 	b.log.Info("colab: requesting a runtime", "accelerator", set.Accelerator)
 
 	wait := b.o.Backoff.Initial
@@ -188,6 +282,14 @@ func (b *Backend) acquire(ctx context.Context, set Settings, jp *jobProgress) (*
 		if ctx.Err() != nil {
 			b.dropUnassigned(ctx, s)
 			return nil, ctx.Err()
+		}
+		if !b.stillBorrowing(s) {
+			// Released while the request was on its way or while waiting
+			// to ask again (SEC2): not this lecture's failure, and no new
+			// request for a session nobody keeps. The release may have asked
+			// Colab before this answer came: ask once more.
+			b.dropUnassigned(ctx, s)
+			return nil, busyErr(errors.New("the remote session was released while a runtime was being assigned"))
 		}
 		st := statusOf(err)
 		switch {
@@ -204,6 +306,10 @@ func (b *Backend) acquire(ctx context.Context, set Settings, jp *jobProgress) (*
 				b.dropUnassigned(ctx, s)
 				return nil, err
 			}
+			if !b.stillBorrowing(s) {
+				b.dropUnassigned(ctx, s)
+				return nil, busyErr(errors.New("the remote session was released while a runtime was being assigned"))
+			}
 			wait = min(2*wait, b.o.Backoff.Max)
 		case st == 400:
 			b.dropUnassigned(ctx, s)
@@ -215,6 +321,20 @@ func (b *Backend) acquire(ctx context.Context, set Settings, jp *jobProgress) (*
 		}
 	}
 	b.mu.Lock()
+	if b.sess != s || s.rec.State == StateStopping {
+		// Released while the assignment was on its way (a release of the
+		// queued session forgot it): nothing would release this runtime
+		// any more, so it goes back now (review R3 item 2); when that
+		// fails it is kept among the lost runtimes (SEC2 H1).
+		l := lostOf(s.rec)
+		l.Endpoint = a.Endpoint
+		if a.Accelerator != "" {
+			l.Accelerator = a.Accelerator
+		}
+		b.mu.Unlock()
+		b.giveBackLost(ctx, l)
+		return nil, busyErr(errors.New("the remote session was released while a runtime was being assigned"))
+	}
 	s.rec.Endpoint, s.rec.AssignedAt, s.rec.State = a.Endpoint, b.now(), StateBooting
 	if a.Accelerator != "" && a.Accelerator != s.rec.Accelerator {
 		b.log.Warn("colab: assigned another accelerator than requested", "requested", s.rec.Accelerator, "assigned", a.Accelerator)
@@ -222,33 +342,61 @@ func (b *Backend) acquire(ctx context.Context, set Settings, jp *jobProgress) (*
 	}
 	s.rt = b.newRuntime(a.Proxy)
 	s.proxyExp = b.now().Add(a.Proxy.ExpiresIn)
-	rec := s.rec
+	acc := s.rec.Accelerator
 	b.mu.Unlock()
-	b.persist(ctx, rec)
+	b.persist(ctx, s)
 	jp.waiting("")
-	b.log.Info("colab: runtime assigned; booting", "accelerator", rec.Accelerator)
+	b.log.Info("colab: runtime assigned; booting", "accelerator", acc)
 
 	if err := b.boot(ctx, s); err != nil {
-		return nil, err
+		if !b.stillBorrowing(s) {
+			// Released while it booted, and the boot then failed (its
+			// runtime is gone): the release gave the runtime back; not this
+			// lecture's failure (SEC2 L4).
+			if ctx.Err() != nil {
+				return nil, ctx.Err() // cancelled all the same: nothing left to release
+			}
+			return nil, busyErr(errors.New("the remote session was released while it booted"))
+		}
+		return s, err // the caller releases s (jobErr)
 	}
 	b.mu.Lock()
+	if b.sess != s || s.rec.State == StateStopping {
+		// released while it booted: the release gave the runtime back; its
+		// record is gone and must not be written again
+		b.mu.Unlock()
+		return nil, busyErr(errors.New("the remote session was released while it booted"))
+	}
 	s.rec.State, s.rec.ReadyAt = StateRunning, b.now()
-	rec = s.rec
+	rec := s.rec
 	b.mu.Unlock()
-	b.persist(ctx, rec)
+	b.persist(ctx, s)
 	b.log.Info("colab: runtime ready", "accelerator", rec.Accelerator, "waited_s", int(rec.ReadyAt.Sub(rec.RequestedAt).Seconds()))
 	return s, nil
 }
 
+// stillBorrowing: s is still the backend's session and nobody is
+// releasing it.
+func (b *Backend) stillBorrowing(s *liveSession) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sess == s && s.rec.State != StateStopping
+}
+
 // boot waits until the runtime's Jupyter server answers (GET /api/kernels).
 // Upstream connects right away (with three retries on timeouts); polling
-// covers a proxy that is not ready yet.
+// covers a proxy that is not ready yet. A session released meanwhile ends
+// the wait (SEC2 L4: its runtime is gone; polling it would go on until the
+// boot timeout).
 func (b *Backend) boot(ctx context.Context, s *liveSession) error {
 	started := b.now()
 	deadline := started.Add(b.o.BootTimeout)
 	delay := time.Second
 	refreshed := false
 	for {
+		if !b.stillBorrowing(s) {
+			return busyErr(errors.New("the remote session was released while it booted"))
+		}
 		rt, err := b.runtime(ctx, s)
 		if err == nil {
 			_, err = rt.listKernels(ctx)
@@ -290,7 +438,11 @@ func (b *Backend) boot(ctx context.Context, s *liveSession) error {
 
 // runtime returns the session's runtime client with a proxy token that is
 // valid for at least proxyRefreshAhead (upstream State.get_session: refresh
-// through list_assignments; an assignment that is gone = reclaimed).
+// through list_assignments; an assignment that is gone = reclaimed). When
+// the refresh fails transiently (refreshTransient) and the current token
+// is still valid for proxyStaleUse, the current client is returned: the
+// step goes on, and the next call tries the refresh again (review R65 S1).
+// Every other failure of the refresh is returned as before.
 func (b *Backend) runtime(ctx context.Context, s *liveSession) (*runtimeClient, error) {
 	b.mu.Lock()
 	if s.rt != nil && b.now().Add(proxyRefreshAhead).Before(s.proxyExp) {
@@ -302,13 +454,29 @@ func (b *Backend) runtime(ctx context.Context, s *liveSession) (*runtimeClient, 
 	b.mu.Unlock()
 	list, err := b.tun.listAssignments(ctx, b.o.AllowHTTP)
 	if err != nil {
-		return nil, err
+		if !refreshTransient(err) {
+			return nil, err
+		}
+		b.mu.Lock()
+		rt, left, first := s.rt, s.proxyExp.Sub(b.now()), !s.proxyStale
+		if rt == nil || left < proxyStaleUse {
+			b.mu.Unlock()
+			return nil, err
+		}
+		s.proxyStale = true
+		b.mu.Unlock()
+		if first {
+			b.log.Info("colab: fetching a new runtime token failed; the current one is used while it lasts",
+				"code", Code(err), "left_s", int(left/time.Second))
+		}
+		return rt, nil
 	}
 	for _, a := range list {
 		if a.Endpoint == endpoint {
 			b.mu.Lock()
 			s.rt = b.newRuntime(a.Proxy)
 			s.proxyExp = b.now().Add(a.Proxy.ExpiresIn)
+			s.proxyStale = false
 			rt := s.rt
 			b.mu.Unlock()
 			return rt, nil
@@ -317,59 +485,158 @@ func (b *Backend) runtime(ctx context.Context, s *liveSession) (*runtimeClient, 
 	return nil, fallbackErr(CodeSessionReclaimed, nil, errors.New("the runtime is no longer among the account's assignments"))
 }
 
+// clientOf is runtime for session s as a clientSource (a cell's every
+// connection takes a current token: execCell).
+func (b *Backend) clientOf(s *liveSession) clientSource {
+	return func(ctx context.Context) (*runtimeClient, error) { return b.runtime(ctx, s) }
+}
+
 // dropUnassigned forgets a session that never got a runtime. A POST whose
 // answer was lost may still have assigned one: one GET with the same
 // notebook hash tells (upstream reconciles the same way), and such a
-// runtime is released.
+// runtime is released. When that cannot be done now (the GET fails, or the
+// release does) the runtime is not forgotten: s stays stopping with the
+// endpoint for Tick while it is the backend's session, else it is kept
+// among the lost runtimes (SEC2 H1).
 func (b *Backend) dropUnassigned(ctx context.Context, s *liveSession) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
 	defer cancel()
-	if a, _, ok, err := b.tun.getAssign(ctx, s.rec.NotebookHash, s.rec.Accelerator, s.rec.Shape, b.o.AllowHTTP); err == nil && ok {
-		if err := b.tun.unassign(ctx, a.Endpoint); err != nil {
-			b.log.Warn("colab: releasing a runtime assigned after giving up", "code", Code(codedHTTP("tun/m/unassign", err)))
-			s.rec.Endpoint, s.rec.State = a.Endpoint, StateStopping
-			b.persist(ctx, s.rec)
+	b.mu.Lock()
+	rec := s.rec
+	b.mu.Unlock()
+	l := lostOf(rec)
+	a, _, ok, err := b.tun.getAssign(ctx, rec.NotebookHash, rec.Accelerator, rec.Shape, b.o.AllowHTTP)
+	switch {
+	case err != nil:
+		// Colab cannot tell now whether a POST whose answer was lost
+		// assigned a runtime: asked again later with the notebook hash.
+		err = codedHTTP("tun/m/assign", err)
+		b.log.Warn("colab: cannot tell whether a runtime was assigned after giving up; asking again later", "code", Code(err))
+		b.dropSession(ctx, s, rec.NotebookHash, nil)
+		b.addLost(ctx, l, err)
+		return
+	case ok:
+		if err := b.unassignRetry(ctx, a.Endpoint, rec.Accelerator); err != nil {
+			b.log.Warn("colab: releasing a runtime assigned after giving up", "code", Code(err))
+			b.mu.Lock()
+			mine := b.sess == s
+			if mine {
+				s.rec.Endpoint, s.rec.State = a.Endpoint, StateStopping
+			}
+			b.mu.Unlock()
+			if mine {
+				b.persist(ctx, s) // Tick tries again (releaseWith)
+				return
+			}
+			l.Endpoint = a.Endpoint
+			b.addLost(ctx, l, err)
 			return
 		}
 	}
-	b.mu.Lock()
-	if b.sess == s {
-		b.sess = nil
+	b.dropSession(ctx, s, rec.NotebookHash, nil)
+}
+
+// giveBackLost releases the runtime of a session that is already gone
+// (acquire: assigned after the session was released). A release that fails
+// keeps it among the lost runtimes: Tick tries again, the card shows it
+// (Status.Leftover), and the next start releases it (SEC2 H1).
+func (b *Backend) giveBackLost(ctx context.Context, l lostRuntime) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+	// Straight to the endpoint (just assigned: the account's list may not
+	// show it yet); after a failure the list says whether it is still there.
+	err := b.unassignRetry(ctx, l.Endpoint, l.Accelerator)
+	if err != nil {
+		err = b.unassignIfListed(ctx, l.Endpoint)
 	}
-	b.mu.Unlock()
-	if err := deleteKV(ctx, b.o.KV, KVSession); err != nil {
-		b.log.Warn("colab: deleting the session record", "err", err)
+	if err != nil {
+		b.log.Warn("colab: releasing a runtime assigned to a session already released failed; will retry", "code", Code(err))
+		b.addLost(ctx, l, err)
+		return
 	}
+	b.log.Info("colab: a runtime assigned to a session already released was given back")
 }
 
 // release gives the runtime back (V14.3 step 5): the kernel is shut down
 // (best effort, as upstream's stop), then the assignment released. A
 // release that fails keeps the record in state stopping; Tick tries again.
 func (b *Backend) release(ctx context.Context, reason string) error {
-	return b.releaseWith(ctx, reason, "")
+	return b.releaseWith(ctx, reason, releaseOpts{})
 }
 
-// releaseWith is release recording file in ReleaseInfo.File (a remote file
-// name, ReleaseCleanupFailed).
-func (b *Backend) releaseWith(ctx context.Context, reason, file string) error {
+// releaseOpts qualifies a release.
+type releaseOpts struct {
+	// file is recorded in ReleaseInfo.File (a remote file name,
+	// ReleaseCleanupFailed).
+	file string
+	// expect, when set, is the session the caller means: the release does
+	// nothing when the backend's session is another one by the time it
+	// holds relMu (a background release overtaken by another release and a
+	// new session must not release the new one: review R3 item 2).
+	expect *liveSession
+	// ifIdle: only when no lecture is on the backend (checked under mu
+	// together with setting the session stopping, so no lecture can be
+	// dispatched to it in between).
+	ifIdle bool
+	// self: the lecture whose end asks for the release (finishJob). It is
+	// still among b.jobs until its Transcribe returns and does not count
+	// for ifIdle.
+	self *jobState
+}
+
+// idleLocked: no lecture other than self is on the backend (ifIdle).
+func (b *Backend) idleLocked(self *jobState) bool {
+	for _, j := range b.jobs {
+		if j != self {
+			return false
+		}
+	}
+	return true
+}
+
+// userRelease tells the reasons the user (or the app's end) asked for:
+// they are recorded even over a pending hand-back's reason.
+func userRelease(reason string) bool {
+	switch reason {
+	case ReleaseNow, ReleaseAppExit, ReleaseDisconnect, ReleaseCancelled:
+		return true
+	}
+	return false
+}
+
+// releaseWith is release with the options o.
+func (b *Backend) releaseWith(ctx context.Context, reason string, o releaseOpts) error {
 	b.relMu.Lock()
 	defer b.relMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
 	defer cancel()
-	b.mu.Lock()
-	s := b.sess
-	b.mu.Unlock()
-	if s != nil {
-		b.awaitRemovals(s) // finished lectures' files go first (removal.go)
+	// mine tells (under mu) whether this release still applies to s.
+	mine := func(s *liveSession) bool {
+		return s != nil && (o.expect == nil || s == o.expect) && (!o.ifIdle || b.idleLocked(o.self))
 	}
 	b.mu.Lock()
+	s := b.sess
+	ok := mine(s)
+	b.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	b.awaitRemovals(s) // finished lectures' files go first (removal.go)
+	b.mu.Lock()
 	s = b.sess
-	if s == nil {
+	if !mine(s) {
 		b.mu.Unlock()
 		return nil
 	}
+	if s.handBackReason != "" && !userRelease(reason) {
+		reason = s.handBackReason // the lecture's failure, not the drain or Tick's retry
+	}
+	file := o.file
 	s.rec.State = StateStopping
 	b.samples.Reset() // the runtime's readings go with it (the account stays)
+	for _, j := range b.jobs {
+		j.reconnect, j.reconnects = nil, nil
+	}
 	rec, rt := s.rec, s.rt
 	kids := append([]string(nil), s.kernels...)
 	if len(kids) == 0 && s.kernelID != "" {
@@ -377,7 +644,7 @@ func (b *Backend) releaseWith(ctx context.Context, reason, file string) error {
 	}
 	b.dropAllUploadsLocked(s)
 	b.mu.Unlock()
-	b.persist(ctx, rec)
+	b.persist(ctx, s)
 	if rec.Endpoint == "" {
 		b.dropUnassigned(ctx, s)
 		b.noteRelease(reason, file)
@@ -404,29 +671,23 @@ func (b *Backend) releaseWith(ctx context.Context, reason, file string) error {
 			b.sess = nil
 		}
 		b.leftover = &LeftoverInfo{Accelerator: rec.Accelerator, Since: rec.RequestedAt, Code: CodeLeftoverSession}
-		b.noteErrLocked(infoOf(err))
+		b.noteErrLocked(infoOf(b.secrets.scrubErr(err)))
 		b.mu.Unlock()
 		return err
 	}
 	if err != nil {
 		b.log.Warn("colab: releasing the runtime failed; will retry", "reason", reason, "code", Code(err))
 		b.mu.Lock()
-		b.noteErrLocked(infoOf(err))
+		b.noteErrLocked(infoOf(b.secrets.scrubErr(err)))
 		b.mu.Unlock()
 		return err
 	}
-	b.mu.Lock()
-	if b.sess == s {
-		b.sess = nil
-	}
-	if reason == ReleaseWindow && b.settings.WindowCooldownMin > 0 {
-		b.cooldownUntil = b.now().Add(time.Duration(b.settings.WindowCooldownMin) * time.Minute)
-		_ = b.o.KV.SetKV(ctx, KVCooldown, b.cooldownUntil.UTC().Format(time.RFC3339))
-	}
-	b.mu.Unlock()
-	if err := deleteKV(ctx, b.o.KV, KVSession); err != nil {
-		b.log.Warn("colab: deleting the session record", "err", err)
-	}
+	b.dropSession(ctx, s, rec.NotebookHash, func() {
+		if reason == ReleaseWindow && b.settings.WindowCooldownMin > 0 {
+			b.cooldownUntil = b.now().Add(time.Duration(b.settings.WindowCooldownMin) * time.Minute)
+			_ = b.o.KV.SetKV(ctx, KVCooldown, b.cooldownUntil.UTC().Format(time.RFC3339))
+		}
+	})
 	b.noteRelease(reason, file)
 	b.log.Info("colab: runtime released", "reason", reason, "accelerator", rec.Accelerator, "jobs", rec.Jobs,
 		"occupied_min", int(b.now().Sub(rec.RequestedAt).Minutes()))
@@ -448,22 +709,27 @@ func (b *Backend) unassignIfListed(ctx context.Context, endpoint string) error {
 	}
 	for _, a := range list {
 		if a.Endpoint == endpoint {
-			var lastErr error
-			for attempt := 0; attempt < 3; attempt++ {
-				if lastErr = b.tun.unassign(ctx, endpoint); lastErr == nil {
-					return nil
-				}
-				if !transient(lastErr) {
-					break
-				}
-				if err := b.o.Sleep(ctx, time.Duration(2<<attempt)*time.Second); err != nil {
-					break
-				}
-			}
-			return fallbackErr(CodeReleaseFailed, map[string]any{"accelerator": a.Accelerator}, codedHTTP("tun/m/unassign", lastErr))
+			return b.unassignRetry(ctx, endpoint, a.Accelerator)
 		}
 	}
 	return nil // already gone
+}
+
+// unassignRetry releases endpoint, trying a transient failure three times.
+func (b *Backend) unassignRetry(ctx context.Context, endpoint, accelerator string) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if lastErr = b.tun.unassign(ctx, endpoint); lastErr == nil {
+			return nil
+		}
+		if !transient(lastErr) {
+			break
+		}
+		if err := b.o.Sleep(ctx, time.Duration(2<<attempt)*time.Second); err != nil {
+			break
+		}
+	}
+	return fallbackErr(CodeReleaseFailed, map[string]any{"accelerator": accelerator}, codedHTTP("tun/m/unassign", lastErr))
 }
 
 // cleanupLeftover releases the session an earlier run left behind (V14.3
@@ -480,19 +746,7 @@ func (b *Backend) cleanupLeftover(ctx context.Context, rec *sessionRecord) error
 			"accelerator", rec.Accelerator)
 		return nil
 	}
-	var err error
-	if rec.Endpoint != "" {
-		err = b.unassignIfListed(ctx, rec.Endpoint)
-	} else if rec.NotebookHash != "" {
-		var a assignment
-		var ok bool
-		a, _, ok, err = b.tun.getAssign(ctx, rec.NotebookHash, rec.Accelerator, rec.Shape, b.o.AllowHTTP)
-		if err == nil && ok {
-			err = b.unassignIfListed(ctx, a.Endpoint)
-		} else if err != nil {
-			err = codedHTTP("tun/m/assign", err)
-		}
-	}
+	err := b.releaseLost(ctx, lostOf(*rec))
 	if err != nil {
 		b.mu.Lock()
 		b.leftover = &LeftoverInfo{Accelerator: rec.Accelerator, Since: rec.RequestedAt, Code: Code(err)}
@@ -500,12 +754,8 @@ func (b *Backend) cleanupLeftover(ctx context.Context, rec *sessionRecord) error
 		b.log.Warn("colab: releasing the session of an earlier run failed", "code", Code(err))
 		return err
 	}
-	if err := deleteKV(ctx, b.o.KV, KVSession); err != nil {
-		return err
-	}
-	b.mu.Lock()
-	b.leftover = nil
-	b.mu.Unlock()
+	// a session borrowed meanwhile keeps its record (dropSession)
+	b.dropSession(ctx, nil, rec.NotebookHash, func() { b.leftover = nil })
 	b.noteRelease(ReleaseLeftover, "")
 	b.log.Info("colab: the session of an earlier run was released", "accelerator", rec.Accelerator)
 	return nil

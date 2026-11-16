@@ -44,7 +44,7 @@ func TestMigration014Upgrade(t *testing.T) {
 func TestRemoteServerCRUD(t *testing.T) {
 	ctx := context.Background()
 	st := openTest(t).(*sqlStore)
-	r := RemoteServer{ID: "mac", Name: "Mac", Host: "203.0.113.5", Port: 22, Username: "quincy", KeyRef: "remote.ssh.key.mac",
+	r := RemoteServer{ID: "mac", Name: "Mac", Host: "203.0.113.5", Port: 22, Username: "alice", KeyRef: "remote.ssh.key.mac",
 		PublicKey: "restrict ssh-ed25519 AAAA lectureflow-mac", CreatedAt: Now(), UpdatedAt: Now()}
 	if err := st.InsertRemoteServer(ctx, r); err != nil {
 		t.Fatal(err)

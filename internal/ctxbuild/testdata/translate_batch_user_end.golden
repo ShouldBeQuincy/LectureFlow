@@ -1,0 +1,12 @@
+[BEFORE]
+That gives us conflict misses when two addresses map to the same set.
+A two-way set associative cache halves the number of sets.
+The miss rate drops from 5 percent to about 3 percent.
+[TARGET #11]
+Blah lab is something we will see in the lab next week.
+[TARGET #12]
+Finally, LRU replacement evicts the least recently used line.
+[TARGET #13]
+Any questions before we move on?
+[AFTER]
+(none)

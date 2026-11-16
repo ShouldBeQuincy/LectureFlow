@@ -72,6 +72,15 @@ LectureFlow 的安装包可能没有代码签名证书（是否购买证书由�
 - 便携版更新时直接替换原来的 exe：快捷方式照常可用，但文件名里的版本号不再准确。
 - 设置页说明这个版本不在应用内更新时（例如从源代码运行的开发版本），请到 Releases 页面下载新版本覆盖安装，数据不受影响。
 - **从 3.1.0 升级到 3.2.0** 请手动下载安装包覆盖安装；之后的版本可以在应用内更新。
+- **安装位置**：建议把 LectureFlow 安装在默认位置（`%LOCALAPPDATA%\Programs\LectureFlow`），尤其是这台电脑还有其他账户时。装在别处（例如另一个盘）时，如果安装文件夹或它上面的某一层文件夹其他账户也能修改、删除或改名（在另一个盘上自己建的文件夹通常如此），诊断页从一开始就会给出警告，应用内更新也会停用；即使没有这种情况，安装程序（包括每次应用内更新）也要到解压完才把文件夹收紧为只有你能修改，而应用内更新失败、回退到上一个版本之后，这个权限不会自动恢复，同样会出现警告并停用应用内更新。出现警告时，按诊断页“安装目录”一行的提示处理（例如重新安装到默认位置），处理好之后应用内更新自动恢复。
+
+### 网络代理
+
+LectureFlow 调用模型、检查和下载更新、下载组件、使用 Colab、刮削录播时，只按环境变量 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY`（大小写均可）使用代理：访问 `https://` 地址用 `HTTPS_PROXY`，访问 `http://` 地址用 `HTTP_PROXY`，不会互相代替。所以只设 `HTTP_PROXY` 时，模型服务、更新和绝大多数录播仍然直连。这些连接不使用 `ALL_PROXY`，也不读取系统的代理设置（Windows 与 macOS 都是）。本机地址（`localhost`、`127.0.0.1`）总是直连；局域网里的地址（例如另一台电脑上的模型服务）不想经过代理时，把它写进 `NO_PROXY`。安装组件时，Python 包由 uv 下载，uv 按它自己的规则使用代理，可能与上面不同（例如它的文档说明也会读取 `ALL_PROXY`）。
+
+刮削录播只能使用 `http://` 写法的代理（不写协议的地址，如 `127.0.0.1:7890`，按 `http://` 处理），不支持 SOCKS 代理和 `https://` 写法的代理；代理要认证时，只支持写在地址里的 Basic 认证（`http://用户名:密码@主机:端口`，特殊字符要百分号编码）。某个录播地址要经过这类代理时（包括对应的 `HTTP_PROXY` / `HTTPS_PROXY` 没设、而 `ALL_PROXY` 是 SOCKS 或 `https://` 的情形），刮削会被拒绝并说明原因，不会悄悄直连；`NO_PROXY` 列出的地址照常直连。调用模型、检查和下载更新不受这条限制，可以通过 `HTTP_PROXY` / `HTTPS_PROXY` 使用 SOCKS5（`socks5://`、`socks5h://`）或 `https://` 写法的代理。
+
+改了这些环境变量之后，请完全退出 LectureFlow（包括在后台运行的），再重新打开。
 
 ### 浏览器扩展
 
@@ -153,6 +162,15 @@ Release builds check for a new version at most once a day (Settings → App → 
 - The portable build replaces its own exe when it updates: shortcuts keep working, but the version in the file name is no longer accurate.
 - If Settings says that this version does not update in the app (for example a development build run from source), download the new version from the Releases page and install it over the old one; your data is not affected.
 - **From 3.1.0 to 3.2.0**, download and install by hand; later versions can update in the app.
+- **Installation folder**: we recommend installing LectureFlow in the default location (`%LOCALAPPDATA%\Programs\LectureFlow`), especially if this computer has other accounts. If you install it elsewhere (for example on another drive) and other accounts can change, delete or rename the installation folder or a folder above it (as they usually can with a folder you made yourself on another drive), the Diagnostics page shows a warning from the start and in-app updates are off. Even when that is not the case, the installer (including the one each in-app update runs) only makes the folder changeable by you alone after unpacking has finished, and after a failed in-app update has been rolled back those permissions are not restored automatically, with the same warning and in-app updates off. When you see the warning, follow the hint in the Installation folder row of the Diagnostics page (for example, install again into the default location); in-app updates resume once it is fixed.
+
+### Network proxy
+
+When LectureFlow calls a model, checks for or downloads updates, downloads components, uses Colab or fetches recordings, it takes its proxy only from the environment variables `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` (upper or lower case): `HTTPS_PROXY` for `https://` addresses, `HTTP_PROXY` for `http://` ones, and neither stands in for the other. With only `HTTP_PROXY` set, model providers, updates and most recordings are still reached directly. These connections do not use `ALL_PROXY` and do not read the system's proxy settings (on Windows or macOS). Addresses on this computer (`localhost`, `127.0.0.1`) are always reached directly; to keep an address on your local network (a model server on another computer, for example) off the proxy, add it to `NO_PROXY`. When a component is installed, its Python packages are downloaded by uv, which follows its own proxy rules and may differ from the above (its documentation says it also reads `ALL_PROXY`, for example).
+
+Fetching recordings works only with proxies written as `http://` (an address without a scheme, such as `127.0.0.1:7890`, is treated as `http://`), not with SOCKS proxies or proxies written with `https://`; if the proxy needs a login, only Basic authentication written in the address is supported (`http://user:password@host:port`, special characters percent-encoded). When a recording's address would go through such a proxy (this includes the case where the matching `HTTP_PROXY` / `HTTPS_PROXY` is not set and `ALL_PROXY` is a SOCKS or `https://` one), fetching is refused with an explanation instead of quietly connecting directly; addresses listed in `NO_PROXY` are still reached directly. Model calls and updates are not limited this way: they can use a SOCKS5 (`socks5://`, `socks5h://`) or `https://` proxy set in `HTTP_PROXY` / `HTTPS_PROXY`.
+
+After changing these variables, quit LectureFlow completely (including any copy running in the background) and open it again.
 
 ### Browser extension
 

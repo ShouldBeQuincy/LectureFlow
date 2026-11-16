@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"lectureflow/internal/model"
 )
@@ -113,10 +114,75 @@ func UpdateStats(ctx context.Context, fn func(*model.JobStats)) {
 	}
 }
 
+// Phases of a RequestEvent.
+const (
+	RequestStart   = "start"   // an HTTP attempt is about to be sent
+	RequestEnd     = "end"     // the attempt is over (Outcome and usage are set)
+	RequestBackoff = "backoff" // the call waits RetryIn before its next attempt
+	RequestPhase   = "phase"   // a streamed attempt entered StreamPhase
+	// RequestActivity: events of a streamed attempt keep arriving (sent at
+	// most every few seconds); only the run's last activity follows it.
+	RequestActivity = "activity"
+)
+
+// RequestEvent is one moment of an LLM request (v3.2.x P1-c, lead freeze):
+// the llm client reports the same moments it writes to its call log, and
+// the scheduler turns them into job.stats.llm (model.LLMStats) and the
+// run's last activity. Usage still goes through ReportUsage / AddUsage; the
+// token fields here only label the attempt.
+type RequestEvent struct {
+	Phase  string    // RequestStart | RequestEnd | RequestBackoff | RequestPhase
+	At     time.Time // when it happened
+	CallID string    // one Complete call
+	N      int       // attempt within the call, 1 = first
+	Try    int       // the stage's request for the same answer, 1 = first, 0 = unknown
+
+	Role, ProviderID, Model string
+	MaxTokens               int    // 0 = not sent
+	Thinking                string // level sent (model.Thinking*)
+	Timeout                 time.Duration
+
+	// RequestEnd
+	Outcome          string // model.LLMOutcome*
+	Status           int    // HTTP status of an http_error
+	EmptyText        bool
+	PromptTokens     int64
+	CompletionTokens int64
+	CacheHitTokens   int64
+	ReasoningTokens  *int64
+
+	// RequestBackoff
+	RetryIn time.Duration
+	// RequestPhase
+	StreamPhase string // model.LLMPhase*
+}
+
+// RequestSink is the optional extension of StatsSink that takes request
+// events. The scheduler's sink implements it; a sink that does not (test
+// doubles written before it) simply gets none.
+type RequestSink interface {
+	ReportRequest(ev RequestEvent)
+}
+
+// ReportRequest forwards a request event to the run's sink, if it takes them.
+func ReportRequest(ctx context.Context, ev RequestEvent) {
+	if s, ok := ctx.Value(statsKey{}).(RequestSink); ok {
+		s.ReportRequest(ev)
+	}
+}
+
 // StatsRecorder is an in-memory StatsSink for tests of stages run directly.
+// It also records request events (RequestSink).
 type StatsRecorder struct {
-	mu    sync.Mutex
-	Stats model.JobStats
+	mu     sync.Mutex
+	Stats  model.JobStats
+	Events []RequestEvent
+}
+
+func (r *StatsRecorder) ReportRequest(ev RequestEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Events = append(r.Events, ev)
 }
 
 func (r *StatsRecorder) AddUsage(p, c, h int64) {

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,6 +53,13 @@ func (w *errCheckWriter) Flush() {
 	}
 }
 
+// extraErrorKeys: keys an error body of one endpoint may carry besides the
+// usual ones — "rollback_reset" only for "Restrict access"
+// (data_dir.restrict_failed after the update's rollback state was removed).
+var extraErrorKeys = map[string][]string{
+	"POST /api/system/data-dir/restrict": {"rollback_reset"},
+}
+
 // checkErrorBodies wraps the server of every test env: each 4xx/5xx answer
 // under /api/ must be a coded body (checkErrorBody). The only exception is
 // http.ServeContent's own plain-text 416 for an unsatisfiable Range of the
@@ -72,7 +80,7 @@ func checkErrorBodies(t *testing.T, h http.Handler) http.Handler {
 		if cw.status < 400 || !strings.HasPrefix(r.URL.Path, "/api/") || cw.status == http.StatusRequestedRangeNotSatisfiable {
 			return
 		}
-		if msg := checkErrorBody(cw.body.Bytes()); msg != "" {
+		if msg := checkErrorBody(cw.body.Bytes(), extraErrorKeys[r.Method+" "+r.URL.Path]...); msg != "" {
 			mu.Lock()
 			bad = append(bad, r.Method+" "+r.URL.Path+" "+strconv.Itoa(cw.status)+": "+msg)
 			mu.Unlock()
@@ -106,14 +114,15 @@ var knownCodes = sync.OnceValue(func() map[string][]string {
 // checkErrorBody returns "" for a valid coded error body: an object whose
 // "error" is {code (a known code), params (only its names), detail};
 // besides it only "diff" (needs_model_choice) and "changes"
-// (calendar.renumber).
-func checkErrorBody(b []byte) string {
+// (calendar.renumber); allowed names further keys the caller admits for
+// one endpoint (restrictBodyKeys).
+func checkErrorBody(b []byte, allowed ...string) string {
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(b, &top); err != nil {
 		return "not a JSON object: " + string(b)
 	}
 	for k := range top {
-		if k != "error" && k != "diff" && k != "changes" {
+		if k != "error" && k != "diff" && k != "changes" && !slices.Contains(allowed, k) {
 			return "unexpected key " + k + ": " + string(b)
 		}
 	}
@@ -280,5 +289,19 @@ func TestCheckErrorBody(t *testing.T) {
 		if msg := checkErrorBody([]byte(bad)); msg == "" {
 			t.Errorf("%s passed", bad)
 		}
+	}
+}
+
+// "rollback_reset" is admitted next to "error" for "Restrict access" only.
+func TestErrorBodyRollbackResetOnlyForRestrict(t *testing.T) {
+	b := []byte(`{"error":{"code":"data_dir.restrict_failed","params":{"path":"x","error":"y"}},"rollback_reset":true}`)
+	if msg := checkErrorBody(b); msg == "" {
+		t.Error("rollback_reset admitted for any endpoint")
+	}
+	if msg := checkErrorBody(b, extraErrorKeys["POST /api/system/data-dir/restrict"]...); msg != "" {
+		t.Errorf("restrict: %s", msg)
+	}
+	if len(extraErrorKeys) != 1 {
+		t.Errorf("extra keys for more endpoints than restrict: %v", extraErrorKeys)
 	}
 }

@@ -23,7 +23,7 @@ import (
 
 // The filter is an output option of audio.wav (after the input's -i).
 func TestAudioArgsKeepTimeline(t *testing.T) {
-	a := audioArgs("in.mp4", "out.tmp")
+	a := audioArgs("in.mp4", "out.tmp", nil)
 	in, af := slices.Index(a, "-i"), slices.Index(a, "-af")
 	if in < 0 || af < in+2 || a[af+1] != "aresample=async=1:first_pts=0" || a[len(a)-1] != "out.tmp" {
 		t.Fatalf("audio.wav args %v", a)
@@ -67,7 +67,7 @@ func TestRealAudioTimeline(t *testing.T) {
 			genMedia(t, ff, media, c.args...)
 			dir := t.TempDir()
 			ps := &prepStage{}
-			if err := ps.convertAudio(ctx, tools, model.Lecture{MediaPath: media}, dir, media, func(float64) {}); err != nil {
+			if err := ps.convertAudio(ctx, tools, model.Lecture{MediaPath: media}, dir, media, nil, func(float64) {}); err != nil {
 				t.Fatal(err)
 			}
 			got := readPCM16(t, filepath.Join(dir, model.AudioFile))
@@ -89,7 +89,7 @@ func TestRealAudioTimeline(t *testing.T) {
 			}
 			// the same samples as the conversion without the filter
 			plain := filepath.Join(dir, "plain.wav")
-			args := audioArgs(media, plain)
+			args := audioArgs(media, plain, nil)
 			i := slices.Index(args, "-af")
 			args = slices.Delete(args, i, i+2)
 			if out, err := tools.FFmpeg(ctx, dir, args, func(float64) {}); err != nil {

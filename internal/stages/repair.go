@@ -11,10 +11,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"lectureflow/internal/config"
 	"lectureflow/internal/ctxbuild"
 	"lectureflow/internal/db"
+	"lectureflow/internal/llm"
 	"lectureflow/internal/model"
 	"lectureflow/internal/sched"
 )
@@ -83,7 +85,8 @@ func planRepair(lectureID string, sentences []model.Sentence, chunks []ctxbuild.
 		}
 		for _, p := range answers[i] {
 			if p.Idx == nil {
-				slog.Warn("repair: patch without idx dropped", "lecture", lectureID, "chunk", i, "after", p.After)
+				// the length only: "after" is a sentence of the lecture (SEC1 L4)
+				slog.Warn("repair: patch without idx dropped", "lecture", lectureID, "chunk", i, "after_chars", utf8.RuneCountInString(p.After))
 				continue
 			}
 			if c.Contains(*p.Idx) {
@@ -149,17 +152,37 @@ func (s *repairStage) Run(ctx context.Context, lectureID string, progress func(f
 	var (
 		mu     sync.Mutex
 		failed []int
+		// refused: chunks the provider declined (llm.ErrRefusal); asking
+		// again gives the same, so like an unusable chunk they are skipped
+		// with a warning (review fix of v3.2.x P1). firstRefusal is the
+		// stage's error when every chunk was declined.
+		refused      []int
+		firstRefusal error
 	)
 	pc := &progressCounter{total: len(chunks), report: progress}
-	// The first chunk gets a head start to warm the prompt cache (perf-llm, warmup.go).
-	err = parallelWarm(ctx, len(chunks), d.concurrency(config.RoleRepair, target.ProviderID), repairWarmup, func(ctx context.Context, i int) (bool, error) {
+	// The first chunk gets a head start to warm the prompt cache (perf-llm,
+	// warmup.go; on Anthropic with a streamed model until its answer begins,
+	// v3.2.x r2 N46).
+	err = parallelWarm(ctx, len(chunks), d.concurrency(config.RoleRepair, target.ProviderID), d.repairWarmupFor(target), func(ctx context.Context, i int) (bool, error) {
 		c := chunks[i]
-		a, err := askJSON(ctx, d.LLM, config.RoleRepair, c.System, c.User, checkRepairAnswer)
+		a, err := askJSON(llm.WithJSONSchema(ctx, ctxbuild.SchemaRepair), d.LLM, config.RoleRepair, c.System, c.User, checkRepairAnswer)
 		if err != nil {
 			if isUnusable(err) {
-				slog.Warn("repair chunk unusable", "lecture", lectureID, "chunk", i, "err", err)
+				// No error text: it quotes the model's answer (lecture content).
+				slog.Warn("repair chunk unusable", "lecture", lectureID, "chunk", i, "problem", unusableKind(err))
 				mu.Lock()
 				failed = append(failed, i)
+				mu.Unlock()
+				pc.inc()
+				return false, nil
+			}
+			if errors.Is(err, llm.ErrRefusal) && ctx.Err() == nil {
+				slog.Warn("repair chunk refused by the provider", "lecture", lectureID, "chunk", i, "category", refusalCategory(err))
+				mu.Lock()
+				refused = append(refused, i)
+				if firstRefusal == nil {
+					firstRefusal = err
+				}
 				mu.Unlock()
 				pc.inc()
 				return false, nil
@@ -177,6 +200,10 @@ func (s *repairStage) Run(ctx context.Context, lectureID string, progress func(f
 		return err
 	}
 	sort.Ints(failed)
+	sort.Ints(refused)
+	if len(chunks) > 0 && len(refused) == len(chunks) {
+		return firstRefusal // llm.refusal, permanent: every chunk was declined
+	}
 	// SPEC §6.4: a chunk without patches is recorded in job.error. The
 	// warning goes through stats.warning; the scheduler writes it into
 	// job.error when the job becomes done (Gate B ruling, NOTES.md).
@@ -198,9 +225,29 @@ func (s *repairStage) Run(ctx context.Context, lectureID string, progress func(f
 		noteI = noteInfo(part(NoteRepairChunksFailed, map[string]any{
 			"total": len(chunks), "chunks": numList(nums), "ranges": strings.Join(spans, ", "), "attempts": attempts}))
 		warningI = &model.ErrorInfo{Code: WarnRepairUnrepaired, Params: map[string]any{"ranges": strings.Join(spans, ", "), "attempts": attempts}}
-		if len(failed) == len(chunks) {
-			return model.Errorf(CodeRepairAllFailed, map[string]any{"n": len(chunks), "attempts": attempts}, fmt.Errorf("修复失败：%s", note))
+	}
+	if len(refused) > 0 {
+		ranges := make([]string, len(refused))
+		nums, spans := make([]int, len(refused)), make([]string, len(refused))
+		for k, i := range refused {
+			ranges[k] = fmt.Sprintf("第 %d–%d 句", chunks[i].Start+1, chunks[i].End)
+			nums[k], spans[k] = i+1, fmt.Sprintf("%d–%d", chunks[i].Start+1, chunks[i].End)
 		}
+		rnote := fmt.Sprintf("共 %d 块，其中第 %s 块（%s）被服务商的安全策略拒绝，这些句子未做修复", len(chunks), numList(nums), strings.Join(ranges, "、"))
+		rwarn := fmt.Sprintf("%s的修复请求被服务商的安全策略拒绝，这些句子保留原始识别结果", strings.Join(ranges, "、"))
+		rnoteI := part(NoteRepairChunksRefused, map[string]any{"total": len(chunks), "chunks": numList(nums), "ranges": strings.Join(spans, ", ")})
+		rwarnI := model.ErrorInfo{Code: WarnRepairRefused, Params: map[string]any{"ranges": strings.Join(spans, ", ")}}
+		if note == "" {
+			note, warning = rnote, rwarn
+			noteI, warningI = noteInfo(rnoteI), noteInfo(rwarnI)
+		} else {
+			note, warning = note+"；"+rnote, warning+"；"+rwarn
+			noteI, warningI = noteInfo(*noteI, rnoteI), noteInfo(*warningI, rwarnI)
+		}
+	}
+	if len(failed) > 0 && len(failed)+len(refused) == len(chunks) {
+		// No chunk got an answer (all declined is the refusal error above).
+		return model.Errorf(CodeRepairAllFailed, map[string]any{"n": len(chunks), "attempts": businessRetries + 1}, fmt.Errorf("修复失败：%s", note))
 	}
 
 	plan := planRepair(lectureID, ld.sentences, chunks, answers)

@@ -6,6 +6,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -27,7 +28,7 @@ func TestUpdateRelayFlow(t *testing.T) {
 		if body != "" {
 			b = []byte(body)
 		}
-		return e.doWith(method, path, b, testToken, "")
+		return e.doHeaders(method, path, b, mainProcessHeaders(path))
 	}
 
 	res, b := do("GET", "/api/app/update", "")
@@ -82,7 +83,7 @@ func TestUpdateRelayFlow(t *testing.T) {
 func TestUpdateRelayNewVersionResetsRequests(t *testing.T) {
 	e := newDesktopEnv(t, &DesktopOptions{Token: testToken})
 	post := func(path, body string) []byte {
-		_, b := e.doWith("POST", path, []byte(body), testToken, "")
+		_, b := e.doHeaders("POST", path, []byte(body), mainProcessHeaders(path))
 		return b
 	}
 	post("/api/app/update/state", `{"state":"available","version":"3.1.0"}`)
@@ -120,7 +121,7 @@ func TestUpdateStateValidation(t *testing.T) {
 		`{"state":"error","error":{"code":"server.internal"}}`:                           "error",
 		`{"state":"available","version":"3.1.0","error":{"code":"update.check_failed"}}`: "error",
 	} {
-		res, b := e.doWith("POST", "/api/app/update/state", []byte(body), testToken, "")
+		res, b := e.doHeaders("POST", "/api/app/update/state", []byte(body), mainProcessHeaders("/api/app/update/state"))
 		if res.StatusCode != 400 || errCode(t, b) != "update.state_invalid" {
 			t.Errorf("%s: %d %s", body, res.StatusCode, b)
 			continue
@@ -135,7 +136,7 @@ func TestUpdateStateValidation(t *testing.T) {
 			t.Errorf("%s: field %v, want %s", body, eb.Error.Params["field"], field)
 		}
 	}
-	if res, b := e.doWith("POST", "/api/app/update/state", []byte(`not json`), testToken, ""); res.StatusCode != 400 || errCode(t, b) != "request.bad_json" {
+	if res, b := e.doHeaders("POST", "/api/app/update/state", []byte(`not json`), mainProcessHeaders("/api/app/update/state")); res.StatusCode != 400 || errCode(t, b) != "request.bad_json" {
 		t.Errorf("bad json: %d %s", res.StatusCode, b)
 	}
 }
@@ -155,5 +156,50 @@ func TestUpdateRelayNeedsTokenAndDesktopMode(t *testing.T) {
 		if res, b := web.doWith("POST", p, []byte(`{}`), "", ""); res.StatusCode != 404 || errCode(t, b) != "api.not_found" {
 			t.Fatalf("web mode %s: %d %s", p, res.StatusCode, b)
 		}
+	}
+}
+
+// mainProcessHeaders are the headers the desktop main process sends to path
+// (desktop/src/main/apiclient.js): the token, and on POST
+// /api/app/update/state the grant only the main process can compute
+// (PathGrantHeader, as on POST /api/app/path-grants; AUD1 I-1).
+func mainProcessHeaders(path string) map[string]string {
+	h := map[string]string{TokenHeader: testToken}
+	if path == "/api/app/update/state" {
+		h[PathGrantHeader] = pathGrantSecret(testToken)
+	}
+	return h
+}
+
+// AUD1 I-1, SEC44 information-1: POST /api/app/update/state is the main
+// process's report of the update mechanism; the page's requests carry the
+// token too, so the main process's own grant is required as well: without
+// it, or with a wrong one, 403 and nothing changes (a script in the page
+// cannot show "a new version is ready"); with it, as before.
+func TestUpdateStateNeedsTheMainProcessGrant(t *testing.T) {
+	e := newDesktopEnv(t, &DesktopOptions{Token: testToken})
+	const body = `{"state":"ready","version":"9.9.9"}`
+	for name, grant := range map[string]string{
+		"no grant":            "",
+		"wrong grant":         pathGrantSecret("another-token"),
+		"the token as grant":  testToken,
+		"grant in upper case": strings.ToUpper(pathGrantSecret(testToken)),
+	} {
+		h := map[string]string{TokenHeader: testToken}
+		if grant != "" {
+			h[PathGrantHeader] = grant
+		}
+		res, b := e.doHeaders("POST", "/api/app/update/state", []byte(body), h)
+		if res.StatusCode != http.StatusForbidden || errCode(t, b) != "auth.token_required" {
+			t.Errorf("%s: %d %s", name, res.StatusCode, b)
+		}
+	}
+	_, b := e.doWith("GET", "/api/app/update", nil, testToken, "")
+	if st := updateStatusOf(t, b); st.State != UpdateNone || st.Version != "" {
+		t.Fatalf("a refused report changed the state: %s", b)
+	}
+	res, b := e.doHeaders("POST", "/api/app/update/state", []byte(body), mainProcessHeaders("/api/app/update/state"))
+	if st := updateStatusOf(t, b); res.StatusCode != http.StatusOK || st.State != UpdateReady || st.Version != "9.9.9" {
+		t.Fatalf("the main process's report: %d %s", res.StatusCode, b)
 	}
 }

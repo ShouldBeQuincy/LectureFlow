@@ -38,6 +38,7 @@ import (
 	"unicode/utf8"
 
 	"lectureflow/internal/api"
+	"lectureflow/internal/glossary"
 	"lectureflow/internal/model"
 )
 
@@ -750,7 +751,7 @@ func (s *store) mergeTerms(c *api.Course, sc *sylCourse, found []api.Term, sourc
 		if len(items) > 0 {
 			changed = true
 			sc.storeRun(model.JanitorReport{CourseID: c.ID, FromVersion: from, Version: from + 1, CreatedAt: time.Now().UTC().Format(time.RFC3339),
-				Fallback: true, Note: "合并术语后按常用词规则整理（未配置术语表清道夫）", Items: items})
+				Fallback: true, Note: glossary.NoteFallbackMerge, NoteInfo: glossary.NoteInfo(glossary.CodeNoteFallbackMerge, nil), Items: items})
 		}
 	}
 	if changed {

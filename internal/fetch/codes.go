@@ -24,9 +24,15 @@ const (
 	CodeCredentialsCleared = "downloads.credentials_cleared"
 
 	// failed (retryable).
-	CodeHTTPStatus    = "downloads.http_status" // params: status
-	CodeNetwork       = "downloads.network"
-	CodeNoSpace       = "downloads.no_space" // params: free_bytes, keep_bytes
+	CodeHTTPStatus = "downloads.http_status" // params: status
+	CodeNetwork    = "downloads.network"
+	CodeNoSpace    = "downloads.no_space" // params: free_bytes, keep_bytes
+	// no_space with the task's own files kept for the resume (disklimit.go:
+	// they stay so that the retry goes on; SEC43b low-5): the text says how
+	// much they hold, which removing the task frees. Params: free_bytes,
+	// keep_bytes, task_bytes (lead's interface F5; the extension knows it
+	// as a disk failure).
+	CodeNoSpaceKept   = "downloads.no_space_kept"
 	CodeWriteFailed   = "downloads.write_failed"
 	CodeEngineMissing = "downloads.engine_missing"
 	CodeEngineFailed  = "downloads.engine_failed"
@@ -54,11 +60,40 @@ const (
 	// and refresh, and a task's failure when a playlist, an MPD or a
 	// redirect leads there later. Params: category (youtube | courses);
 	// host for a task.
-	CodeSiteBlocked  = "downloads.site_blocked"
-	CodeMergeFailed  = "downloads.merge_failed"
-	CodeImportFailed = "downloads.import_failed"
+	CodeSiteBlocked = "downloads.site_blocked"
+	// A URL of the task (a playlist's entry, an MPD's, a redirect's
+	// Location) has a host name with characters outside plain ASCII, a
+	// control character or a percent sign (blocklist.UnusualHost): it can
+	// be neither matched against the do-not-handle list nor judged for
+	// local addresses as written (net/http maps it by IDNA), so it is
+	// refused (SEC10). Params: host (non-ASCII bytes percent-encoded).
+	// Also a redirect that leads to an address that is neither http nor
+	// https (ftp://, which aria2c follows; the guard proxy refuses it,
+	// guard.go): host is then the scheme and the host, "ftp://files.example".
+	// Also an address of no single server (multicast, the limited
+	// broadcast, an IPv4-compatible address of a public one, an IPv6
+	// address with 0.0.0.0/8 inside: local.go classNotUnicast), and a URL
+	// with user info ("user:pass@", which aria2c would send as Basic
+	// authentication; local.go userInfoError): host is the URL's host
+	// alone, never the user info.
+	CodeUnusualHost = "downloads.unusual_host"
+	// The proxy set for a URL of the task (HTTP_PROXY / HTTPS_PROXY, as
+	// Go's own requests read them) is one aria2c cannot use: a SOCKS proxy
+	// (aria2c has none: it would connect directly, past the proxy, from
+	// the user's own address) or one written https:// (aria2c speaks plain
+	// HTTP to it: the proxy's password would go out in the clear). Nothing
+	// is handed to aria2c (SEC16 low-1 and low-2; user 2026-11-11).
+	// Params: scheme (socks5, socks5h, https, ...).
+	CodeProxyUnsupported = "downloads.proxy_unsupported"
+	CodeMergeFailed      = "downloads.merge_failed"
+	CodeImportFailed     = "downloads.import_failed"
 	// The second camera angle (angle.go) has no video stream to keep.
 	CodeAngleNoVideo = "downloads.angle_no_video"
+	// The task would hold more than one task may (Options.MaxTaskBytes,
+	// 64 GiB; disklimit.go): a live stream or a server that never stops
+	// sending, rarely a real recording. Not retryable; the files go.
+	// Params: max_bytes.
+	CodeTooLarge = "downloads.too_large"
 
 	// HTTP answers.
 	CodeNotFound           = "downloads.not_found"           // 404
@@ -73,8 +108,8 @@ const (
 // ErrorCodes lists every code above (cmd's catalog test).
 var ErrorCodes = []string{
 	CodeRestarted, CodeCredentialsRejected, CodeCredentialsExpired, CodeCredentialsCleared,
-	CodeHTTPStatus, CodeNetwork, CodeNoSpace, CodeWriteFailed, CodeEngineMissing, CodeEngineFailed, CodeTLSFailed,
-	CodePlaylistInvalid, CodePlaylistUnsupported, CodeDRMProtected, CodeLocalAddress, CodeLoopbackAddress, CodeSiteBlocked, CodeMergeFailed, CodeImportFailed, CodeAngleNoVideo,
+	CodeHTTPStatus, CodeNetwork, CodeNoSpace, CodeNoSpaceKept, CodeWriteFailed, CodeEngineMissing, CodeEngineFailed, CodeTLSFailed,
+	CodePlaylistInvalid, CodePlaylistUnsupported, CodeDRMProtected, CodeLocalAddress, CodeLoopbackAddress, CodeSiteBlocked, CodeUnusualHost, CodeProxyUnsupported, CodeMergeFailed, CodeImportFailed, CodeAngleNoVideo, CodeTooLarge,
 	CodeNotFound, CodeActive, CodeNeedsRefresh, CodeNotRetryable, CodeNotCancellable,
 	CodeConcurrencyInvalid, CodeConnectionsInvalid,
 }

@@ -588,9 +588,13 @@ func (s *Scheduler) remoteAdmit(ctx context.Context, sc *scanState, r *run, busy
 }
 
 // audioPath is the job's lecture audio.wav ("" when the lecture is gone).
+// It is read (audioSec) and uploaded ahead to Colab (planEntry) before any
+// run, so before the start check (checkScopeIDs): a lecture whose directory
+// is not one of its own — an id that names another folder, a link on the
+// way (state.LectureFilesOK) — has none either (SEC49 L2).
 func (s *Scheduler) audioPath(ctx context.Context, j model.Job) string {
 	l, err := s.st.GetLecture(ctx, j.ScopeID)
-	if err != nil {
+	if err != nil || !state.LectureFilesOK(s.dataDir, l) {
 		return ""
 	}
 	return model.LectureDir(s.dataDir, l.CourseID, l.ID) + string(os.PathSeparator) + model.AudioFile

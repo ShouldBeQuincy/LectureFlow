@@ -25,6 +25,7 @@ import (
 	"lectureflow/internal/cite"
 	"lectureflow/internal/ctxbuild"
 	"lectureflow/internal/db"
+	"lectureflow/internal/llm"
 	"lectureflow/internal/model"
 	"lectureflow/internal/procutil"
 	"lectureflow/internal/pyenv"
@@ -79,6 +80,9 @@ func writeFileAtomic(path, data string) error {
 // writeRaw stores the raw syllabus text (A8.2 syllabus.raw.txt) and its
 // source file name.
 func (s *Server) writeRaw(courseID, filename, raw string) error {
+	if err := checkRecordIDs(courseID); err != nil { // record_dir.go
+		return err
+	}
 	if err := writeFileAtomic(s.syllabusRawPath(courseID), raw); err != nil {
 		return err
 	}
@@ -191,6 +195,10 @@ func (s *Server) syllabusRaw(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	c, ok := s.courseExists(w, r, r.PathValue("id"))
 	if !ok {
+		return
+	}
+	if err := checkRecordIDs(c.ID); err != nil { // record_dir.go
+		s.fail(w, r, err)
 		return
 	}
 	var name, raw string
@@ -315,6 +323,18 @@ func (s *Server) formatSyllabus(w http.ResponseWriter, r *http.Request) {
 		if ctx.Err() != nil {
 			return
 		}
+		// The provider declined (R25 B-3): its own code says so and that
+		// asking again will not help, with the role, provider and model
+		// (llm.CodeRefusal), instead of the generic format_failed.
+		var ce *model.CodedError
+		if errors.Is(err, llm.ErrRefusal) && errors.As(err, &ce) && ce.Info.Code == llm.CodeRefusal {
+			info := ce.Info
+			if info.Detail == "" && ce.Err != nil {
+				info.Detail = ce.Err.Error()
+			}
+			writeErrorInfo(w, http.StatusBadGateway, info)
+			return
+		}
 		writeErrorInfo(w, http.StatusBadGateway, model.ErrorInfo{Code: "syllabus.format_failed", Detail: err.Error()})
 		return
 	}
@@ -346,6 +366,10 @@ func (s *Server) saveSyllabus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	c, ok := s.courseExists(w, r, r.PathValue("id"))
 	if !ok {
+		return
+	}
+	if err := checkRecordIDs(c.ID); err != nil { // record_dir.go
+		s.fail(w, r, err)
 		return
 	}
 	var in SyllabusSaveInput
@@ -466,9 +490,9 @@ func (s *Server) runExtractPDF(ctx context.Context, dir, pdf string) ([]string, 
 	}
 	deadline := stages.NewPDFDeadline(ctx, size, syllabusPDFTimeout)
 	defer deadline.Stop()
-	cmd := exec.CommandContext(deadline.Context(), py, script, "--in", jobPath, "--out", tmp)
+	cmd := exec.CommandContext(deadline.Context(), py, pyenv.ScriptArgs(script, "--in", jobPath, "--out", tmp)...) // -s (pyenv "Isolation")
 	cmd.Dir = absDir
-	cmd.Env = pyenv.Environ("PYTHONIOENCODING=utf-8", "PYTHONUNBUFFERED=1") // no usage reporting (pyenv)
+	cmd.Env = pyenv.Environ("PYTHONIOENCODING=utf-8", "PYTHONUNBUFFERED=1") // no usage reporting, no PYTHONPATH and the like (pyenv)
 	cmd.WaitDelay = 3 * time.Second
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -601,7 +625,7 @@ func (s *Server) updateStale(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	ix, err := s.loadJobs(ctx)
+	ix, err := s.scopeJobsOf(ctx, nil, nil, lecs) // this course's lectures only (course_reads.go)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -654,7 +678,7 @@ func (s *Server) courseCite(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	ix, err := s.loadJobs(ctx)
+	ix, err := s.scopeJobsOf(ctx, nil, nil, lecs) // this course's lectures only (course_reads.go)
 	if err != nil {
 		s.fail(w, r, err)
 		return

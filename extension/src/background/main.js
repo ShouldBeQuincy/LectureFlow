@@ -10,13 +10,15 @@ import { LANGUAGE_KEY } from '../lib/i18n.js';
 import * as requests from './requests.js';
 import { detectTab, forgetTab, lastResult, viewOf, suggestedOrigins, cookieHostOrigins, reportFor, setBadge, reportableTabs } from './detector.js';
 import { isAuthorized, syncObserver, grantedOrigins } from './sites.js';
-import { allProfiles } from './profiles.js';
+import { allProfiles, recordTrip, watchRegexes, forgetTrips } from './profiles.js';
+import { fromExtensionPage, recordRemoved, HEALTH_KEY } from '../lib/health.js';
 import { nm, connection, setTestConnect } from './nm.js';
 import { checkResult, checkMany, sendResult, refreshResult, openInApp, latestStatus, fail, restrictedRemembered, sentPreset, LAST_COURSE_KEY } from './actions.js';
 import { cookieApi } from './cookies.js';
 import { findProfile, profileMatchesUrl, profilePermissionOrigins } from '../lib/profile.js';
+import { platformOf } from '../lib/send.js';
 import { observeConfig } from '../lib/observe.js';
-import { findInpage, inpageConfig, sessionResult, sessionInfoRequest, sessionInfoSpec } from '../lib/inpage.js';
+import { findInpage, inpageConfig, sessionLoadReply, sessionInfoRequest, sessionInfoSpec } from '../lib/inpage.js';
 import { contextCategory } from '../lib/blockedframes.js';
 import { isBlockedUrl } from '../lib/blocklist.js';
 import { urlKey, parseHttpUrl, hostMatches, requestableOrigin } from '../lib/url.js';
@@ -98,10 +100,14 @@ browser.permissions.onRemoved.addListener(() => syncObserver());
 // A locally imported profile may add or drop an observation or a button;
 // the interface language may change in the settings.
 browser.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && changes.localProfiles) syncObserver();
+  // a profile stopped as too slow, or enabled again (src/lib/health.js)
+  if (area === 'local' && (changes.localProfiles || changes[HEALTH_KEY])) syncObserver();
+  // a record removed (enabled again, imported again): this background tries again too
+  if (area === 'local' && changes[HEALTH_KEY] && recordRemoved(changes[HEALTH_KEY].oldValue, changes[HEALTH_KEY].newValue)) forgetTrips();
   if (area === 'local' && changes[LANGUAGE_KEY]) refreshLanguage();
 });
 refreshLanguage();
+watchRegexes();
 
 const senderUrl = (sender) => (sender && (sender.url || (sender.tab && sender.frameId === 0 ? sender.tab.url : ''))) || '';
 const senderTopUrl = (sender) => (sender && sender.tab && typeof sender.tab.url === 'string' ? sender.tab.url : '');
@@ -139,6 +145,16 @@ async function inpageFor(sender, msg = null) {
 browser.runtime.onMessage.addListener((msg, sender) => {
   if (!msg || !sender || sender.id !== browser.runtime.id) return undefined;
   if (msg.cmd === 'observeConfig') return observeConfigFor(sender, msg).catch(() => null);
+  // a profile regex too slow in a content script (src/lib/regexguard.js):
+  // recorded for a local profile only (src/lib/health.js recordable)
+  const ownPage = fromExtensionPage(sender, browser.runtime.getURL(''));
+  if (msg.cmd === 'regexSlow') return sender.tab && !ownPage ? recordTrip(msg, 'content').then(() => ({ ok: true }), () => ({ ok: false })) : undefined;
+  // the settings page (in a tab or not) enabled a stopped profile again
+  if (msg.cmd === 'regexReset') {
+    if (!ownPage) return undefined;
+    forgetTrips();
+    return Promise.resolve({ ok: true });
+  }
   if (msg.cmd === 'inpageConfig') {
     return Promise.all([inpageFor(sender, msg), languageReady()]).then(([f]) => (f ? { ...inpageConfig(f), i18n: chosenCatalog() } : null), () => null);
   }
@@ -147,11 +163,13 @@ browser.runtime.onMessage.addListener((msg, sender) => {
 
 /**
  * hello, plus what the cards preselect: the course used last, the system.
- * passive: a query the page made on its own (row states), which must not
- * start LectureFlow; everything a user clicks may.
+ * passive: a query nobody clicked for — the row states a page asks for on
+ * its own, the popup just opened — or the popup's "重新检测" beside "打开
+ * LectureFlow" (a fresh look), which must not start LectureFlow; every
+ * other click may.
  */
 async function connectionFor(recheck, passive = false) {
-  const view = await connection(recheck, { noLaunch: passive && !recheck });
+  const view = await connection(recheck, { noLaunch: passive });
   try {
     view.lastCourseId = String((await browser.storage.local.get(LAST_COURSE_KEY))[LAST_COURSE_KEY] || '');
   } catch {
@@ -349,7 +367,9 @@ async function pageCommand(name, msg, subscribe) {
   await languageReady(); // track names and labels are in the interface language
   switch (msg.cmd) {
     case 'detect': {
-      const r = msg.force || !lastResult(tabId) ? await detectTab(tabId, { force: !!msg.force }) : lastResult(tabId);
+      let r = msg.force || !lastResult(tabId) ? await detectTab(tabId, { force: !!msg.force }) : lastResult(tabId);
+      // the tab moved on while it ran (nothing was stored): once more, on the page it shows now
+      if (r && r.status === 'navigated') r = await detectTab(tabId, { force: true });
       return { ok: true, view: await viewFor(r), origins: suggestedOrigins(r), cookieHosts: await notGranted(cookieHostOrigins(r)), offers: await offersFor(r) };
     }
     case 'report':
@@ -357,12 +377,23 @@ async function pageCommand(name, msg, subscribe) {
     case 'reportTabs':
       return { ok: true, tabs: reportableTabs() };
     case 'connection': {
-      const view = await connectionFor(!!msg.recheck);
+      // passive: the popup opening asks only whether LectureFlow runs, and
+      // never starts it (T26 G1); its "重新检测" and "打开 LectureFlow" may
+      const view = await connectionFor(!!msg.recheck, !!msg.passive);
       if (view.status === 'connected') subscribe();
       return { ok: true, connection: view };
     }
-    case 'check':
-      return checkResult(lastResult(tabId));
+    case 'check': {
+      // Whether this lecture is in LectureFlow is never a reason to start
+      // it (SEC42 低-1): if it quit since the popup's hello, the check finds
+      // it not running. Sending checks again and may start it.
+      const r = lastResult(tabId);
+      if (!r || r.status !== 'ok') return fail('ext.stale');
+      const c = await checkMany(platformOf(r), [r.sessionId], { noLaunch: true });
+      if (!c.ok) return c;
+      const item = c.items.find((i) => i.sessionId === r.sessionId) || null;
+      return { ok: true, item, status: item && item.taskId ? latestStatus(item.taskId) : null };
+    }
     case 'send': {
       subscribe();
       const r = lastResult(tabId);
@@ -449,9 +480,10 @@ async function inpageCommand(ctx, msg, subscribe) {
       if (found.mode !== 'list') return fail('ext.not_allowed');
       if (inWindowOnly) return fail('ext.confirm_in_window');
       const sid = String(msg.sessionId || '');
-      if (!sid || sid.length > 200 || !sessionInfoRequest(sessionInfoSpec(found.profile), sid, ctx.frameUrl)) return fail('request.invalid', { field: 'sessionId' });
-      const result = sessionResult({ found, sessionId: sid, values: msg.values && typeof msg.values === 'object' ? msg.values : {}, frameUrl: ctx.frameUrl, locale: uiLocale() });
-      if (!result) return fail('ext.info_failed', { status: 0 });
+      if (!sid || sid.length > 200 || !sessionInfoRequest(sessionInfoSpec(found.profile, { reviewed: !!found.reviewed }), sid, ctx.frameUrl)) return fail('request.invalid', { field: 'sessionId' });
+      const reply = sessionLoadReply({ found, sessionId: sid, values: msg.values && typeof msg.values === 'object' ? msg.values : {}, frameUrl: ctx.frameUrl, locale: uiLocale() });
+      if (!reply.ok) return reply;
+      const result = reply.result;
       sessions.set(sessionKey(sid), { result, at: Date.now() });
       note(sid);
       return { ok: true, view: await viewFor(result), origins: [], offers: [] };

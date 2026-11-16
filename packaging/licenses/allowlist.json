@@ -43,13 +43,6 @@
       "name": "regex",
       "scope": "user-fetched",
       "reason": "Not distributed with LectureFlow: not in the installer or any LectureFlow download; the component manager downloads it on the user's computer from PyPI (or the mirror the user chose), pinned by the component lock file, into the component's own Python environment that runs in a separate process. The project must not publish offline component archives that contain this package. Incompatibility: Apache-2.0 AND CNRI-Python; the CNRI-Python part alone is not GPL-compatible per FSF. Component: asr-mlx. Lead ruling 2026-10-24. LectureFlow's combination with this package is covered by the additional permission under AGPL-3.0 section 7 in LICENSE-EXCEPTION.md (user decision 2026-10-25, confirmed 2026-10-27), which names it; that permission does not change this package's own license and does not change the rule above: LectureFlow still does not distribute it."
-    },
-    {
-      "kind": "npm",
-      "name": "sax",
-      "version": "1.6.1",
-      "scope": "distributed",
-      "reason": "Shipped with the desktop app through electron-updater. BlueOak-1.0.0 is an OSI-approved permissive license whose only condition is keeping the license notice (reproduced in Appendix A); it has no term that conflicts with AGPL-3.0. Not on the FSF license list; accepted by the copyright holder (the user) on 2026-10-25, and confirmed by the user on 2026-10-27 as compatible with AGPL-3.0. Lead ruling 2026-10-24; BlueOak-1.0.0 deliberately not added to the general compatible table."
     }
   ]
 }

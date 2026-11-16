@@ -85,6 +85,29 @@ func RelPathNeed(c *Component, b *Build) int {
 // limitsPaths: the platform has the MAX_PATH limit.
 func limitsPaths(platform string) bool { return strings.HasPrefix(platform, "windows") }
 
+// DataDirLimit is the longest data directory (an absolute path without a
+// trailing separator, in UTF-16 units as PathLen counts) under which the
+// current manifest's build of component id for this platform can be
+// installed: checkPathLen's rule, MaxPathLen − 1 − RelPathNeed. ok is
+// false when no such limit is known: the platform has no MAX_PATH limit,
+// the manifest has no such component or no build of it for this platform,
+// or the build's depth is unknown (RelPathNeed 0, which checkPathLen lets
+// through too). It only reads the manifest (the diagnostics page).
+func (m *Manager) DataDirLimit(id string) (max int, ok bool) {
+	if !limitsPaths(m.platform) {
+		return 0, false
+	}
+	c := m.manifest().Component(id)
+	if c == nil {
+		return 0, false
+	}
+	need := RelPathNeed(c, c.Build(m.platform))
+	if need == 0 {
+		return 0, false
+	}
+	return MaxPathLen - 1 - need, true
+}
+
 // checkPathLen refuses a build whose deepest file would get a path longer
 // than MaxPathLen under this data directory (Windows platforms only).
 func (m *Manager) checkPathLen(c *Component, b *Build) error {

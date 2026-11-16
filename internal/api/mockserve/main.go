@@ -38,6 +38,16 @@
 //	       period (P12.4 tags; course_p2.go); set the browser clock to the
 //	       resources' sampled_at for consistent countdowns
 //	battery, noov, cpuonly  transcription devices (devices.go)
+//	lowvram, lowvram_fp16, lowvram_turbo  a 4 GB NVIDIA card (cuda:0 on
+//	       large-v2, the same at float16, or after switching to
+//	       large-v3-turbo): cuda:0's VRAM hint on the diagnostics page
+//	       (none for large-v3-turbo) (vram_hint.go)
+//	lowvram_missing, lowvram_missing_install  the same 4 GB card where
+//	       cuda:0's large-v2 is not installed: the diagnostics hint that
+//	       says so and suggests the card's recommended large-v3-turbo,
+//	       installed / still to install (vram_hint.go)
+//	vram_raised  the per-task estimate raised after running out of GPU
+//	       memory: the GPU card's note (vram_hint.go)
 //	diag_intel, diag_mac, diag_cloud  the diagnostics by hardware and
 //	       transcription mode: a pure Intel laptop, an Apple silicon Mac,
 //	       only Colab (ext_diag.go; GET / PUT /api/asr-mode)
@@ -49,12 +59,21 @@
 //	       other accounts can change / read the data folder (the data_dir
 //	       row's warning and "收紧权限"; the last one cannot be restricted)
 //	       (datadir.go)
+//	installdir_ok, installdir_shared, installdir_unconfirmed, installdir_above,
+//	installdir_root, installdir_profile
+//	       the installation folder's row: private, other accounts can
+//	       change it, cannot be confirmed, a folder above it, the drive's
+//	       root above it, the default place with a foreign group
+//	       (installdir.go)
 //	power_ac_dgpu, power_ac_intel, power_battery_npu, power_battery_suspended,
 //	power_ac_switch, power_all_suspended
 //	       the power policy's resource bar (power.go): AC + NVIDIA card, AC +
 //	       Intel only, battery + NPU, battery with a suspended NVIDIA job,
 //	       plugged in while the NPU runs (switch pending), battery without
 //	       any qualifying device (everything suspended)
+//	old_failures  the default data with the Deadlocks translate failure three
+//	       days old: out of the dashboard's 24-hour failures, counted in
+//	       earlier_failed_total and in COMP2120's failed_count (r7.go)
 //
 // It also streams fake SSE (job progress, "resources" every tick, one
 // "lecture finished" and one "final failure" event), synthetic audio clips
@@ -173,6 +192,7 @@ type mock struct {
 	powerBatterySuspended lazyStore
 	powerACSwitch         lazyStore
 	powerAllSuspended     lazyStore
+	oldFailures           lazyStore // scenario "old_failures" (r7.go)
 	resNoGPU              resources.Snapshot
 	loadErr               error
 	mediaFile             string                 // -media: the file of GET /media (player.go)
@@ -258,6 +278,9 @@ func (m *mock) storeFor(r *http.Request) *store {
 	if s, ok := m.diagStore(r); ok { // ext-step1 (ext_diag.go)
 		return s
 	}
+	if s, ok := m.sshStore(r); ok { // ssh-1b (ssh.go): the SSH servers' device rows
+		return s
+	}
 	switch scenario(r) {
 	case "empty":
 		return m.empty
@@ -288,6 +311,8 @@ func (m *mock) storeFor(r *http.Request) *store {
 		return m.powerACSwitch.get(m, setupPowerACSwitch)
 	case "power_all_suspended":
 		return m.powerAllSuspended.get(m, setupPowerAllSuspended)
+	case "old_failures":
+		return m.oldFailures.get(m, setupOldFailures)
 	}
 	return m.main
 }
@@ -467,11 +492,13 @@ func (m *mock) system(r *http.Request, s *store) (api.System, error) {
 	sys.Power = &p
 	sys.OpenVINO = s.openVINOInfo(now)
 	sys.Checks = s.withDeviceChecks(sys.Checks)
+	vramSystem(r, &sys)                     // r2 N15 (vram_hint.go)
 	obDesktopChecks(r, &sys)                // ob_desktop (v3_accfix.go)
 	sys.Config = mockConfigView(r, s, &sys) // 3.1.0 (v31_config.go)
 	m.diagSystem(r, s, &sys)                // ext-step1 (ext_diag.go)
 	m.web3System(r, &sys)                   // ext web3: aria2c, browser_ext (ext_web3.go)
 	m.dataDirSystem(r, &sys)                // datadir-ui: who else can reach the data folder (datadir.go)
+	m.installDirSystem(r, &sys)             // T-SEC-05: who else can change the installation (installdir.go)
 	return sys, nil
 }
 
@@ -795,14 +822,14 @@ func (m *mock) update(w http.ResponseWriter, r *http.Request, s *store) {
 }
 
 func (m *mock) stageAction(w http.ResponseWriter, r *http.Request, s *store) {
-	choice, err := modelChoice(r)
-	if err != nil {
+	var in api.ModelChoiceRequest
+	if err := decodeBody(r, &in); err != nil {
 		writeErr(w, err)
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	l, err := s.stageAction(r.PathValue("id"), r.PathValue("stage"), r.PathValue("action"), choice, time.Now())
+	l, err := s.stageActionWith(r.PathValue("id"), r.PathValue("stage"), r.PathValue("action"), in, time.Now())
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -990,7 +1017,8 @@ func (m *mock) review(w http.ResponseWriter, r *http.Request, s *store) {
 
 func (m *mock) sentenceOp(w http.ResponseWriter, r *http.Request, s *store) {
 	var in struct {
-		Text string `json:"text"`
+		Text       string `json:"text"`
+		UseCurrent bool   `json:"use_current"` // retranslate, v3.2.x (manual.go)
 	}
 	if err := decodeBody(r, &in); err != nil {
 		writeErr(w, err)
@@ -1019,6 +1047,16 @@ func (m *mock) sentenceOp(w http.ResponseWriter, r *http.Request, s *store) {
 	case "reset":
 		sn.HumanText, sn.Text = nil, sn.RepairedText
 	case "retranslate":
+		if in.UseCurrent {
+			mixed, err := s.useCurrentModel(r.PathValue("id"), sn)
+			if err != nil {
+				writeErr(w, err)
+				return
+			}
+			sn.ZhStatus = model.ZhStale
+			writeJSON(w, http.StatusOK, api.RetranslateResult{Sentence: *sn, Mixed: &mixed})
+			return
+		}
 	default:
 		notImplemented(w, r)
 		return
@@ -1096,7 +1134,13 @@ func (m *mock) step(n int, r *http.Request, s *store, send func(string, any) err
 	for _, l := range s.lectures {
 		for _, st := range l.Stages {
 			if st.Status == model.StatusRunning {
-				jobs = append(jobs, api.JobEvent{Scope: model.ScopeLecture, ScopeID: l.ID, Stage: st.Stage, Status: st.Status, Progress: st.Progress})
+				ev := api.JobEvent{Scope: model.ScopeLecture, ScopeID: l.ID, Stage: st.Stage, Status: st.Status, Progress: st.Progress}
+				if st.LLM != nil || st.LastActivityAt != nil {
+					// v3.2.x P1-c: a running job's stats as the stage view has them
+					u := st.Stats
+					ev.Stats, ev.LLM, ev.LastActivityAt = &u, st.LLM, st.LastActivityAt
+				}
+				jobs = append(jobs, ev)
 			}
 		}
 	}

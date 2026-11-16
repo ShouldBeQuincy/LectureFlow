@@ -86,6 +86,33 @@ type Result struct {
 	Error   string `json:"error,omitempty"` // a short reason (English, for "查看详情")
 }
 
+// Outcomes of Result.
+const (
+	OutcomeInstalled  = "installed"
+	OutcomeRolledBack = "rolled_back"
+	OutcomeFailed     = "failed"
+)
+
+// FailedInstall is an installation of a newer version that did not work
+// (result.json rolled_back or failed while the running version is still
+// older): that version is not offered again, and its package is removed,
+// until a strictly newer version appears; the user may still try it again
+// (Status.InstallFailed).
+type FailedInstall struct {
+	Version string `json:"version"`
+	At      string `json:"at"`              // result.json's "at": the failure this is about
+	Outcome string `json:"outcome"`         // rolled_back | failed
+	Error   string `json:"error,omitempty"` // result.json's reason
+}
+
+// failedRecord is kv selfupdate.failed_install. Retry: the user asked to
+// try that version again (a download or an offline update of it): not in
+// effect, kept only so that the same result.json does not record it again.
+type failedRecord struct {
+	FailedInstall
+	Retry bool `json:"retry,omitempty"`
+}
+
 // relPath joins parts into a "/"-separated path relative to the updates dir.
 func relPath(parts ...string) string { return path.Join(parts...) }
 

@@ -126,13 +126,16 @@ func TestThinkingRequestBodies(t *testing.T) {
 			`{"model":"deepseek-v4-pro",` + oaiMsgs + `,` + jsonFmt + `"stream":false,"thinking":{"type":"enabled"},"max_tokens":32768,"reasoning_effort":"max"}`},
 		{dsHost, "deepseek-v4-pro", model.RoleGlossaryJanitor, "high", true, "/chat/completions",
 			`{"model":"deepseek-v4-pro",` + oaiMsgs + `,` + jsonFmt + `"stream":false,"thinking":{"type":"enabled"},"max_tokens":24192,"reasoning_effort":"high"}`},
-		// Anthropic, current Claude model: adaptive thinking with the effort.
+		// Anthropic, current Claude model: adaptive thinking with the effort;
+		// max_tokens = the role's base + the level's headroom (v3.2.x D1,
+		// maxtokens.go). Streamed with a thinking summary (v3.2.x P1-c,
+		// stream.go), so max holds its full 60000.
 		{claude, "claude-opus-5-5", model.RoleTranslate, "low", true, "/v1/messages",
-			`{"model":"claude-opus-5-5","max_tokens":6048,` + anthSys + `,` + anthJSON + `,"thinking":{"type":"adaptive"},"output_config":{"effort":"low"}}`},
+			`{"model":"claude-opus-5-5","max_tokens":14000,` + anthSys + `,` + anthJSON + `,"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"low"},"stream":true}`},
 		{claude, "claude-sonnet-5-5", model.RoleSummary, "high", false, "/v1/messages",
-			`{"model":"claude-sonnet-5-5","max_tokens":12192,` + anthSys + `,` + anthText + `,"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`},
+			`{"model":"claude-sonnet-5-5","max_tokens":28000,` + anthSys + `,` + anthText + `,"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"high"},"stream":true}`},
 		{claude, "claude-opus-5-5", model.RoleGlossaryJanitor, "max", true, "/v1/messages",
-			`{"model":"claude-opus-5-5","max_tokens":40576,` + anthSys + `,` + anthJSON + `,"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`},
+			`{"model":"claude-opus-5-5","max_tokens":76000,` + anthSys + `,` + anthJSON + `,"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"max"},"stream":true}`},
 		// Anthropic, older Claude model: budget_tokens.
 		{claude, "claude-haiku-4-5", model.RoleRepair, "high", true, "/v1/messages",
 			`{"model":"claude-haiku-4-5","max_tokens":12192,` + anthSys + `,` + anthJSON + `,"thinking":{"type":"enabled","budget_tokens":8192}}`},
@@ -196,7 +199,7 @@ func TestThinkingTruncationRetry(t *testing.T) {
 		first, then            int
 	}{
 		{"DeepSeek", model.ProviderOpenAI, "https://api.deepseek.com", "deepseek-flash", 16384, 32768},
-		{"Claude adaptive", model.ProviderAnthropic, "", "claude-opus-5-5", 12192, 24384},
+		{"Claude adaptive", model.ProviderAnthropic, "", "claude-opus-5-5", 30000, 60000}, // v3.2.x D1: repair 6000 + high 24000
 		{"Claude budget", model.ProviderAnthropic, "", "claude-haiku-4-5", 12192, 24384},
 	} {
 		for _, twice := range []bool{false, true} {
@@ -215,8 +218,18 @@ func TestThinkingTruncationRetry(t *testing.T) {
 			setRole(t, e.set, model.RoleRepair, p.ID, tc.model, model.RoleParams{Thinking: sp(model.ThinkingHigh)})
 			_, err := e.c.Complete(context.Background(), model.RoleRepair, "SYS", "USR", true)
 			caps := e.got()
-			if len(caps) != 2 {
+			want := 2
+			if twice {
+				want = 3 // v3.2.x P1-c: two truncation retries; text was written, so each doubles
+			}
+			if len(caps) != want {
 				t.Fatalf("%s twice=%v: %d requests", tc.name, twice, len(caps))
+			}
+			if twice {
+				mt3 := fmt.Sprintf(`"max_tokens":%d`, 2*tc.then)
+				if third := string(caps[2].body); strings.Replace(string(caps[0].body), fmt.Sprintf(`"max_tokens":%d`, tc.first), mt3, 1) != third {
+					t.Errorf("%s: the third request is not the first with max_tokens %d:\n%s", tc.name, 2*tc.then, third)
+				}
 			}
 			first, then := string(caps[0].body), string(caps[1].body)
 			mtFirst, mtThen := fmt.Sprintf(`"max_tokens":%d`, tc.first), fmt.Sprintf(`"max_tokens":%d`, tc.then)
@@ -230,14 +243,14 @@ func TestThinkingTruncationRetry(t *testing.T) {
 				t.Errorf("%s: retry %s", tc.name, then)
 			}
 			if twice {
-				if !errors.Is(err, ErrTruncated) || !sched.IsPermanent(err) || !isCode(err, CodeTruncated, "max_tokens", tc.then, "role", model.RoleRepair) {
-					t.Errorf("%s: truncated twice: %v %+v", tc.name, err, infoOf(err))
+				if !errors.Is(err, ErrTruncated) || !sched.IsPermanent(err) || !isCode(err, CodeTruncated, "max_tokens", 2*tc.then, "role", model.RoleRepair) {
+					t.Errorf("%s: truncated every time: %v %+v", tc.name, err, infoOf(err))
 				}
 			} else if err != nil {
 				t.Errorf("%s: %v", tc.name, err)
 			}
-			// No backoff wait; both answers billed.
-			if len(e.rec.waits) != 0 || len(e.used.all()) != 2 {
+			// No backoff wait; every answer billed.
+			if len(e.rec.waits) != 0 || len(e.used.all()) != want {
 				t.Errorf("%s: waits %v usage %+v", tc.name, e.rec.waits, e.used.all())
 			}
 		}
@@ -445,8 +458,26 @@ func TestAnthropicAdaptiveModels(t *testing.T) {
 				!tc.adaptive && (th.Type != "enabled" || th.BudgetTokens != ThinkingBudgetHigh || oc != nil) {
 				t.Errorf("%s: fields of %q: %+v %+v", tc.class, id, th, oc)
 			}
-			if th, oc := anthropicThinkingFields(id, model.ThinkingOff); th != nil || oc != nil {
-				t.Errorf("%q off: %+v %+v", id, th, oc)
+			// Off: no field, except the models that think without one
+			// (v3.2.x P1, Q4a; C91; TestAnthropicRequestThinkingByModelAndLevel).
+			th, oc = anthropicThinkingFields(id, model.ThinkingOff)
+			switch norm := strings.ToLower(strings.TrimSpace(id)); {
+			case strings.HasPrefix(norm, "claude-sonnet-5-5"):
+				if th == nil || *th != (anthropicThinking{Type: "between_tools"}) || oc != nil {
+					t.Errorf("%q off: %+v %+v", id, th, oc)
+				}
+			case strings.HasPrefix(norm, "claude-opus-5-5"), strings.HasPrefix(norm, "claude-fable-"), strings.HasPrefix(norm, "claude-mythos-"):
+				if th != nil || oc == nil || oc.Effort != "low" || oc.Format != nil {
+					t.Errorf("%q off: %+v %+v", id, th, oc)
+				}
+			case norm == "claude-opus-5", norm == "claude-sonnet-5", norm == "claude-haiku-5-5":
+				if th == nil || *th != (anthropicThinking{Type: "disabled"}) || oc != nil {
+					t.Errorf("%q off: %+v %+v", id, th, oc)
+				}
+			default:
+				if th != nil || oc != nil {
+					t.Errorf("%q off: %+v %+v", id, th, oc)
+				}
 			}
 		}
 	}

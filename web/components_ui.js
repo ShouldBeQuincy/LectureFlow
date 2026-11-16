@@ -9,7 +9,7 @@
 // TaskStatus, Sources of .claude/v3-brief.md §7.2) and report the user's
 // choices through callbacks — the caller makes the requests.
 
-import { h, clear, btn, openDialog } from './dom.js';
+import { h, btn, openDialog } from './dom.js';
 import { icon } from './icons.js';
 import { t, has } from './i18n.js';
 import * as U from './util.js';
@@ -298,20 +298,34 @@ const ERR_KEYS = {
   'components.http_status': 'http',
 };
 
+// Failures a retry from the same download source repeats: only another
+// source helps, and the catalog text says so (components.redirect_refused:
+// the source sent the request to an address LectureFlow does not follow).
+const SOURCE_ONLY = new Set(['components.redirect_refused']);
+
 /**
- * What happened and what can be done about a failed task: {what, todo}.
- * The four failures of V3.3 have their own texts; another code uses its
- * catalog text (or detail) with a general suggestion.
+ * What happened and what can be done about a failed task: {what, todo,
+ * sourceOnly}. The four failures of V3.3 have their own texts; another
+ * code uses its catalog text (or detail) with a general suggestion.
+ * sourceOnly (SOURCE_ONLY): no "you can retry" suggestion (todo is empty:
+ * the text itself says to change the source), and the way out offered is
+ * changing the download source, not a retry.
  */
 export function taskErrorText(err, kind = '') {
   // An import has no download source to change: its own wording.
   const g = kind === 'import' ? 'import_' : '';
   if (!err) return { what: t(`compui.err.${g}generic`), todo: t(`compui.err.${g || 'generic_'}todo`) };
+  if (SOURCE_ONLY.has(err.code) && !g) {
+    const text = codeText(err);
+    return { what: text ? t('compui.err.with_reason', { reason: text }) : t('compui.err.generic'), todo: '', sourceOnly: true };
+  }
   const k = ERR_KEYS[err.code];
   if (k) {
     const p = err.params || {};
     const params = {
-      required: typeof p.required_mb === 'number' ? U.fmtMB(p.required_mb) : t('compui.unknown_size'),
+      // -1: not known (internal/components withDiskFree, a disk that
+      // filled up while writing), as for free_mb: never "-1 MB"
+      required: typeof p.required_mb === 'number' && p.required_mb >= 0 ? U.fmtMB(p.required_mb) : t('compui.unknown_size'),
       free: typeof p.free_mb === 'number' && p.free_mb >= 0 ? U.fmtMB(p.free_mb) : t('compui.unknown_size'),
       status: p.status != null ? p.status : '',
     };
@@ -348,19 +362,72 @@ function stateText(task) {
 }
 
 /**
+ * keepChildren(parent, kids): makes kids (nodes or strings, in this order)
+ * the children of parent. A node among them already there stays where it
+ * is, never taken out and put back (R81 L8: a task view's status line and
+ * alert); the others are taken out, the new ones put in around it. (Two
+ * kept nodes that swap places: one of them is moved; no caller does so.)
+ */
+export function keepChildren(parent, kids) {
+  const want = kids.filter((k) => k != null && k !== false && k !== true).map((k) => (k instanceof Node ? k : document.createTextNode(String(k))));
+  const set = new Set(want);
+  for (const c of [...parent.childNodes]) if (!set.has(c)) parent.removeChild(c);
+  want.forEach((k, i) => {
+    const at = parent.childNodes[i] || null;
+    if (at !== k) parent.insertBefore(k, at);
+  });
+}
+
+/**
  * The progress of an install task. opts:
  *   components()   ComponentStatus[] for the item names (may be empty)
  *   onAction(name) 'retry' | 'change_source' | 'pause' | 'resume' | 'cancel'
  *   busy()         true while an action is in flight (buttons disabled)
  *   actions        which buttons to offer (default all)
  * Returns {el, update(task)}.
+ *
+ * T23 general 18: the view is no live region (its figures change every
+ * second, a screen reader would read them all the time). One status line,
+ * kept across updates, says the task's state when it changes (started,
+ * paused, done); a failure is told by its own alert, not twice. The
+ * progress bars keep their values for whoever looks.
+ * R81 L8: the alert is put in once, when the failure is first shown;
+ * updates while that failure lasts leave it where it is (its buttons
+ * follow busy() in place). The caller puts el in its place once and
+ * keeps it there (keepChildren): taken out and put back, the status line
+ * and the alert may be read again, or a change of the line not at all.
  */
 export function taskView({ components = () => [], onAction, busy = () => false, actions = ['retry', 'change_source', 'pause', 'resume', 'cancel'] } = {}) {
-  const el = h('div', { class: 'cu-task', 'aria-live': 'polite' });
+  const live = h('p', { class: 'visually-hidden', role: 'status' });
+  const el = h('div', { class: 'cu-task' }, live);
+  let said = null;
+  let alertEl = null; // the failure's alert, and what it says
+  let alertKey = '';
   const can = (a) => actions.includes(a);
+  function say(task) {
+    const key = task ? `${task.kind}:${task.state}` : '';
+    if (key === said) return;
+    said = key;
+    live.textContent = task && task.state !== 'failed' ? stateText(task) : '';
+  }
   function update(task) {
-    clear(el);
+    const failure = task && task.state === 'failed' ? taskErrorText(task.error, task.kind) : null;
+    const key = failure ? JSON.stringify([task.id, task.kind, failure.what, failure.todo]) : '';
+    const keep = key && key === alertKey && alertEl && alertEl.parentNode === el ? alertEl : null;
+    for (const c of [...el.children]) if (c !== live && c !== keep) c.remove();
+    if (!keep) {
+      alertEl = null;
+      alertKey = '';
+    }
+    say(task);
     if (!task) return;
+    // what comes before the alert goes in before the one kept
+    const put = (...ns) => {
+      for (const n of ns) {
+        if (keep) el.insertBefore(n, keep);
+        else el.append(n);
+      }
+    };
     el.dataset.state = task.state;
     const total = task.total_bytes || 0;
     const done = Math.min(task.done_bytes || 0, total || Infinity);
@@ -372,7 +439,7 @@ export function taskView({ components = () => [], onAction, busy = () => false, 
     if (task.state === 'running' && task.speed_bps > 0) facts.push(t('compui.task.speed', { speed: U.fmtBytes(task.speed_bps) }));
     if (task.state === 'running' && task.eta_s > 0) facts.push(t('compui.task.eta', { time: U.fmtDuration(task.eta_s * 1000) }));
     const ic = task.state === 'done' ? 'circle-check' : task.state === 'failed' ? 'circle-alert' : task.state === 'paused' || task.state === 'cancelled' ? 'circle-pause' : 'download';
-    el.append(
+    put(
       h(
         'div',
         { class: 'cu-task-head' },
@@ -383,24 +450,30 @@ export function taskView({ components = () => [], onAction, busy = () => false, 
     );
     for (const n of task.notes || []) {
       const s = taskNoteText(n);
-      if (s) el.append(h('p', { class: 'cu-note' }, icon('info', { size: 14 }), h('span', null, s)));
+      if (s) put(h('p', { class: 'cu-note' }, icon('info', { size: 14 }), h('span', null, s)));
     }
-    if (task.state === 'failed') {
-      const e = taskErrorText(task.error, task.kind);
-      el.append(
+    if (failure && keep) {
+      for (const b of keep.querySelectorAll('button')) b.disabled = busy();
+    } else if (failure) {
+      alertKey = key;
+      // a failure only another source helps with: "change the download
+      // source" is the way out, without a retry (unless no source can be
+      // chosen here)
+      const source = can('change_source') && task.kind !== 'import';
+      const retry = can('retry') && !(failure.sourceOnly && source);
+      alertEl = h(
+        'div',
+        { class: 'cu-error', role: 'alert' },
+        h('p', { class: 'cu-error-what' }, failure.what),
+        failure.todo ? h('p', { class: 'cu-error-todo' }, failure.todo) : null,
         h(
           'div',
-          { class: 'cu-error', role: 'alert' },
-          h('p', { class: 'cu-error-what' }, e.what),
-          h('p', { class: 'cu-error-todo' }, e.todo),
-          h(
-            'div',
-            { class: 'cu-actions' },
-            can('retry') ? btn(t('compui.task.retry'), { kind: 'primary', size: 'sm', icon: 'rotate-cw', disabled: busy(), fkey: 'cu:task:retry', onclick: () => onAction && onAction('retry') }) : null,
-            can('change_source') && task.kind !== 'import' ? btn(t('compui.task.change_source'), { size: 'sm', icon: 'server', disabled: busy(), fkey: 'cu:task:source', onclick: () => onAction && onAction('change_source') }) : null,
-          ),
+          { class: 'cu-actions' },
+          retry ? btn(t('compui.task.retry'), { kind: 'primary', size: 'sm', icon: 'rotate-cw', disabled: busy(), fkey: 'cu:task:retry', onclick: () => onAction && onAction('retry') }) : null,
+          source ? btn(t('compui.task.change_source'), { kind: failure.sourceOnly ? 'primary' : undefined, size: 'sm', icon: 'server', disabled: busy(), fkey: 'cu:task:source', onclick: () => onAction && onAction('change_source') }) : null,
         ),
       );
+      el.append(alertEl);
     } else if (taskActive(task)) {
       const tools = [];
       if (task.state === 'running' && can('pause')) tools.push(btn(t('compui.task.pause'), { size: 'sm', kind: 'ghost', icon: 'pause', disabled: busy(), fkey: 'cu:task:pause', onclick: () => onAction && onAction('pause') }));

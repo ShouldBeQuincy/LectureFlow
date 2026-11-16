@@ -174,11 +174,13 @@ func (s *secretSet) contains(text string) bool {
 	return s.scrub(text) != text
 }
 
-// scrubErr returns err unchanged when its text holds no known secret, and
-// otherwise an equivalent error (same code, params and classification)
-// whose cause text has the secrets removed.
+// scrubErr returns err unchanged when neither its text nor its params hold
+// a known secret, and otherwise an equivalent error (same code, params and
+// classification) whose cause text and params have the secrets removed.
+// The params are looked at on their own: a CodedError's text does not
+// include them (review R52 L2).
 func (s *secretSet) scrubErr(err error) error {
-	if err == nil || !s.contains(err.Error()) {
+	if err == nil || !s.contains(err.Error()) && !s.paramsHold(err) {
 		return err
 	}
 	var ce *model.CodedError
@@ -200,4 +202,19 @@ func (s *secretSet) scrubErr(err error) error {
 		return newErr(ce.Info.Code, params, c.kind, c.waitingFor, cause)
 	}
 	return model.Errorf(ce.Info.Code, params, cause)
+}
+
+// paramsHold tells whether a string param of err's ErrorInfo holds a known
+// secret.
+func (s *secretSet) paramsHold(err error) bool {
+	var ce *model.CodedError
+	if !errors.As(err, &ce) {
+		return false
+	}
+	for _, v := range ce.Info.Params {
+		if str, ok := v.(string); ok && s.contains(str) {
+			return true
+		}
+	}
+	return false
 }

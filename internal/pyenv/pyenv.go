@@ -3,7 +3,9 @@
 
 // Package pyenv is what every Python process LectureFlow starts gets on top
 // of the service's own environment: the switches that turn off the usage
-// reporting ("telemetry") of the libraries the workers load.
+// reporting ("telemetry") of the libraries the workers load, and the
+// isolation from the variables that would make Python run code from
+// elsewhere (Dropped, ScriptArgs; see "Isolation" below).
 //
 // Privacy audit before 3.2.0 (NOTES.md "无遥测"): `import openvino` sent a
 // Google Analytics event (openvino.tools.ovc through the openvino-telemetry
@@ -57,12 +59,98 @@ func ImportCheck(modules []string) string {
 	return BlockTelemetryModules + "; import " + strings.Join(modules, ", ")
 }
 
-// Env returns base without the keys of TelemetryOff, then TelemetryOff,
-// then extra (KEY=VALUE entries, e.g. PYTHONIOENCODING=utf-8).
+// Isolation (security audit AUD4 L-4). Every Python child is started
+// apart from the settings of the service's environment that would make it
+// run code from elsewhere:
+//
+//   - code passed with -c runs with -I (isolated: no PYTHON* variables, no
+//     user site-packages, and not the current directory on sys.path, where
+//     a pypdf.py of the folder the service was started from would run);
+//   - a script runs with -s (ScriptArgs: no user site-packages) and the
+//     environment of Env (Dropped removed). Not -I: it would also drop the
+//     script's own directory from sys.path, and the workers import their
+//     siblings (asr_common, textrepair); nor -E: the workers need
+//     PYTHONIOENCODING / PYTHONUNBUFFERED.
+//
+// The interpreters are virtual environments (the components' uv
+// environments, the development .venv), so -s takes nothing away from
+// them: a venv without system site-packages has no user site-packages
+// either.
+
+// Dropped are the variables of the service's environment no Python child
+// inherits (upper case; compared case-insensitively, as Windows reads
+// them). A user's or another program's setting (a global PYTHONPATH of a
+// course environment, an active virtualenv) would otherwise reach every
+// transcription, probe and check:
+//
+//   - code from elsewhere, or code run on its own: PYTHONPATH,
+//     PYTHONHOME, PYTHONSTARTUP, PYTHONINSPECT (also waits for input after
+//     the script), PYTHONBREAKPOINT (imports the callable it names),
+//     PYTHONWARNINGS (imports the category modules it names),
+//     PYTHONPYCACHEPREFIX (compiled modules from another directory),
+//     PYTHONPLATLIBDIR, PYTHONUSERBASE, PYTHONEXECUTABLE, PYTHONCASEOK,
+//     PYTHON_PRESITE;
+//   - the scripts' own imports and output: PYTHONSAFEPATH (drops the
+//     script's directory from sys.path), PYTHONVERBOSE and PYTHONDEBUG
+//     (traces where the error lines go), PYTHONLEGACYWINDOWSFSENCODING
+//     (file names in the ANSI code page);
+//   - another environment: VIRTUAL_ENV, CONDA_PREFIX (packages that read
+//     them would look there);
+//   - __PYVENV_LAUNCHER__ (Windows): the venv launcher's note to the
+//     interpreter it starts. An interpreter that is not a venv's takes the
+//     directory it names for its own venv (sys.prefix) and runs that
+//     directory's sitecustomize; -I does not ignore it, nor -s (SEC47
+//     low-2, tested with a system Python). A venv's launcher sets it anew,
+//     so dropping it takes nothing away from the components' environments
+//     or the development .venv.
+//
+// The others (PYTHONUTF8, PYTHONDONTWRITEBYTECODE, ...) change nothing of
+// the above and stay.
+var Dropped = []string{
+	"PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT", "PYTHONBREAKPOINT", "PYTHONWARNINGS",
+	"PYTHONPYCACHEPREFIX", "PYTHONPLATLIBDIR", "PYTHONUSERBASE", "PYTHONEXECUTABLE", "PYTHONCASEOK",
+	"PYTHON_PRESITE", "PYTHONSAFEPATH", "PYTHONVERBOSE", "PYTHONDEBUG", "PYTHONLEGACYWINDOWSFSENCODING",
+	"VIRTUAL_ENV", "CONDA_PREFIX", "__PYVENV_LAUNCHER__",
+}
+
+// Clean returns base (KEY=VALUE entries) without the variables of Dropped.
+func Clean(base []string) []string {
+	out := make([]string, 0, len(base))
+	for _, kv := range base {
+		if !dropped(kv) {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+// dropped: kv sets one of Dropped's variables.
+func dropped(kv string) bool {
+	k, _, ok := strings.Cut(kv, "=")
+	if !ok || k == "" { // Windows "=C:=C:\..." entries have an empty key
+		return false
+	}
+	for _, d := range Dropped {
+		if strings.EqualFold(k, d) {
+			return true
+		}
+	}
+	return false
+}
+
+// ScriptArgs are the arguments of an interpreter that runs script with
+// args: -s first (see Isolation above).
+func ScriptArgs(script string, args ...string) []string {
+	return append([]string{"-s", script}, args...)
+}
+
+// Env returns base without the variables of Dropped and the keys of
+// TelemetryOff, then TelemetryOff, then extra (KEY=VALUE entries, e.g.
+// PYTHONIOENCODING=utf-8; the caller's own, kept as they are).
 func Env(base []string, extra ...string) []string {
 	out := make([]string, 0, len(base)+len(TelemetryOff)+len(extra))
 	for _, kv := range base {
-		if !overridden(kv) {
+		if !overridden(kv) && !dropped(kv) {
 			out = append(out, kv)
 		}
 	}

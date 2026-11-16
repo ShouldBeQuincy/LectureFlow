@@ -5,17 +5,21 @@ package stages
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	lfmedia "lectureflow/internal/media"
 	"lectureflow/internal/model"
 	"lectureflow/internal/sched"
 	"lectureflow/internal/state"
+	lfwav "lectureflow/internal/wav"
 )
 
 // prepStage converts the uploaded media to 16 kHz mono WAV (SPEC §6.1,
@@ -132,7 +136,7 @@ func (s *prepStage) Run(ctx context.Context, lectureID string, progress func(flo
 		media = resolvePath(l.MediaPath, dir)
 	}
 	if fi, err := os.Stat(media); media == "" || err != nil || fi.IsDir() {
-		return sched.Permanent(model.Errorf(CodePrepMediaMissing, map[string]any{"file": filepath.Base(l.MediaPath)},
+		return sched.Permanent(model.Errorf(CodePrepMediaMissing, map[string]any{"file": mediaDisplayName(l)},
 			fmt.Errorf("找不到讲座的原始媒体文件（%s）。请重新上传录音或录像", l.MediaPath)))
 	}
 	// A text playlist (an HLS .m3u8, an ffconcat script, …) is no recording,
@@ -171,28 +175,47 @@ func (s *prepStage) Run(ctx context.Context, lectureID string, progress func(flo
 		audioShare = audioShareRemux
 	}
 
-	if err := s.convertAudio(ctx, tools, l, dir, media, func(p float64) { progress(p * audioShare) }); err != nil {
+	var audio *mediaStream
+	if probeErr == nil {
+		audio = info.Audio
+	}
+	if err := s.convertAudio(ctx, tools, l, dir, media, audio, func(p float64) { progress(p * audioShare) }); err != nil {
 		return err
 	}
 	progress(audioShare)
+	if probeErr == nil {
+		noteTruncation(ctx, lectureID, filepath.Join(dir, model.AudioFile), info.Duration)
+	}
+	noteLowVolume(ctx, lectureID, filepath.Join(dir, model.AudioFile))
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	// P8.1: stream.mp4. Its hash is not part of asr's input_hash (asr reads
 	// audio.wav only), so a transcode need not hold up asr: it is left to
 	// the stream task (stream-parallel), which records the result in kv and
 	// deletes the original under keep_original_media = false once the file
 	// exists. A remux, an audio-only source and a failed probe are settled
-	// here as before.
+	// here as before — except a remux out of a container other than MP4
+	// that fails (test-media I5): its fallback, the transcode, goes to the
+	// stream task as well (makeStreamInPrep, review R5).
 	background := plan == planTranscode
+	var st model.StreamState
 	if !background {
-		var st model.StreamState
 		if probeErr == nil {
-			st, err = makeStream(ctx, tools, dir, media, info, func(p float64) { progress(audioShare + p*(1-audioShare)) })
+			st, err = makeStreamInPrep(ctx, tools, dir, media, info, func(p float64) { progress(audioShare + p*(1-audioShare)) })
 		} else {
 			err = probeErr
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if errors.Is(err, errRemuxNeedsTranscode) {
+			slog.Warn("prep: remux failed, the playback file is left to the stream task", "lecture", lectureID, "format", info.Format, "err", err)
+			background = true
+		}
+	}
+	if !background {
 		if err != nil {
 			slog.Warn("prep: playback file not generated", "lecture", lectureID, "err", err)
 			st = model.StreamState{Status: StreamFailed, Error: errorInfoJSON(err)}
@@ -280,6 +303,160 @@ func removeOriginal(ctx context.Context, d Deps, lectureID, media, dir, streamSt
 	}
 }
 
+// Truncated media (test-media I9): a file cut off while it was recorded or
+// downloaded often still declares its full length, and ffmpeg converts what
+// is there without complaint, so only the first part was transcribed and
+// nothing said so. When audio.wav is more than truncatedShare shorter than
+// the container's declared duration (the threshold test-media suggests,
+// "短 10% 以上"), and by at least truncatedMinSeconds (rounding and short
+// clips), prep finishes with the warning WarnPrepMediaTruncated; the
+// transcription goes on with what was converted.
+const (
+	truncatedShare      = 0.10
+	truncatedMinSeconds = 1.0
+)
+
+// TruncatedWarning is the Chinese text of WarnPrepMediaTruncated.
+const TruncatedWarning = "媒体文件可能不完整：文件标明的时长为 %s，但只读出了 %s 的音频，只转写了这一部分。如果这不是完整的录音录像，请重新上传完整的文件"
+
+// truncated reports whether audio.wav's duration (wav seconds) is short of
+// the container's declared duration by the margins above; declared <= 0 is
+// unknown.
+func truncated(wav, declared float64) bool {
+	return declared > 0 && wav >= 0 && declared-wav > declared*truncatedShare && declared-wav >= truncatedMinSeconds
+}
+
+// noteTruncation writes WarnPrepMediaTruncated on the prep job when the
+// WAV at path is truncated against declared. A WAV whose length cannot be
+// read is not judged (logged).
+func noteTruncation(ctx context.Context, lectureID, path string, declared float64) {
+	if declared <= 0 {
+		return
+	}
+	wav, err := wavSeconds(path)
+	if err != nil {
+		slog.Warn("prep: audio.wav duration unknown, truncation not checked", "lecture", lectureID, "err", err)
+		return
+	}
+	if !truncated(wav, declared) {
+		return
+	}
+	processed, total := clock(wav), clock(declared)
+	slog.Warn("prep: media shorter than its declared duration, possibly truncated", "lecture", lectureID, "audio_s", wav, "declared_s", declared)
+	sched.UpdateStats(ctx, func(st *model.JobStats) {
+		st.Warning = fmt.Sprintf(TruncatedWarning, total, processed)
+		st.WarningInfo = &model.ErrorInfo{Code: WarnPrepMediaTruncated, Params: map[string]any{"processed": processed, "declared": total}}
+	})
+}
+
+// Very quiet recordings (round 2 N06; needs-human #6, option a): faster-
+// whisper drops speech from recordings averaging below about −50 dBFS
+// (T055 / I4; real lectures sit around −30 dBFS). prep measures the speech
+// level of the audio.wav it just wrote (wav.Level: the 90th percentile of
+// the 1-second RMS levels, digital silence left out; review R26 C-1) and,
+// below lowVolumeDBFS, finishes with the warning WarnPrepLowVolume.
+// audio.wav is only read — no gain, no normalisation — so its hash, and
+// with it asr's input_hash, stay what they were: no transcribed lecture
+// becomes stale. The threshold was set for the whole-file mean; the
+// percentile reads a few dB above it for continuous speech, so −50 is on
+// the cautious side (fewer warnings) until the next real acceptance run
+// measures it.
+const lowVolumeDBFS = -50.0
+
+// LowVolumeWarning is the Chinese text of WarnPrepLowVolume.
+const LowVolumeWarning = "录音音量过低，转写结果可能不准"
+
+// lowVolume reports whether a speech level in dBFS is below lowVolumeDBFS;
+// silence (-Inf) is.
+func lowVolume(level float64) bool { return level < lowVolumeDBFS }
+
+// noteLowVolume writes WarnPrepLowVolume on the prep job when the WAV at
+// path is too quiet. A level that cannot be measured is logged and never
+// fails prep. When the job already has a warning (WarnPrepMediaTruncated)
+// both are kept: the earlier one stays the main part and this one is
+// joined after it (params.extra, like repair's two warnings), the text
+// after a "；".
+func noteLowVolume(ctx context.Context, lectureID, path string) {
+	level, err := lfwav.Level(ctx, path)
+	if err != nil {
+		if ctx.Err() == nil {
+			slog.Warn("prep: audio.wav level unknown, volume not checked", "lecture", lectureID, "err", err)
+		}
+		return
+	}
+	if !lowVolume(level) {
+		return
+	}
+	slog.Warn("prep: recording very quiet, transcription may be inaccurate", "lecture", lectureID, "speech_dbfs", level, "threshold_dbfs", lowVolumeDBFS)
+	sched.UpdateStats(ctx, func(st *model.JobStats) {
+		low := part(WarnPrepLowVolume, nil)
+		if st.WarningInfo == nil {
+			st.WarningInfo = &low
+		} else {
+			st.WarningInfo = noteInfo(*st.WarningInfo, low)
+		}
+		if st.Warning == "" {
+			st.Warning = LowVolumeWarning
+		} else {
+			st.Warning += "；" + LowVolumeWarning
+		}
+	})
+}
+
+// clock renders seconds as m:ss, or h:mm:ss from an hour on (rounded down
+// to whole seconds).
+func clock(sec float64) string {
+	s := int(sec)
+	if s >= 3600 {
+		return fmt.Sprintf("%d:%02d:%02d", s/3600, s/60%60, s%60)
+	}
+	return fmt.Sprintf("%d:%02d", s/60, s%60)
+}
+
+// wavSeconds reads the duration of a PCM WAV from its header: the bytes
+// after the data chunk's start (the file's size rather than the chunk's
+// size field, which a writer that could not seek leaves unset) over the
+// byte rate of the fmt chunk.
+func wavSeconds(path string) (float64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	head := make([]byte, 4096)
+	n, err := io.ReadFull(f, head)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return 0, err
+	}
+	head = head[:n]
+	if len(head) < 12 || string(head[:4]) != "RIFF" || string(head[8:12]) != "WAVE" {
+		return 0, errors.New("not a WAV file")
+	}
+	byteRate := uint32(0)
+	for p := 12; p+8 <= len(head); {
+		id, size := string(head[p:p+4]), binary.LittleEndian.Uint32(head[p+4:p+8])
+		p += 8
+		switch id {
+		case "fmt ":
+			if p+12 > len(head) {
+				return 0, errors.New("WAV fmt chunk cut short")
+			}
+			byteRate = binary.LittleEndian.Uint32(head[p+8 : p+12])
+		case "data":
+			if byteRate == 0 {
+				return 0, errors.New("WAV data before a usable fmt chunk")
+			}
+			return float64(fi.Size()-int64(p)) / float64(byteRate), nil
+		}
+		p += int(size) + int(size&1)
+	}
+	return 0, errors.New("WAV data chunk not found in the header")
+}
+
 // audioArgs are the ffmpeg arguments that write the 16 kHz mono WAV of
 // SPEC §6.1 from media to out. The input is read with the whitelists of
 // media.InputArgs (security review 2, M3), which must come right before its
@@ -291,10 +468,18 @@ func removeOriginal(ctx context.Context, d Deps, lectureID, media, dir, streamSt
 // the audio (a damaged stretch, a recording paused and resumed) was closed
 // up, and every sentence after it came early against the playback file
 // and the original media (test-media I2).
-func audioArgs(media, out string) []string {
+//
+// audio is the probed audio stream (parseProbe, test-media I3: the track
+// stream.mp4 plays), mapped with -map 0:{index}; nil when the probe failed,
+// and ffmpeg then picks the track itself as before.
+func audioArgs(media, out string, audio *mediaStream) []string {
 	args := []string{"-hide_banner", "-nostdin", "-nostats", "-progress", "pipe:1", "-y", "-threads", "2"}
 	args = append(args, lfmedia.InputArgs()...)
-	return append(args, "-i", media, "-vn", "-af", audioTimeline, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav", out)
+	args = append(args, "-i", media)
+	if audio != nil {
+		args = append(args, "-map", "0:"+strconv.Itoa(audio.Index))
+	}
+	return append(args, "-vn", "-af", audioTimeline, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav", out)
 }
 
 // audioTimeline is the audio filter of audioArgs: aresample's timestamp
@@ -313,14 +498,14 @@ const audioTimeline = "aresample=async=1:first_pts=0"
 // another free .tmp name when that one is still held: tmpFor) and puts it
 // in place with replaceFile: an audio.wav that another program has open
 // fails the run with prep.file_in_use and stays as it was.
-func (s *prepStage) convertAudio(ctx context.Context, tools mediaTools, l model.Lecture, dir, media string, progress func(float64)) error {
+func (s *prepStage) convertAudio(ctx context.Context, tools mediaTools, l model.Lecture, dir, media string, audio *mediaStream, progress func(float64)) error {
 	out := filepath.Join(dir, model.AudioFile)
 	tmp, err := tmpFor(out)
 	if err != nil {
 		return inUseCoded(CodePrepFileInUse, err)
 	}
 
-	msg, werr := tools.FFmpeg(ctx, dir, audioArgs(media, tmp), progress)
+	msg, werr := tools.FFmpeg(ctx, dir, audioArgs(media, tmp, audio), progress)
 	if ctx.Err() != nil {
 		os.Remove(tmp)
 		return ctx.Err()
@@ -332,7 +517,7 @@ func (s *prepStage) convertAudio(ctx context.Context, tools mediaTools, l model.
 			return sched.Permanent(model.Errorf(CodePrepFFmpegStartFailed, map[string]any{"path": se.exe}, se))
 		}
 		if _, err := os.Stat(media); err != nil {
-			return sched.Permanent(model.Errorf(CodePrepMediaVanished, map[string]any{"file": filepath.Base(l.MediaPath)},
+			return sched.Permanent(model.Errorf(CodePrepMediaVanished, map[string]any{"file": mediaDisplayName(l)},
 				fmt.Errorf("讲座的原始媒体文件（%s）在预处理过程中消失了。请重新上传录音或录像", l.MediaPath)))
 		}
 		// Appendix D6 (lead ruling at the phase-2 gate): classified like

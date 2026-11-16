@@ -42,6 +42,9 @@ import (
 //	LF_FAKE_UV_LOG=file         each uv call appends its arguments as one JSON line
 //	LF_FAKE_UV_HASH_FAIL=file   file holds a count n: the next n uv pip sync calls fail with uv's
 //	                            "Hash mismatch for `pkg-a==1.0.0`" (decremented per call)
+//	LF_FAKE_UV_SDIST_ONLY=file  the index offers source distributions only: uv pip sync with
+//	                            --no-build fails like uv 0.13.1 ("has no usable wheels"); without
+//	                            it the fake "runs the build backend" (writes file) and installs
 //	LF_FAKE_PY_FAIL=module      python -c "import ..." fails when it imports module
 //	LF_FAKE_PY_LOG=file         each python call appends {"args", "telemetry_off": pyenv.Has(its environment)}
 var fakeBin string
@@ -163,6 +166,18 @@ func fakeUV(args []string) int {
 					return 1
 				}
 			}
+		}
+		if marker := os.Getenv("LF_FAKE_UV_SDIST_ONLY"); marker != "" {
+			if hasFlag(args, "--no-build") {
+				// uv 0.13.1's message (checked with a local sdist-only find-links directory)
+				fmt.Fprint(os.Stderr, "error: No solution found when resolving dependencies\n"+
+					"  cause: Because pkg-a==1.0.0 has no usable wheels and you require pkg-a==1.0.0, "+
+					"we can conclude that your requirements are unsatisfiable.\n\n"+
+					"hint: Wheels are required for `pkg-a` because building from source is disabled "+
+					"for all packages (i.e., with `--no-build`)\n")
+				return 1
+			}
+			os.WriteFile(marker, []byte("build backend ran"), 0o644)
 		}
 		if os.Getenv("LF_FAKE_UV_FAIL") == "sync" {
 			fmt.Fprintln(os.Stderr, "error: something unexpected broke")

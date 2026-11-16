@@ -48,30 +48,12 @@ type ClipSource struct {
 // header; task D): a shorter lecture cannot give a clip of "中间 2 分钟",
 // so it is skipped rather than making the test fail.
 func FindClipSource(ctx context.Context, st db.Store, dataDir string) (src ClipSource, ok bool, err error) {
-	jobs, err := st.ListCurrentJobsByStatus(ctx, model.StatusDone)
+	cs, err := clipCandidates(ctx, st)
 	if err != nil {
 		return ClipSource{}, false, err
 	}
-	type cand struct{ lectureID, finished string }
-	var cs []cand
-	for _, j := range jobs {
-		if j.Scope != model.ScopeLecture || j.Stage != model.StageRepair {
-			continue
-		}
-		f := ""
-		if j.FinishedAt != nil {
-			f = *j.FinishedAt
-		}
-		cs = append(cs, cand{j.ScopeID, f})
-	}
-	sort.SliceStable(cs, func(a, b int) bool {
-		if cs[a].finished != cs[b].finished {
-			return cs[a].finished > cs[b].finished
-		}
-		return cs[a].lectureID < cs[b].lectureID
-	})
 	for _, c := range cs {
-		l, err := st.GetLecture(ctx, c.lectureID)
+		l, err := st.GetLecture(ctx, c.ScopeID)
 		if err != nil {
 			continue // deleted meanwhile
 		}
@@ -88,6 +70,40 @@ func FindClipSource(ctx context.Context, st db.Store, dataDir string) (src ClipS
 		return ClipSource{LectureID: l.ID, CourseID: l.CourseID, Title: l.Title, Audio: audio}, true, nil
 	}
 	return ClipSource{}, false, nil
+}
+
+// clipCandidates returns the lectures whose current repair job is done, in
+// the order FindClipSource tries them: the most recently finished first
+// (no finish time counts as ""), ties by lecture id. The SQLite store reads
+// just those rows (db.JobReader, r7 perf: about 0.5 ms instead of 15 ms on
+// a 400-lecture library); another store is read in full, with the same
+// result.
+func clipCandidates(ctx context.Context, st db.Store) ([]db.FinishedJob, error) {
+	if jr, ok := st.(db.JobReader); ok {
+		return jr.DoneLectureJobsByFinish(ctx, model.StageRepair)
+	}
+	jobs, err := st.ListCurrentJobsByStatus(ctx, model.StatusDone)
+	if err != nil {
+		return nil, err
+	}
+	var cs []db.FinishedJob
+	for _, j := range jobs {
+		if j.Scope != model.ScopeLecture || j.Stage != model.StageRepair {
+			continue
+		}
+		f := ""
+		if j.FinishedAt != nil {
+			f = *j.FinishedAt
+		}
+		cs = append(cs, db.FinishedJob{ScopeID: j.ScopeID, FinishedAt: f})
+	}
+	sort.SliceStable(cs, func(a, b int) bool {
+		if cs[a].FinishedAt != cs[b].FinishedAt {
+			return cs[a].FinishedAt > cs[b].FinishedAt
+		}
+		return cs[a].ScopeID < cs[b].ScopeID
+	})
+	return cs, nil
 }
 
 // Clip planning (PlanClip).

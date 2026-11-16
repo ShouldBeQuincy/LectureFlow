@@ -131,7 +131,8 @@ func TestSelfUpdateTexts(t *testing.T) {
 func TestSelfUpdateStatesAndReasons(t *testing.T) {
 	src := readWeb(t, "settings_update.js")
 	for _, s := range []string{selfupdate.StateIdle, selfupdate.StateChecking, selfupdate.StateUpToDate, selfupdate.StateAvailable,
-		selfupdate.StateDownloading, selfupdate.StateImporting, selfupdate.StatePending, selfupdate.StateError} {
+		selfupdate.StateDownloading, selfupdate.StateImporting, selfupdate.StatePending, selfupdate.StateError,
+		selfupdate.StateInstallFailed} {
 		if !strings.Contains(src, "case '"+s+"':") {
 			t.Errorf("settings_update.js shows nothing for the state %q", s)
 		}
@@ -150,6 +151,12 @@ func TestSelfUpdateStatesAndReasons(t *testing.T) {
 		"[...pendingLines(st.pending, true), checkNote()]",
 		"info.code === '" + selfupdate.CodeVersionMismatch + "' && !p.signed",
 		"t('settings.update.next_check'",
+		// a version whose installation failed: its own line, not "available",
+		// and "try again" downloads it (after a check when it is not known)
+		"return failedLines(st.install_failed, a);",
+		"t('settings.update.state.install_failed', { version: f.version })",
+		"if (!same(s)) s = await suRequest('POST', '/api/selfupdate/check');",
+		"return suRequest('POST', '/api/selfupdate/download');",
 	} {
 		if !strings.Contains(src, want) {
 			t.Errorf("settings_update.js: %q missing", want)

@@ -60,6 +60,12 @@ var errorCatalog = map[string]errDef{
 	"stage.unknown_action":           {"未知的操作，只支持 cancel、retry、rerun", []string{"action"}},
 	model.ErrNeedsModelChoice:        {"模型设置已变化，需要选择沿用原模型还是使用当前设置", nil},
 	"model_choice.snapshot_unusable": {"原模型不可用，请改选“使用当前设置”", nil},
+	// v3.2.x P1-b: the retry with a model named by hand (v32x_retry.go)
+	codeManualConflict:    {"临时指定的模型只能和“临时指定”这一选项一起提交", nil},
+	codeManualIncomplete:  {"临时指定模型时缺少 {field}", []string{"field"}},
+	codeManualUnsupported: {"只有摘要、修复和翻译的重试可以临时指定模型（{stage} / {action}）", []string{"stage", "action"}},
+	// v3.2.x P1-b: "用当前设置的模型重新翻译这句" (sentenceOp, use_current)
+	codeSentenceNotPending: {"这句已有可用的译文，只有未能翻译的句子才能改用当前设置的模型重新翻译", nil},
 
 	// desktop mode and the application endpoints (SPEC-v3 V1.2, V1.1, V4)
 	"auth.token_required":                 {"缺少或错误的访问令牌，请从 LectureFlow 应用中打开这个页面", nil},
@@ -85,6 +91,8 @@ var errorCatalog = map[string]errDef{
 
 	// changing the data directory and importing data (SPEC-v3 V1.3; handlers_datadir.go, internal/relocate)
 	"data_dir.path_invalid":           {"“{path}”不是有效的文件夹路径，请选择一个完整的文件夹路径", []string{"path"}},
+	"data_dir.path_not_allowed":       {"“{path}”在网络位置上。出于安全考虑，网络上的文件夹只能在文件夹选择框里选中后使用（之前的选择可能已失效，或应用重启过），请重新选择这个文件夹", []string{"path"}},
+	"data_dir.path_not_granted":       {"出于安全考虑，“{path}”需要先在文件夹选择框里选中才能使用（之前的选择可能已失效，或应用重启过），请重新选择这个文件夹", []string{"path"}},
 	"data_dir.same_dir":               {"这就是现在的数据目录，请选择另一个文件夹", nil},
 	"data_dir.target_not_empty":       {"“{path}”里已经有文件。请选择一个空文件夹，或者新建一个文件夹", []string{"path"}},
 	"data_dir.target_inside_source":   {"新位置不能在现在的数据目录里面，请选择别处的文件夹", nil},
@@ -105,6 +113,8 @@ var errorCatalog = map[string]errDef{
 	"data_import.too_new":             {"这份数据来自更新的 LectureFlow（数据版本 {version}，本程序支持到 {supported}）。请先更新 LectureFlow", []string{"version", "supported"}},
 	"data_import.not_fresh":           {"现在的资料库里已经有 {courses} 门课程、{lectures} 节讲座，只能导入到空的资料库", []string{"courses", "lectures"}},
 	"data_import.same_dir":            {"这就是现在的数据目录（或与它重叠），请选择开发版的 data 文件夹", nil},
+	"data_import.modified":            {"“{path}”里的资料库含有 LectureFlow 自己不会写入的内容（例如用数据库工具加过或改过的表、列、视图、触发器，或格式不对的记录编号、文件名）。为了安全，不能导入", []string{"path"}},
+	"data_import.outside_path":        {"要导入的资料库里有 {count} 个文件路径指向资料库自己的文件夹之外，或指向另一条记录的文件（例如 {path}）。为了不让 LectureFlow 读取资料库之外的文件，不能导入", []string{"count", "path"}},
 	"old_data_dir.none":               {"没有记录需要清理的旧数据目录", nil},
 	"old_data_dir.mismatch":           {"只能删除记录的旧数据目录：{path}", []string{"path"}},
 	"old_data_dir.is_current":         {"这是现在正在使用的数据目录，不能删除", nil},
@@ -126,6 +136,8 @@ var errorCatalog = map[string]errDef{
 	"upload.path_not_file":    {"这不是一个普通文件：{path}", []string{"path"}},
 	"upload.path_in_data_dir": {"这个文件已经在 LectureFlow 的数据目录里，不能再次添加：{path}", []string{"path"}},
 	"upload.path_unreadable":  {"无法读取文件：{path}（可能没有权限，或正被其他程序占用）", []string{"path"}},
+	// no grant of the desktop main process (pathgrant.go, security audit FB1 L-7)
+	"upload.path_not_allowed": {"这个文件的选择已失效（可能已经添加过，或选择后隔得太久、重启过应用），请重新选择或拖入这个文件：{path}", []string{"path"}},
 	"upload.copy_failed":      {"复制文件失败：{path}", []string{"path"}},
 
 	// courses (v1.1 A8.1, v2 P13.4, P13.6)
@@ -346,6 +358,7 @@ var errorCatalog = map[string]errDef{
 	"check.hint_cpu":               {"转写设备为 CPU：CPU 转写速度很慢，一节课可能需要数小时（可在设置页的“转写”中修改）", nil},
 	"check.hint_selftest":          {"确认 faster-whisper 与 CUDA 库已安装（worker/requirements.txt）；首次运行需要联网下载 tiny 模型", nil},
 	"check.hint_key_settings":      {"在设置页的“提供商”中编辑「{provider}」并填写 API key", []string{"provider"}},
+	codeHintKeyPlainHTTP:           {"这个提供商的地址用的是 http：API key 和讲座内容会不加密地经过网络。服务支持 https 的话，建议在设置页的“提供商”中改用 https 地址", nil},
 	"check.hint_key_env":           {"设置环境变量 {env} 后重启服务", []string{"env"}},
 	"check.hint_key_config":        {"在 config.toml 的 [llm.providers.{provider}] 中设置 api_key_env", []string{"provider"}},
 	"check.hint_api":               {"离线时转写仍可运行；联网后点击“重新检查”。若持续失败请检查 base_url、API key 和模型名", nil},
@@ -515,15 +528,29 @@ func (s *Server) failBusy(w http.ResponseWriter, r *http.Request, err error, bus
 	case 0:
 		// client went away; nothing useful to send
 	case http.StatusInternalServerError:
-		slog.Error("api", "method", r.Method, "path", r.URL.Path, "err", err)
+		route, path := logRoute(r)
+		slog.Error("api", "method", r.Method, "route", route, "path", path, "err", err)
 		writeErrorInfo(w, status, info)
 	default:
 		writeErrorInfo(w, status, info)
 	}
 	var he *httpError
 	if err != nil && !errors.As(err, &he) {
-		slog.Debug("api error", "method", r.Method, "path", r.URL.Path, "err", err)
+		route, path := logRoute(r)
+		slog.Debug("api error", "method", r.Method, "route", route, "path", path, "err", err)
 	}
+}
+
+// logRoute is what an error's log line names of the request, as the
+// slow-request log does (SEC32 信息-5): the route pattern and its path with
+// a lecture's or course's id filled in (slowLogPath), never the request's
+// own path (an export's file name is the lecture's title).
+func logRoute(r *http.Request) (route, path string) {
+	route = r.Pattern
+	if route == "" {
+		route = "(unmatched)"
+	}
+	return route, slowLogPath(r.Pattern, r.PathValue("id"))
 }
 
 // fail writes the error response of err. A *state.NeedsModelChoiceError

@@ -22,12 +22,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"lectureflow/internal/model"
 	"lectureflow/internal/remote"
 )
 
@@ -47,6 +50,20 @@ type jobState struct {
 	sent bool
 	// split: the parts of "极速模式" (0 = whole; guarded by Backend.mu)
 	split int
+	// reconnect: the runtime does not answer and a step of the lecture is
+	// tried again in place (retry.go; nil otherwise; guarded by Backend.mu).
+	// It is the latest of reconnects, which holds what each reconnecting
+	// source (a request's retryOp, the kernel channel) shows, in the order
+	// they began: one source's end does not hide another's still going
+	// (review R3 suggestion 2, D13).
+	reconnect  *remote.Reconnect
+	reconnects []sourceReconnect
+}
+
+// sourceReconnect is what one reconnecting source of a lecture shows.
+type sourceReconnect struct {
+	src int
+	r   *remote.Reconnect
 }
 
 // jobProgress reports progress to the caller and into jobState.
@@ -58,6 +75,8 @@ type jobProgress struct {
 
 	tsMu            sync.Mutex
 	transcribeStart time.Time // the remote transcription began (guarded by tsMu)
+
+	lastSrc int // the last reconnecting source handed out (guarded by Backend.mu)
 }
 
 func (p *jobProgress) setTranscribeStart(t time.Time) {
@@ -92,10 +111,61 @@ func (p *jobProgress) emit(ev Event) {
 		ev.SessionState = StateQueued
 	}
 	if p.j != nil {
-		p.j.ev = ev
+		p.j.ev = ev // without Reconnect: Status reads jobState.reconnect
+		ev.Reconnect = p.j.reconnect
 	}
 	b.mu.Unlock()
 	p.out(ev)
+}
+
+// reconnectNotify is the notify of one reconnecting source of the lecture
+// (a reconnector): see reconnecting.
+func (p *jobProgress) reconnectNotify() func(*remote.Reconnect) {
+	if p == nil {
+		return nil
+	}
+	p.b.mu.Lock()
+	p.lastSrc++
+	src := p.lastSrc
+	p.b.mu.Unlock()
+	return func(r *remote.Reconnect) { p.reconnecting(src, r) }
+}
+
+// reconnecting shows that source src of the lecture waits for the runtime
+// to answer again (r) or that its wait is over (nil). The lecture shows the
+// latest wait of the sources still waiting, nil when none is: Status.Jobs
+// carries it, and the lecture's last event is reported again with it (or
+// without).
+func (p *jobProgress) reconnecting(src int, r *remote.Reconnect) {
+	b := p.b
+	b.mu.Lock()
+	if p.j == nil {
+		b.mu.Unlock()
+		return
+	}
+	j := p.j
+	i := slices.IndexFunc(j.reconnects, func(x sourceReconnect) bool { return x.src == src })
+	switch {
+	case r == nil && i >= 0:
+		j.reconnects = slices.Delete(j.reconnects, i, i+1)
+	case r != nil && i >= 0:
+		j.reconnects[i].r = r
+	case r != nil:
+		j.reconnects = append(j.reconnects, sourceReconnect{src: src, r: r})
+	}
+	r = nil
+	if n := len(j.reconnects); n > 0 {
+		r = j.reconnects[n-1].r
+	}
+	j.reconnect = r
+	ev := j.ev
+	ev.Reconnect = r
+	b.mu.Unlock()
+	if ev.Step == "" {
+		ev = Event{Step: StepWaitAccelerator, Fraction: -1, ETASec: p.est, Reconnect: r}
+	}
+	p.out(ev)
+	b.changed()
 }
 
 func (p *jobProgress) step(step string, fraction float64) {
@@ -234,7 +304,7 @@ func (p *sessionPrep) memoryOn() bool { return p.memory != nil && p.memory.memor
 // decision holds for the runtime: its resident worker lives on that
 // storage), the worker scripts and the jobs directory. A lecture arriving
 // meanwhile waits for it; after a failure the next lecture tries again.
-func (b *Backend) prepare(ctx context.Context, s *liveSession, set Settings, job Job, files map[string][]byte, hash string) (*sessionPrep, error) {
+func (b *Backend) prepare(ctx context.Context, s *liveSession, set Settings, job Job, files map[string][]byte, hash string, jp *jobProgress) (*sessionPrep, error) {
 	for {
 		b.mu.Lock()
 		p := s.prep
@@ -245,7 +315,7 @@ func (b *Backend) prepare(ctx context.Context, s *liveSession, set Settings, job
 		}
 		b.mu.Unlock()
 		if owner {
-			p.err = b.doPrepare(ctx, s, set, job, files, hash, p)
+			p.err = b.doPrepare(ctx, s, set, job, files, hash, p, jp)
 			if p.err != nil {
 				b.mu.Lock()
 				if s.prep == p {
@@ -273,17 +343,14 @@ func (b *Backend) prepare(ctx context.Context, s *liveSession, set Settings, job
 	}
 }
 
-func (b *Backend) doPrepare(ctx context.Context, s *liveSession, set Settings, job Job, files map[string][]byte, hash string, p *sessionPrep) error {
-	rt, err := b.runtime(ctx, s)
-	if err != nil {
-		return err
-	}
-	kid, err := rt.startKernel(ctx)
+func (b *Backend) doPrepare(ctx context.Context, s *liveSession, set Settings, job Job, files map[string][]byte, hash string, p *sessionPrep,
+	jp *jobProgress) error {
+	// Every step is retried in place after a transient failure (retry.go).
+	kid, err := b.startKernel(ctx, s, jp)
 	if err != nil {
 		return err
 	}
 	b.mu.Lock()
-	s.kernels = append(s.kernels, kid)
 	if s.kernelID == "" {
 		s.kernelID = kid
 	}
@@ -292,7 +359,7 @@ func (b *Backend) doPrepare(ctx context.Context, s *liveSession, set Settings, j
 	base := b.o.RemoteBase
 	if b.memoryMode(ctx) == MemoryModeAuto {
 		// Memory mode: decide before anything is uploaded (memory.go).
-		d, err := b.probeMemory(ctx, rt, kid, set, job, files["colab_remote.py"])
+		d, err := b.probeMemory(ctx, b.clientOf(s), kid, set, job, files["colab_remote.py"])
 		if err != nil {
 			return err
 		}
@@ -305,18 +372,17 @@ func (b *Backend) doPrepare(ctx context.Context, s *liveSession, set Settings, j
 			}
 			p.memBudgetMB = max(0, d.MemAvailableMB-d.NeedMB+2*wavMB)
 		}
-		if rt, err = b.runtime(ctx, s); err != nil {
-			return err
-		}
 	}
 	// The scripts are uploaded once per runtime and directory.
 	if uploaded != base+"\x00"+hash {
-		if err := rt.mkdir(ctx, base); err != nil {
+		if err := b.retryOp(ctx, s, jp, "mkdir", func(rt *runtimeClient) error { return rt.mkdir(ctx, base) }); err != nil {
 			return err
 		}
 		for _, name := range workerFiles {
 			// small files go in one piece (upstream's single "chunk": 1)
-			if err := rt.upload(ctx, base+"/"+name, files[name], len(files[name])+1, nil); err != nil {
+			if err := b.retryOp(ctx, s, jp, "upload_worker", func(rt *runtimeClient) error {
+				return rt.upload(ctx, base+"/"+name, files[name], len(files[name])+1, nil)
+			}); err != nil {
 				return uploadErr(name, err)
 			}
 		}
@@ -324,7 +390,7 @@ func (b *Backend) doPrepare(ctx context.Context, s *liveSession, set Settings, j
 		s.workerHash = base + "\x00" + hash
 		b.mu.Unlock()
 	}
-	if err := rt.mkdir(ctx, base+"/jobs"); err != nil {
+	if err := b.retryOp(ctx, s, jp, "mkdir", func(rt *runtimeClient) error { return rt.mkdir(ctx, base+"/jobs") }); err != nil {
 		return err
 	}
 	b.mu.Lock()
@@ -338,7 +404,7 @@ func (b *Backend) doPrepare(ctx context.Context, s *liveSession, set Settings, j
 
 // takeKernel returns a kernel without a running cell, starting one when
 // every kernel is busy (two lectures at once on the larger GPUs).
-func (b *Backend) takeKernel(ctx context.Context, s *liveSession) (string, error) {
+func (b *Backend) takeKernel(ctx context.Context, s *liveSession, jp *jobProgress) (string, error) {
 	b.mu.Lock()
 	if n := len(s.idle); n > 0 {
 		kid := s.idle[n-1]
@@ -347,11 +413,19 @@ func (b *Backend) takeKernel(ctx context.Context, s *liveSession) (string, error
 		return kid, nil
 	}
 	b.mu.Unlock()
-	rt, err := b.runtime(ctx, s)
-	if err != nil {
-		return "", err
-	}
-	kid, err := rt.startKernel(ctx)
+	return b.startKernel(ctx, s, jp)
+}
+
+// startKernel starts a kernel on s's runtime (retried in place after a
+// transient failure) and remembers it for the release. A request whose
+// answer was lost may leave a kernel nobody uses: it idles until the
+// runtime is released.
+func (b *Backend) startKernel(ctx context.Context, s *liveSession, jp *jobProgress) (string, error) {
+	var kid string
+	err := b.retryOp(ctx, s, jp, "start_kernel", func(rt *runtimeClient) (err error) {
+		kid, err = rt.startKernel(ctx)
+		return err
+	})
 	if err != nil {
 		return "", err
 	}
@@ -431,7 +505,7 @@ type runOutcome struct {
 func (b *Backend) runJob(ctx context.Context, s *liveSession, set Settings, job Job, j *jobState,
 	files map[string][]byte, hash string, af *audioFuture, jp *jobProgress) (_ string, m jobMetrics, out runOutcome, err error) {
 	start := b.now()
-	prep, err := b.prepare(ctx, s, set, job, files, hash)
+	prep, err := b.prepare(ctx, s, set, job, files, hash, jp)
 	if err != nil {
 		return "", m, out, err
 	}
@@ -451,19 +525,18 @@ func (b *Backend) runJob(ctx context.Context, s *liveSession, set Settings, job 
 		m.ahead = true
 	}
 	jobDir := base + "/jobs/" + j.id
-	rt, err := b.runtime(ctx, s)
-	if err != nil {
-		return "", m, out, err
-	}
 	if ahead == nil {
-		if err := rt.mkdir(ctx, jobDir); err != nil {
+		// An earlier attempt's directory still being deleted gets no new
+		// files: this attempt takes one of its own (T051, removal.go).
+		jobDir = b.jobDirFor(s, base, j)
+		if err := b.retryOp(ctx, s, jp, "mkdir", func(rt *runtimeClient) error { return rt.mkdir(ctx, jobDir) }); err != nil {
 			return "", m, out, err
 		}
 	}
 	out.jobDir = jobDir
 
 	// The cell first: the resident worker prepares while the audio uploads.
-	kid, err := b.takeKernel(ctx, s)
+	kid, err := b.takeKernel(ctx, s, jp)
 	if err != nil {
 		return "", m, out, err
 	}
@@ -471,7 +544,8 @@ func (b *Backend) runJob(ctx context.Context, s *liveSession, set Settings, job 
 	workers, acc := s.workers, s.rec.Accelerator
 	j.split = splitFor(acc, set.FastMode)
 	b.mu.Unlock()
-	cell := b.startCell(ctx, rt, kid, cellCode(base, jobDir, attachArgs(set, workers, memory)), s, jobDir, jp)
+	cell := b.startCell(ctx, kid, cellCode(base, jobDir, attachArgs(set, workers, memory)), s, jobDir,
+		int64(math.Round(job.DurationSec*1000)), jp)
 	select {
 	case <-cell.started:
 	case <-cell.ended:
@@ -574,15 +648,16 @@ func (b *Backend) sendLecture(ctx context.Context, s *liveSession, set Settings,
 		if cell.finished() {
 			return nil
 		}
-		rt, err := b.runtime(ctx, s)
-		if err != nil {
-			return err
-		}
-		s.upMu.Lock()
-		err = rt.upload(ctx, jobDir+"/"+pa.Name, pa.Data, b.o.ChunkSize, func(done, total int64) {
-			jp.step(StepUploadAudio, float64(done)/float64(max(1, total)))
+		// Retried from the first chunk, never from the chunk that failed:
+		// chunk 1 creates the file and the later ones append, so a chunk
+		// whose answer was lost would be on the runtime twice (retry.go).
+		err = b.retryOp(ctx, s, jp, "upload_audio", func(rt *runtimeClient) error {
+			s.upMu.Lock()
+			defer s.upMu.Unlock()
+			return rt.upload(ctx, jobDir+"/"+pa.Name, pa.Data, b.o.ChunkSize, func(done, total int64) {
+				jp.step(StepUploadAudio, float64(done)/float64(max(1, total)))
+			})
 		})
-		s.upMu.Unlock()
 		if err != nil {
 			// R1: the caller deletes the job directory, so the attaching
 			// process in the cell ends.
@@ -603,11 +678,11 @@ func (b *Backend) sendLecture(ctx context.Context, s *liveSession, set Settings,
 		rjob.Redecode = &off
 	}
 	rj, _ := json.Marshal(rjob)
-	rt, err := b.runtime(ctx, s)
-	if err != nil {
-		return err
-	}
-	if err := rt.upload(ctx, jobDir+"/job.json", rj, len(rj)+1, nil); err != nil {
+	// One piece, the same bytes every time: writing it again is harmless
+	// (the worker waits for a job.json it can parse).
+	if err := b.retryOp(ctx, s, jp, "upload_job", func(rt *runtimeClient) error {
+		return rt.upload(ctx, jobDir+"/job.json", rj, len(rj)+1, nil)
+	}); err != nil {
 		return uploadErr("job.json", err)
 	}
 	cell.uploaded()
@@ -629,6 +704,7 @@ type lectureCell struct {
 	outcome execOutcome
 	err     error
 	stop    context.CancelFunc
+	audioMS int64 // the lecture's length: its result's times are checked against it
 
 	mu        sync.Mutex
 	up        bool    // job.json is written: remote events go to the caller
@@ -646,15 +722,21 @@ type lectureCell struct {
 	fetchErr error
 }
 
-func (b *Backend) startCell(ctx context.Context, rt *runtimeClient, kid, code string, s *liveSession, jobDir string, jp *jobProgress) *lectureCell {
+// startCell runs the lecture's cell in kernel kid of s's runtime. Each of
+// its connections takes a current proxy token (execCell): the cell usually
+// outlasts the token it began with, and a transient failure of a refresh
+// is waited out like a failed connection (review R65 M1, L3). audioMS is
+// the lecture's length (checkResult).
+func (b *Backend) startCell(ctx context.Context, kid, code string, s *liveSession, jobDir string, audioMS int64, jp *jobProgress) *lectureCell {
 	cctx, stop := context.WithCancel(ctx)
-	c := &lectureCell{b: b, s: s, jobDir: jobDir, jp: jp, lctx: ctx, started: make(chan struct{}), ended: make(chan struct{}), stop: stop}
+	c := &lectureCell{b: b, s: s, jobDir: jobDir, jp: jp, lctx: ctx, started: make(chan struct{}), ended: make(chan struct{}), stop: stop,
+		audioMS: audioMS}
 	c.stream = &eventStream{onEvent: c.onEvent}
 	var once sync.Once
 	go func() {
 		defer close(c.ended)
 		defer stop()
-		c.outcome, c.err = rt.kernelExec(cctx, kid, code, c.stream.feed, b.o.Sleep, func() { once.Do(func() { close(c.started) }) })
+		c.outcome, c.err = execCell(cctx, b.clientOf(s), kid, code, c.stream.feed, b.newReconnector(jp.reconnectNotify()), func() { once.Do(func() { close(c.started) }) })
 	}()
 	return c
 }
@@ -718,7 +800,7 @@ func (c *lectureCell) startFetchLocked(final remoteEvent) {
 	c.fetch = ch
 	go func() {
 		defer close(ch)
-		c.data, c.fetchErr = c.b.fetchResult(c.lctx, c.s, c.jobDir, final, c.jp)
+		c.data, c.fetchErr = c.b.fetchResult(c.lctx, c.s, c.jobDir, final, c.audioMS, c.jp)
 	}()
 }
 
@@ -789,17 +871,35 @@ func (c *lectureCell) result(ctx context.Context) ([]byte, error) {
 	}
 }
 
-// fetchResult downloads result.json and checks it against the done event.
-func (b *Backend) fetchResult(ctx context.Context, s *liveSession, jobDir string, final remoteEvent, jp *jobProgress) ([]byte, error) {
-	jp.step(StepDownloadResult, 0)
-	rt, err := b.runtime(ctx, s)
-	if err != nil {
-		return nil, err
+// maxResultAnswer is the most of a result.json download's answer read: a
+// result of remote.MaxResultBytes in base64, with room for the contents
+// model around it (its fields, the escaped line breaks of the base64).
+const maxResultAnswer = remote.MaxResultBytes/3*4 + remote.MaxResultBytes/16 + 1<<20
+
+// fetchResult downloads result.json, checks it against the done event and
+// returns it checked (checkResult) for audio of audioMS. A result larger
+// than remote.MaxResultBytes is refused, by the done event's size before
+// any download, and by the download's own limit (maxResultAnswer) when
+// the answer is larger than that event said. Every refusal of the content
+// is a contract violation: the lecture goes back to the local devices and
+// the runtime is released (failedErr), as for any other violation; the
+// download is not tried again.
+func (b *Backend) fetchResult(ctx context.Context, s *liveSession, jobDir string, final remoteEvent, audioMS int64, jp *jobProgress) ([]byte, error) {
+	if final.Bytes > remote.MaxResultBytes {
+		return nil, violation("result.json is larger than allowed")
 	}
-	data, err := rt.download(ctx, jobDir+"/"+final.Result)
+	jp.step(StepDownloadResult, 0)
+	var data []byte
+	err := b.retryOp(ctx, s, jp, "download_result", func(rt *runtimeClient) (err error) {
+		data, err = rt.download(ctx, jobDir+"/"+final.Result)
+		return err
+	})
 	if err != nil {
 		if st := statusOf(err); st == 404 {
 			return nil, fallbackErr(CodeDownloadFailed, map[string]any{"file": final.Result}, errors.New("result file missing on the runtime"))
+		}
+		if errors.Is(err, errAnswerTooLarge) {
+			return nil, violation("result.json is larger than allowed")
 		}
 		return nil, err
 	}
@@ -808,13 +908,63 @@ func (b *Backend) fetchResult(ctx context.Context, s *liveSession, jobDir string
 		return nil, fallbackErr(CodeHashMismatch, map[string]any{"file": final.Result},
 			fmt.Errorf("downloaded %d bytes, the worker reported %d; sha256 differs", len(data), final.Bytes))
 	}
-	var probe struct {
-		Sentences []json.RawMessage `json:"sentences"`
+	return checkResult(data, audioMS)
+}
+
+// checkResult checks a Colab result.json as an SSH server's is
+// (remote.ValidateResult, the same function: size, UTF-8, at most
+// MaxResultSentences sentences of at most MaxSentenceRunes characters,
+// times inside the audio of audioMS and in order, control and format
+// characters removed, unknown keys dropped) and returns it re-encoded: the
+// size and the hash only show the transfer was complete, both come from the
+// same runtime (security audit AUD4 L-1). A refusal is a contract
+// violation.
+//
+// One Colab field the shared check does not keep: 极速模式's cuts
+// (timing.postprocess.split.cuts_ms, an array; the check keeps numbers,
+// booleans and short strings in timing). They are put back when
+// model.ASRSplit.Checked accepts them and they lie inside the audio, else
+// the split goes (the lecture page then shows no 极速模式, as for any split
+// the asr stage cannot use).
+func checkResult(data []byte, audioMS int64) ([]byte, error) {
+	clean, res, err := remote.ValidateResult(data, audioMS)
+	if err != nil {
+		return nil, violation("result.json " + strings.TrimPrefix(err.Error(), remote.ErrResultInvalid.Error()+": "))
 	}
-	if json.Unmarshal(data, &probe) != nil || probe.Sentences == nil {
-		return nil, violation("result.json is not a transcription result")
+	post, _ := res.Timing["postprocess"].(map[string]any)
+	if _, ok := post["split"]; !ok {
+		return clean, nil
 	}
-	return data, nil
+	if sp := resultSplit(data, audioMS); sp != nil {
+		post["split"] = map[string]any{"parts": sp.Parts, "cuts_ms": sp.CutsMS}
+	} else {
+		delete(post, "split")
+	}
+	out, err := json.Marshal(res)
+	if err != nil {
+		return nil, violation("result.json could not be encoded again")
+	}
+	return out, nil
+}
+
+// resultSplit is timing.postprocess.split of raw when model.ASRSplit.Checked
+// accepts it and its cuts lie inside the audio (audioMS; 0 = unknown).
+func resultSplit(raw []byte, audioMS int64) *model.ASRSplit {
+	var r struct {
+		Timing *struct {
+			Postprocess *struct {
+				Split *model.ASRSplit `json:"split"`
+			} `json:"postprocess"`
+		} `json:"timing"`
+	}
+	if json.Unmarshal(raw, &r) != nil || r.Timing == nil || r.Timing.Postprocess == nil {
+		return nil
+	}
+	sp := r.Timing.Postprocess.Split.Checked()
+	if sp == nil || audioMS > 0 && sp.CutsMS[len(sp.CutsMS)-1] >= audioMS {
+		return nil
+	}
+	return sp
 }
 
 func orDash(s string) string {
@@ -880,6 +1030,16 @@ var remoteJobFiles = []string{"audio.flac", "audio.wav", "job.json", "result.jso
 // ctx is cancelled no deletion is retried and a failure returns no file.
 // The log names only the fixed file name and an error code, never content.
 func (b *Backend) cleanupRemote(ctx context.Context, s *liveSession, jobDir string, retry bool) (failed string) {
+	failed, _ = b.cleanupRemoteStopped(ctx, s, jobDir, retry)
+	return failed
+}
+
+// cleanupRemoteStopped is cleanupRemote that also names, in stopped, a file
+// whose deletion failed once ctx was cancelled ("" when every file went or
+// ctx was not cancelled). failed stays "" then, as for cleanupRemote: the
+// caller decides whether such a file still matters (the removal after a
+// lecture, when the release that stopped it did not happen: review R52 M1).
+func (b *Backend) cleanupRemoteStopped(ctx context.Context, s *liveSession, jobDir string, retry bool) (failed, stopped string) {
 	timeout := cleanupTimeout
 	if ctx.Err() != nil {
 		timeout = cleanupStoppedTimeout
@@ -934,7 +1094,7 @@ func (b *Backend) cleanupRemote(ctx context.Context, s *liveSession, jobDir stri
 		case ctx.Err() != nil:
 			b.log.Info("colab: deleting a remote file failed after the lecture was stopped",
 				"file", name, "attempts", tries[i], "code", Code(codedHTTP("api/contents", err)))
-			return ""
+			return "", name
 		case !retry:
 			b.log.Info("colab: deleting a remote file failed", "file", name,
 				"code", Code(codedHTTP("api/contents", err)))
@@ -942,12 +1102,12 @@ func (b *Backend) cleanupRemote(ctx context.Context, s *liveSession, jobDir stri
 		}
 		b.log.Warn("colab: deleting a remote file failed after retries; releasing the runtime", "file", name,
 			"attempts", tries[i], "code", Code(codedHTTP("api/contents", err)))
-		return name
+		return name, ""
 	}
 	if rt, err := b.runtime(cctx, s); err == nil {
 		_ = rt.remove(cctx, jobDir) // the empty directory: nothing in it to protect
 	}
-	return ""
+	return "", ""
 }
 
 // finishJob records the measurement and releases the runtime when asked
@@ -971,27 +1131,35 @@ func (b *Backend) finishJob(ctx, jctx context.Context, s *liveSession, set Setti
 	mc := m
 	b.lastMetrics = &mc
 	b.mu.Unlock()
-	b.persist(ctx, rec)
+	b.persist(ctx, s)
 	if err := b.o.KV.SetKV(context.WithoutCancel(ctx), KVRates, string(rates)); err != nil {
 		b.log.Warn("colab: saving the measured rate", "err", err)
 	}
 	b.log.Info("colab: lecture transcribed on Colab", "audio_min", int(m.audioSec/60), "transcribe_s", int(m.transcribeSec),
 		"overhead_s", int(m.overheadSec), "setup_s", int(m.setupSec), "storage", m.storage(), "mem_peak_mb", m.memPeakMB,
 		"uploaded_ahead", m.ahead)
+	mine := releaseOpts{expect: s} // a release since may have ended s; a new session is not this lecture's
+	// The idle-type reasons: a lecture dispatched to the runtime since the
+	// counts above keeps it (SEC2 T3); its own end, or the next Tick when it
+	// never got that far, asks again. Lecture j itself is still among
+	// b.jobs here and does not count (self).
+	idle := releaseOpts{expect: s, ifIdle: true, self: j}
 	cause := context.Cause(jctx)
 	switch {
 	case errors.Is(cause, errShutdownNow), errors.Is(cause, errAuthEnding):
-		_ = b.release(ctx, stopReason(jctx))
+		_ = b.releaseWith(ctx, stopReason(jctx), mine)
 	case jctx.Err() != nil && others == 0:
-		_ = b.release(ctx, stopReason(jctx))
+		_ = b.releaseWith(ctx, stopReason(jctx), mine)
 	case left != "" && b.runningOthers(j) == 0:
-		_ = b.releaseWith(ctx, ReleaseCleanupFailed, left) // a file of an earlier lecture stayed
+		// a file of an earlier lecture stayed; a lecture dispatched since
+		// keeps the runtime, and its end or Tick releases it (R52 L1)
+		_ = b.releaseWith(ctx, ReleaseCleanupFailed, releaseOpts{file: left, expect: s, ifIdle: true, self: j})
 	case after && b.runningOthers(j) == 0:
-		_ = b.release(ctx, ReleaseAfterCurrent)
+		_ = b.releaseWith(ctx, ReleaseAfterCurrent, idle)
 	case drained && others == 0:
-		_ = b.release(ctx, ReleaseQueueEmpty)
+		_ = b.releaseWith(ctx, ReleaseQueueEmpty, idle)
 	case set.IdleReleaseMin == 0 && others == 0:
-		_ = b.release(ctx, ReleaseIdle) // "0 = right after each lecture"
+		_ = b.releaseWith(ctx, ReleaseIdle, idle) // "0 = right after each lecture"
 	}
 	b.kickPlan()
 }

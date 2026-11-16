@@ -194,5 +194,7 @@ test('bulk choices per session and row states', () => {
   assert.equal(rowState({ state: 'needs_refresh' }), 'refresh');
   assert.equal(rowState({ state: 'failed' }), 'again');
   const rows = [{ sessionId: 'a' }, { sessionId: 'b' }, { sessionId: 'c' }, { sessionId: 'd' }];
-  assert.deepEqual(bulkCounts(rows, [{ sessionId: 'b', state: 'imported' }, { sessionId: 'c', state: 'queued' }], new Set(['a', 'd'])), { total: 4, imported: 1, active: 1, toSend: 2 });
+  assert.deepEqual(bulkCounts(rows, [{ sessionId: 'b', state: 'imported' }, { sessionId: 'c', state: 'queued' }], new Set(['a', 'd'])), { total: 4, imported: 1, active: 1, refresh: 0, toSend: 2 });
+  // a lecture that needs a refresh is not being fetched (T26 G5): counted apart
+  assert.deepEqual(bulkCounts(rows, [{ sessionId: 'b', state: 'needs_refresh' }, { sessionId: 'c', state: 'downloading' }, { sessionId: 'd', state: 'needs_refresh' }], new Set(['a'])), { total: 4, imported: 0, active: 1, refresh: 2, toSend: 1 });
 });

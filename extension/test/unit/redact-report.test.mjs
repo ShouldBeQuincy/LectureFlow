@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRedactor, shape, isIdentityField } from '../../src/lib/redact.js';
-import { buildReport, scanReport, reportFileName } from '../../src/lib/report.js';
+import { buildReport, scanReport, reportFileName, redactTrack } from '../../src/lib/report.js';
 import { replayReport, compareReplay, compareProfile } from '../../src/lib/replay.js';
 import { validate } from '../../src/lib/jsonschema.js';
 import { parseHls, hlsTracks } from '../../src/lib/hls.js';
@@ -278,4 +278,93 @@ test('host placeholders: a tenant of the profile’s wildcard hosts becomes "ten
   const json = JSON.stringify(report);
   assert.ok(!json.includes('myuni') && !json.includes('lf-fixture'), json.slice(0, 300));
   assert.equal(new URL(report.page.url).hostname, 'site-1.example');
+});
+
+test('short tokens in path segments become fakes; names with numbers in them stay (FB1 L-3)', () => {
+  const r = createRedactor();
+  // 10 to 19 letters and digits, switching case and class like a random key
+  for (const tok of ['Xk9pQ2mZ7vL4', 'a8f3k2z9q1', 'Q7wE2rT9yU1iO3pA5s']) {
+    const out = r.url(`https://share.example.org/s/${tok}/master.m3u8`);
+    assert.ok(!out.includes(tok), out);
+    const fake = out.split('/')[4];
+    assert.equal(fake.length, tok.length, out);
+    assert.equal(r.url(`https://share.example.org/s/${tok}/master.m3u8`), out, 'the same token, the same fake');
+  }
+  // not tokens: words with a number, codecs, resolutions, counters
+  for (const word of ['index1080p', 'H264Video', 'audio2video3', 'Lecture2026', 'chunk1920x1080', 'master_1080p.m3u8']) {
+    assert.equal(r.segment(word), word);
+  }
+  // long digit runs inside such a word are still ids, as before
+  assert.equal(r.segment('segment00012'), 'segment00001');
+  assert.equal(r.findings.length, 0);
+});
+
+test('a query parameter without a value is kept only when it is a word (FB1 L-3)', () => {
+  const r = createRedactor();
+  const out = r.url('https://cdn.example.org/v/master.m3u8?Xk9pQ2mZ7vL4&embed&noCache&a8f3k2&1767225600&x=1');
+  assert.ok(!/Xk9pQ2mZ7vL4|a8f3k2|1767225600/.test(out), out);
+  assert.equal(out, 'https://cdn.example.org/v/master.m3u8?{str12-1}&embed&noCache&{str6-2}&{num10-3}&x={num1-4}');
+  // relative manifest URIs too
+  assert.equal(r.uriRef('a/en.m3u8?QwErTy12UiOp'), 'a/en.m3u8?{str12-5}');
+  assert.equal(r.findings.length, 0);
+});
+
+test('language fields keep a language tag and shape anything else (FB1 L-3: DASH lang)', () => {
+  const r = createRedactor();
+  const mpd = r.mpd(`<MPD xmlns="urn:mpeg:dash:schema:mpd:2011">
+    <Period>
+      <AdaptationSet contentType="audio" lang="en"/>
+      <AdaptationSet contentType="audio" lang="zh-Hans-CN"/>
+      <AdaptationSet contentType="audio" lang="es-419"/>
+      <AdaptationSet contentType="audio" lang="jane-doe-12345"/>
+      <AdaptationSet contentType="text" lang="Xk9pQ2mZ7vL4"/>
+    </Period></MPD>`);
+  assert.ok(!/jane|doe|12345|Xk9pQ2/.test(mpd), mpd);
+  assert.match(mpd, /lang="en"/);
+  assert.match(mpd, /lang="zh-Hans-CN"/);
+  assert.match(mpd, /lang="es-419"/);
+  assert.match(mpd, /lang="xxxx-xxx-00000"/);
+  const hls = r.hls('#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",NAME="A",LANGUAGE="jane-doe-12345",ASSOC-LANGUAGE="en-GB",URI="a.m3u8"\n');
+  assert.ok(!/jane|doe|12345/.test(hls), hls);
+  assert.match(hls, /LANGUAGE="xxxx-xxx-00000",ASSOC-LANGUAGE="en-GB"/);
+  // a track's language in the report
+  const track = (language) => redactTrack(createRedactor(), { url: 'https://cdn.example.org/a.m3u8', kind: 'audio', format: 'hls', sizeBytes: -1, sources: [], frameIds: [0], language });
+  assert.equal(track('yue').language, 'yue');
+  assert.equal(track('en-US').language, 'en-US');
+  assert.equal(track('jane-doe-12345').language, 'xxxx-xxx-00000');
+  assert.equal(track('en-Smith-ab12cd34').language, 'xx-Xxxxx-xx00xx00');
+});
+
+test('SEC18: letter-only and separator-cut tokens are masked; words with numbers stay (低-4, 低-6)', () => {
+  const r = createRedactor();
+  // masked: letters only, cut by "-", "_", "." or a percent escape, all upper case, codes
+  for (const tok of ['QwErTyUiOpAsDf', 'AbCdEfGhIjKl', 'ABCDEFGHIJKLMNOPQRSTUVWX', 'aB3dE-5gH7j-K9xQ2', 'Xk9pQ_2mZ7v_L4aB3', 'Xk9p.Q2mZ7vL4', 'Xk9p%51Q2mZ7vL4', '3fa9c01b7e2d', 'CSC3631W10L2']) {
+    const out = r.url(`https://share.example.org/s/${tok}/master.m3u8`);
+    const fake = out.split('/')[4];
+    assert.equal(fake.length, tok.length, out);
+    for (const piece of tok.split(/[._-]|%[0-9A-F]{2}/)) assert.ok(piece.length < 3 || !fake.includes(piece), `${tok} → ${out}`);
+  }
+  // kept: words and numbers, resolutions, frame and bit rates, slugs, codes
+  for (const word of ['Week10Lecture2', 'Lecture01Part2', '1920x1080p30', 'Mp4Audio128k', 'aacLC48kHz2ch', 'index1080p', 'H264Video', 'Fall2024CS101', 'DeliveryInfo.aspx', 'PodcastStreams', 'Lecture-Week-One', 'lecture-notes-week-10.pdf', 'video_avc1_1080p', 'master_1080p.m3u8', '2026-10-21', 'C%2B%2B-Programming-2026']) {
+    assert.equal(r.segment(word), word, word);
+  }
+  assert.equal(r.findings.length, 0);
+});
+
+test('SEC18: a query parameter without a value stays only when it is a common switch (低-4)', () => {
+  const r = createRedactor();
+  const out = r.url('https://cdn.example.org/v/m.m3u8?QwErTyUiOpAsDfGh&jsmith&John-Smith&john_smith&embed&noCache&download');
+  assert.ok(!/QwErTy|jsmith|John|john/.test(out), out);
+  assert.equal(out, 'https://cdn.example.org/v/m.m3u8?{tok16-1}&{str6-2}&{str10-3}&{str10-4}&embed&noCache&download');
+});
+
+test('SEC18: language fields keep only tags in their canonical case; short names are shaped (低-5)', () => {
+  const r = createRedactor();
+  for (const [tag, out] of [['Li-Ming', 'Xx-Xxxx'], ['Wu-Chen', 'Xx-Xxxx'], ['Bob', 'Xxx'], ['Ann-Lee', 'Xxx-Xxx'], ['EN', 'XX'], ['en-gb', 'xx-xx']]) {
+    assert.match(r.mpd(`<MPD><Period><AdaptationSet lang="${tag}"/></Period></MPD>`), new RegExp(`lang="${out}"`), tag);
+  }
+  for (const tag of ['en', 'en-GB', 'yue', 'yue-Hant-HK', 'zh-Hant-HK', 'es-419', 'sr-Latn-RS', 'zh-cmn-Hans-CN', 'und']) {
+    assert.match(r.mpd(`<MPD><Period><AdaptationSet lang="${tag}"/></Period></MPD>`), new RegExp(`lang="${tag}"`), tag);
+  }
+  assert.match(r.hls('#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="A",LANGUAGE="Wu-Chen",URI="a.m3u8"\n'), /LANGUAGE="Xx-Xxxx"/);
 });

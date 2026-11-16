@@ -136,7 +136,7 @@ func TestRealSSH(t *testing.T) {
 			if want == "" || res.HostKey.Fingerprint != want {
 				t.Fatalf("host key %s, expected %q", res.HostKey.Fingerprint, want)
 			}
-			if res, err = m.Trust(ctx, realID, res.HostKeyHop, want); err != nil {
+			if res, err = m.Trust(ctx, realID, TrustRequest{Hop: res.HostKeyHop, Fingerprint: want}); err != nil {
 				t.Fatal(err)
 			}
 		}

@@ -253,8 +253,19 @@ func TestRetryWithUnusableSnapshot(t *testing.T) {
 	if l.Stages[4].Status != model.StatusQueued || l.Stages[4].Model.ProviderName != "Anthropic" {
 		t.Errorf("retry result %+v", l.Stages[4])
 	}
-	// A plain retry with a usable snapshot does not ask.
-	doJSON(t, "POST", srv.URL+"/api/lectures/"+lecCancelled+"/stages/repair/retry", nil, 200, &l)
+	// v3.2.x P1-b (Q9a, revising A4.2): a plain retry of an LLM stage asks
+	// when its snapshot or a pending downstream one differs from the
+	// current settings, even when every snapshot is usable (here: translate
+	// after repair, DeepSeek → Anthropic) ...
+	retry := srv.URL + "/api/lectures/" + lecCancelled + "/stages/repair/retry"
+	nc = api.NeedsModelChoice{}
+	doJSON(t, "POST", retry, nil, 409, &nc)
+	if len(nc.Diff) != 1 || nc.Diff[0].Stage != model.StageTranslate || !nc.Diff[0].SnapshotUsable {
+		t.Fatalf("409 body %+v", nc)
+	}
+	doJSON(t, "POST", retry, api.ModelChoiceRequest{ModelChoice: model.ModelChoiceSnapshot}, 200, &l)
+	// ... and the retry of any other stage still only when one is unusable.
+	doJSON(t, "POST", srv.URL+"/api/lectures/01JD3121000000000000000006/stages/prep/retry", nil, 200, &l)
 }
 
 func TestDeleteForceAndBatch(t *testing.T) {

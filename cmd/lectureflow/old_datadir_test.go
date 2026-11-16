@@ -89,6 +89,47 @@ func TestScrubOldDataDirAtStartup(t *testing.T) {
 	}
 }
 
+// TestScrubOldDataDirLeavesNonLocalAlone (AUD1 L-1): a recorded old data
+// directory that is not an absolute path on this computer's drives (a
+// share an imported database named, a device path, a URL, a relative
+// path) is never opened and gets no marker; a local one still is.
+func TestScrubOldDataDirLeavesNonLocalAlone(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := db.Open(filepath.Join(dir, relocate.DBName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var calls []string
+	scrubOld = func(_ context.Context, old, _ string) error {
+		calls = append(calls, old)
+		return nil
+	}
+	t.Cleanup(func() { scrubOld = relocate.ScrubOldDataDir })
+	local := filepath.Join(t.TempDir(), "old")
+	for _, v := range []string{`\\server\share\LectureFlow`, "//server/share/LectureFlow", `\\?\UNC\server\share\x`,
+		`\\.\pipe\x`, "file://server/share/x", "relative/data", " " + local} {
+		if err := st.SetKV(ctx, relocate.KVOldDataDir, v); err != nil {
+			t.Fatal(err)
+		}
+		scrubOldDataDir(ctx, st, dir)
+	}
+	if len(calls) != 0 {
+		t.Errorf("opened %q", calls)
+	}
+	if v, _, _ := st.GetKV(ctx, relocate.KVOldDataDirScrubbed); v != "" {
+		t.Errorf("marker %q", v)
+	}
+	if err := st.SetKV(ctx, relocate.KVOldDataDir, local); err != nil {
+		t.Fatal(err)
+	}
+	scrubOldDataDir(ctx, st, dir)
+	if len(calls) != 1 || calls[0] != local {
+		t.Errorf("local directory: calls %q", calls)
+	}
+}
+
 // TestScrubOldDataDirFailureIsRetried: a failure leaves no marker (the
 // next start tries again) and the start goes on.
 func TestScrubOldDataDirFailureIsRetried(t *testing.T) {

@@ -6,14 +6,14 @@
 
 ## 简体中文
 
-最后更新：2026-10-27
+最后更新：2026-11-11
 
 本声明说明 LectureFlow 浏览器扩展“发送至 LectureFlow”（英文名 Send to LectureFlow，下称“扩展”）读取哪些数据、什么时候读、交给谁、保存什么。扩展是 LectureFlow 桌面应用（下称“LectureFlow”）的配套部分。两者都是开源软件，源代码在 <https://github.com/ShouldBeQuincy/LectureFlow>。
 
 ### 简要
 
 - 扩展只和**同一台电脑上**的 LectureFlow 通信，不连接我们的任何服务器（我们没有服务器）。没有账号，没有遥测，没有统计，没有广告。
-- 只有在你发送讲座时，扩展才读取 Cookie，而且只读你选中的轨道所在网站的 Cookie，只交给本机的 LectureFlow；对策文件写明不需要 Cookie 的平台（例如 Panopto）一个也不读。播放器嵌在别的网站页面里（例如 Canvas）时，浏览器会把它的 Cookie 按所在页面的网站分开存放（分区 Cookie）：交给 LectureFlow 的只有你发送时所在页面的那一份，这个网站嵌在其他网站页面里时存下的那份不会交给 LectureFlow。
+- 只有在你发送讲座时，扩展才读取 Cookie，而且只读你选中的轨道所在网站的 Cookie，只交给本机的 LectureFlow。对策文件为平台列出的网站，交出这些轨道地址的 Cookie；其他网站只交出两类：与你所在页面同属一个网站的 Cookie，以及页面里嵌入的播放器亲自请求过这些轨道时、那个播放器所在网站允许跨站发送的 Cookie（Firefox 版只交下面所说的分区 Cookie）。页面只是写出了别的网站的地址时，那个网站的 Cookie 一个也不交。对策文件写明不需要 Cookie 的平台（例如 Panopto）一个也不读。播放器嵌在别的网站页面里（例如 Canvas）时，浏览器会把它的 Cookie 按所在页面的网站分开存放（分区 Cookie）：交给 LectureFlow 的只有你发送时所在页面的那一份，这个网站嵌在其他网站页面里时存下的那份不会交给 LectureFlow。
 - 扩展不保存 Cookie。LectureFlow 只把 Cookie 放在内存里，用于这一次刮削，不写入磁盘、数据库或日志。
 - 扩展不读课程名、课程代码、文件夹或课件。
 - 在你授权过、且有平台对策文件的录播平台上，扩展会在页面里加“发送至 LectureFlow”按钮，并从平台自己的请求结果里只取对策文件声明的几个字段；结果里的其余内容（包括你的姓名、邮箱）不会离开页面。
@@ -27,6 +27,7 @@
 | 发往你授权过的网站的网络请求：地址、`Content-Type` 和大小（只读，不拦截、不修改；只留下媒体文件和播放清单，其余忽略） | 浏览器只报告发往你授权过的网站的请求；按标签页分开记在内存里，标签页跳转或关闭就丢弃 | 识别地址里没有扩展名的媒体文件和播放清单 |
 | HLS / DASH 播放清单的内容，单个媒体文件的大小 | 探测到清单或媒体文件时 | 把清单拆成音频轨道和视频轨道，估算大小 |
 | 讲座标题、录制日期、时长；平台的受限标志（讲师或大学是否限制了这条媒体流）；会话 ID | 当前网址命中某个平台对策文件时，按对策文件里写好的 CSS 选择器读取 | 给轨道和文件命名；媒体流可能受限时显示受限提示（见下文“受限的媒体流与 DRM”）；识别同一节课是否已经送过 |
+| 页面自己的标题（浏览器标签页上显示的那一行） | 扩展 0.2.1 起：没有对策文件命中时（通用探测），扩展在这个页面上探测时读取（时机同第一行）；只读正在探测的那个页面或框架的标题，而且在“不处理的网站”检查（见下文）之后才读，名单上的网站和嵌在其中的框架一概不读 | 去掉末尾的站点名（例如“… : Internet Archive”）后作为讲座标题：在弹窗里显示，发送讲座时交给本机的 LectureFlow，扩展不把它发到别处（LectureFlow 之后怎样使用，见下文“LectureFlow 收到之后”）；只剩站点名或“Recording”“Video”之类的占位词时不用，由 LectureFlow 命名。不写进探测报告 |
 | 当前页面的地址 | 扩展在这个页面上探测时（时机同第一行） | 匹配平台对策文件；刮削时作为 Referer（与浏览器默认的做法相同：所选轨道都和页面同源，即协议、域名和端口都相同时，是页面地址，不含 `#` 之后的部分；有轨道在其他来源时，只有页面的协议、域名和端口；HTTPS 页面上的普通 HTTP 轨道不带 Referer）；没有对策文件时，用规范化地址的哈希值作为会话 ID |
 | 录播页面嵌在哪个网站的页面里（只有协议、域名和端口，浏览器告诉页面里的扩展脚本的，或你允许扩展访问那个网站时的标签页地址） | 录播平台的页面嵌在别的网站页面里（例如 Canvas），你点页内按钮时 | 决定在页面上还是在扩展自己的确认窗口里确认发送（见下文“嵌在其他网站里的按钮”）；读 Cookie 时只取你所在页面的网站那一份 |
 | 平台页面自己发出的、对策文件声明的那个请求的 JSON 结果里的几个指定字段（例如 Panopto `DeliveryInfo` 里的完整录像地址、各路媒体地址、是否只有音频、标题、时长；完整录像地址为空即受限标志） | 在你授权过、且对策文件声明了 `observe` 的平台页面上，页面自己发出这个请求时 | 找出完整录像和各条轨道，判断是否受限，给轨道和文件命名 |
@@ -36,7 +37,7 @@
 
 扩展**不读取**：课程名、课程代码、文件夹结构、课件、页面上的其他文字和个人信息、你的浏览历史、其他标签页、表单内容、密码。
 
-“授权过的网站”是指扩展认识的录播平台（例如 Panopto）或你手动添加的网站，并且你在浏览器弹出的权限确认框里点了同意。安装时扩展不获得任何网站的访问权限。弹窗里的“在此网站自动探测”只申请当前页面所在的网站；轨道在其他网站、刮削又需要那些网站的 Cookie 时，那些网站单独列出，默认不选，由你逐个勾选。
+“授权过的网站”是指扩展认识的录播平台（例如 Panopto）或你手动添加的网站，并且你在浏览器弹出的权限确认框里点了同意。安装时扩展不获得任何网站的访问权限。弹窗里的“在此网站自动探测”只申请当前页面所在的网站；轨道在其他网站、发送时可能交出那些网站的 Cookie 时（对策文件为平台列出的网站、与页面同属一个网站的，或页面里嵌入的播放器所在网站的），那些网站单独列出，默认不选，由你逐个勾选；列出本身不读也不交任何 Cookie。
 
 ### 在录播平台页面里做的事
 
@@ -64,14 +65,14 @@
 - 打开弹窗时：扩展版本、浏览器种类、界面语言（用来确认双方版本兼容），以及当前讲座的平台和会话 ID（用来检查这节课是否已经导入）。LectureFlow 回给扩展的是它自己的课程列表、导入状态和刮削进度。
 - 打开带页内入口的文件夹列表时：平台和这一页各行的会话 ID，用来在行上显示“已导入 / 刮削中 / 需要刷新”。只查本机的 LectureFlow，不联网；LectureFlow 没有运行时，不会为此启动它。
 - 打开“更新这门课程到 LectureFlow”或在其中换课程时：这一页各节的会话 ID、列表上的标题和你选的课程，用来识别已经导入的课。
-- 发送讲座时（弹窗或页内卡片里的发送按钮，或批量发送）：你选的轨道地址、当前页面地址（作为 Referer；轨道在其他来源时只有页面的协议、域名和端口，见上表）、轨道所在网站的 Cookie（对策文件写明不需要时不读）、讲座标题、录制日期、时长、会话 ID、你选的课程，以及在媒体流可能受限时你是否确认了继续（或已对这个平台关闭提醒）。批量发送时每节一份。
+- 发送讲座时（弹窗或页内卡片里的发送按钮，或批量发送）：你选的轨道地址、当前页面地址（作为 Referer；轨道在其他来源时只有页面的协议、域名和端口，见上表）、轨道所在网站的 Cookie（对策文件写明不需要时不读）、讲座标题（命中对策文件时是按选择器读到的标题；没有对策文件时是页面自己的标题，见上表，可能为空）、录制日期、时长、会话 ID、你选的课程，以及在媒体流可能受限时你是否确认了继续（或已对这个平台关闭提醒）。批量发送时每节一份。
 - 点“在 LectureFlow 中打开”时：只有那节讲座或那个刮削任务在 LectureFlow 里的编号。
 
 扩展本身不向任何远程地址发送这些数据。
 
 ### 扩展自己发出的网络请求
 
-为了数出轨道、估算大小，扩展会向**轨道所在的服务器**拉取 HLS / DASH 播放清单，并对单个媒体文件发出 `HEAD` 请求；服务器不支持 `HEAD` 或不给出大小时，改发一个只要第一个字节的 `GET` 请求（`Range: bytes=0-0`），收到响应头就中止，不读取文件内容。这些正是网页上的播放器本来就会请求的地址，浏览器会像播放时一样带上该网站的 Cookie；扩展不在请求里附加任何别的信息。此外只有一种请求：在文件夹列表上发送讲座时，扩展向**该页所在的平台**（同源地址）请求要发送的那几节课的讲座信息（见上文“在录播平台页面里做的事”）。除此之外，扩展不发出任何网络请求；观察平台自己的请求时，扩展不另外发出请求。
+为了数出轨道、估算大小，扩展会向**轨道所在的服务器**拉取 HLS / DASH 播放清单，并对单个媒体文件发出 `HEAD` 请求；服务器不支持 `HEAD` 或不给出大小时，改发一个只要第一个字节的 `GET` 请求（`Range: bytes=0-0`），收到响应头就中止，不读取文件内容。这些正是网页上的播放器本来就会请求的地址。请求先在页面里、由引用了这个地址的那个页面或框架发出，浏览器像播放时一样带上该网站的 Cookie。页面里请求不成功（或没有拿到文件大小）时，扩展自己再请求，但只对你授权过的网站：只有下面几种情况才带该网站的 Cookie——地址与正在探测的页面同源（协议、域名和端口都相同；页面地址取自浏览器，不取页面自己的说法）；正在探测的页面本身命中平台对策文件，且地址属于对策文件声明的网站；对策文件命中的是页面里嵌入的播放器框架，且地址是这个框架自己引用的、与它同源的地址。其他地址一律不带 Cookie。带 Cookie 的这次请求不跟随跳转；遇到跳转，扩展对原地址改为不带 Cookie 再请求一次，这一次会跟随跳转（跳转后的地址可能不在你授权过的网站里，同样不带 Cookie）。所以扩展自己的这次再请求，同一个地址最多两次。播放清单最多读 2 MB，每个请求从发出到读完最多 10 秒，超出就中止、按失败处理。扩展不在请求里附加任何别的信息。此外只有一种请求：在文件夹列表上发送讲座时，扩展向**该页所在的平台**（同源地址）请求要发送的那几节课的讲座信息（见上文“在录播平台页面里做的事”）。除此之外，扩展不发出任何网络请求；观察平台自己的请求时，扩展不另外发出请求。
 
 ### 扩展保存什么、不保存什么
 
@@ -83,6 +84,7 @@
 - 你选择了“对这个平台不再提醒”的平台：只有平台的标识（例如 panopto）和选择的时间，不含课程或讲座信息；在设置里恢复提醒即删除；
 - 每节送入过的讲座用的是哪种内容选择（主要音视频 / 双机位 / 仅音频），只为“续传”时默认选同样的轨道：以平台与会话 ID 的哈希为键，不含标题、地址或课程，最多保留最近 200 条；
 - 你信任的嵌入网站（录播页面嵌在这些网站里时，直接在页面上确认发送）：只有网站本身（协议、域名、端口，例如 `https://canvas.example.edu`）和加入的时间，不含页面地址、课程或讲座，最多 100 个；在设置里移除即删除。
+- 因为正则太慢而停用的对策文件：只有对策文件的标识与版本、哪一条规则（在文件里的位置，例如 `/tracks/1/detect/urlPattern`）、用了多少毫秒、扩展版本和日期，不含页面地址或页面内容，最多 64 条；重新导入该文件、移除它，或在设置里重新启用内置对策文件即删除。
 
 扩展**不保存** Cookie、轨道地址、页面地址或刮削记录（上面那份内容选择只有哈希和选项名，读不出讲座标题或地址）。探测结果只放在内存里，只为当前标签页服务，标签页关闭或跳转后就丢弃；文件夹列表上取得的讲座信息同样只在内存里，30 分钟后或标签页关闭时丢弃。
 
@@ -94,7 +96,7 @@
 - LectureFlow 用内建的刮削工具 aria2c 把文件拉取到本机。Cookie 和 Referer 只通过本机回环地址（127.0.0.1）上带随机密钥的接口交给 aria2c（交出之前，LectureFlow 先确认这个接口确实属于它自己启动的 aria2c），aria2c 带着它们**直接向轨道所在的服务器**请求文件，也就是播放器本来就会访问的服务器。每个 Cookie 只发给它所属的网站。指向这台电脑本身的轨道地址一律拒绝；指向局域网的地址，只在录播页面本身也在局域网里时才刮削。
 - LectureFlow 在本机数据库里保存一条刮削记录，用来显示进度和识别重复送入：平台、会话 ID、讲座标题、录制日期、时长、你选的课程、页面的域名（不含路径）、每条轨道的类型、域名和路径的哈希值（**不保存路径和查询参数**：有些平台的媒体路径本身就足以取得文件，签名和令牌通常在查询参数里）、状态和进度，以及在媒体流可能受限时你是否确认了继续。这些记录与 LectureFlow 的其他数据一样，只保存在你的电脑上。失败或已取消的任务可以在课程页移除；删除课程时，它的刮削记录一并删除。已完成的记录保留下来，用于识别重复送入。
 - 日志里轨道地址只记域名和路径的哈希值，不记路径和查询参数。
-- 刮削完成后，录音成为 LectureFlow 里的一节讲座。之后的转写、修复和翻译遵循 LectureFlow 本身的隐私说明（见 [README 的“隐私”一节](https://github.com/ShouldBeQuincy/LectureFlow#privacy)）：转写在你的电脑上进行；只有在你配置了模型服务商时，转写文字才会发给你选的服务商；如果你选择用 Google Colab 转写，录音会上传到 Google 的服务器，选择时会明确告诉你。
+- 刮削完成后，录音成为 LectureFlow 里的一节讲座。之后的转写、修复和翻译遵循 LectureFlow 本身的隐私说明（见 [README 的“隐私”一节](https://github.com/ShouldBeQuincy/LectureFlow#privacy)）：转写在你的电脑上进行；只有在你配置了模型服务商时，转写文字才会发给你选的服务商；扩展交来的讲座标题会成为这节讲座的原始文件名，配置了模型服务商时，LectureFlow 为讲座整理标题，会把这个文件名连同讲座摘要一起发给该服务商（这是 LectureFlow 本身的行为，只在你配置了服务商时发生）；如果你选择用 Google Colab 转写，录音会上传到 Google 的服务器，选择时会明确告诉你。
 
 ### 不做的事
 
@@ -107,7 +109,7 @@
 
 ### 探测报告
 
-弹窗和设置里的“导出探测报告”只在你点击时生成，内容先经过脱敏：去掉 Cookie；网址只保留协议、域名、路径结构和查询参数的**名字**；页面文字替换为占位符。报告像浏览器的其他下载一样保存在你的电脑上，扩展不会上传它。如果你自愿把它附在公开的贡献请求（PR）里，它就会公开可见，提交前请自己再检查一遍。
+弹窗和设置里的“导出探测报告”只在你点击时生成，内容先经过脱敏：去掉 Cookie；网址只保留协议、网站名和路径，路径里较长的编号换成形状相同的假值，查询参数只留**名字**、值换成占位符；页面文字替换为占位符；没有对策文件时读到的页面标题根本不写进报告。报告像浏览器的其他下载一样保存在你的电脑上，扩展不会上传它。如果你自愿把它附在公开的贡献请求（PR）里，它就会公开可见，提交前请自己再检查一遍。
 
 ### 你的控制
 
@@ -130,14 +132,14 @@ LectureFlow 浏览器扩展对用户数据的使用遵守 Chrome 网上应用店
 
 ## English
 
-Last updated: 27 October 2026
+Last updated: 11 November 2026
 
 This policy explains what the LectureFlow browser extension "Send to LectureFlow" ("the extension") reads, when it reads it, who it gives it to, and what it keeps. The extension is a companion to the LectureFlow desktop app ("LectureFlow"). Both are open source; the source code is at <https://github.com/ShouldBeQuincy/LectureFlow>.
 
 ### In short
 
 - The extension talks only to LectureFlow **on the same computer**. It does not connect to any server of ours (we don't have one). No account, no telemetry, no analytics, no ads.
-- The extension reads cookies only when you send a lecture, and then only the cookies of the website that hosts the tracks you selected. It gives them only to LectureFlow on your computer. On platforms whose profile says the media needs no cookies (for example Panopto), it reads none at all. When the player is embedded in another website's page (for example Canvas), the browser keeps its cookies apart for each website it is embedded in (partitioned cookies): LectureFlow gets only the ones kept for the page you send from, and the ones that website keeps for other websites' pages are not given to LectureFlow.
+- The extension reads cookies only when you send a lecture, and then only the cookies of the website that hosts the tracks you selected. It gives them only to LectureFlow on your computer. For the websites a platform profile lists, it gives the cookies for those track addresses; for any other website, only two kinds: cookies of the same website as the page you are on, and, when a player embedded in the page itself requested those tracks, the cookies that the player's website allows to be sent across sites (in the Firefox version, only the partitioned ones described below). A page that merely names another website's address gets none of that website's cookies. On platforms whose profile says the media needs no cookies (for example Panopto), it reads none at all. When the player is embedded in another website's page (for example Canvas), the browser keeps its cookies apart for each website it is embedded in (partitioned cookies): LectureFlow gets only the ones kept for the page you send from, and the ones that website keeps for other websites' pages are not given to LectureFlow.
 - The extension does not keep cookies. LectureFlow keeps them in memory only, for that one fetch, and never writes them to disk, to its database or to a log.
 - The extension does not read course names, course codes, folders or slides.
 - On recording platforms you have allowed and that have a platform profile, the extension adds "Send to LectureFlow" buttons to the page and takes only a few fields, named in the profile, from the answers to the platform's own requests. The rest of those answers (including your name or e-mail address) never leaves the page.
@@ -151,6 +153,7 @@ This policy explains what the LectureFlow browser extension "Send to LectureFlow
 | Network requests to sites you have allowed: address, `Content-Type` and size (read-only; nothing is blocked or changed; only media files and playlists are kept, everything else is ignored) | The browser reports only requests to sites you have allowed; they are kept in memory per tab and dropped when the tab moves to another page or closes | To recognise media files and playlists whose addresses have no file extension |
 | The contents of HLS / DASH playlists; the size of single media files | When a playlist or media file is found | To split a playlist into audio and video tracks and estimate their size |
 | The lecture's title, recording date and length; the platform's restriction flag (whether the lecturer or university restricts this stream); the session ID | When the page matches a platform profile, using the CSS selectors written in that profile | To name the tracks and the file; to show the restriction notice when the stream may be restricted (see "Restricted streams and DRM" below); to recognise a lecture you have already sent |
+| The page's own title (the line the browser shows on the tab) | From extension version 0.2.1: when no platform profile matches (generic detection), whenever the extension looks at that page (same times as the first row). Only the title of the page or frame being looked at, and only after the check for sites LectureFlow does not handle (see below): those sites, and frames inside them, are never read | With the website's name dropped from its end (for example "… : Internet Archive"), as the lecture's title: shown in the popup and, when you send the lecture, given to LectureFlow on your computer; the extension sends it nowhere else (for what LectureFlow then does with it, see "What LectureFlow does with it" below). When only the website's name or a placeholder such as "Recording" or "Video" is left, it is not used and LectureFlow names the lecture. Never written into a detection report |
 | The address of the current page | Whenever the extension looks at that page (same times as the first row) | To match a platform profile; sent as the Referer when fetching (as browsers do by default: the page address, without the part after `#`, when all the chosen tracks are on the page's origin — the same scheme, domain and port; only the page's scheme, domain and port when any track is on another origin; no Referer for plain HTTP tracks on an HTTPS page); without a platform profile, a hash of the normalised address is used as the session ID |
 | Which website's page a recording page is embedded in (scheme, domain and port only: what the browser tells the extension's script in the page, or the tab's address when you allowed the extension that website) | When a recording platform's page is embedded in another website's page (for example Canvas) and you click an in-page button | To decide whether you confirm on the page or in the extension's own confirmation window (see "Buttons inside other websites" below); when reading cookies, to take only the ones kept for the page you are on |
 | A few named fields of the JSON answer to the one request, declared in the platform profile, that the platform's page makes itself (for Panopto's `DeliveryInfo`: the full recording's address, the media addresses, whether it is audio only, the title and the length; an empty full-recording address is the restriction flag) | On platform pages you have allowed whose profile declares `observe`, when the page itself makes that request | To find the full recording and the tracks, to tell whether the stream may be restricted, and to name the tracks and the file |
@@ -160,7 +163,7 @@ This policy explains what the LectureFlow browser extension "Send to LectureFlow
 
 The extension **does not read** course names, course codes, folder structures, slides, any other text or personal information on the page, your browsing history, other tabs, form contents or passwords.
 
-"Sites you have allowed" means recording platforms the extension knows (for example Panopto) and sites you add yourself, after you have agreed in the browser's own permission prompt. At installation the extension has access to no website at all. "Detect automatically on this site" in the popup asks only for the website of the current page; when tracks are on other websites and fetching needs their cookies, those websites are listed separately, unticked, for you to tick one by one.
+"Sites you have allowed" means recording platforms the extension knows (for example Panopto) and sites you add yourself, after you have agreed in the browser's own permission prompt. At installation the extension has access to no website at all. "Detect automatically on this site" in the popup asks only for the website of the current page; when tracks are on other websites whose cookies a send may hand over (websites a platform profile lists, websites the page belongs to, or the website of a player embedded in the page), those websites are listed separately, unticked, for you to tick one by one; listing them reads and hands over no cookie.
 
 ### What it does on recording platform pages
 
@@ -188,14 +191,14 @@ The extension gives data only to **LectureFlow on the same computer**, through t
 - When you open the popup: the extension's version, the kind of browser and the interface language (to check that both sides are compatible), and the platform and session ID of the lecture on the page (to check whether it was already imported). LectureFlow answers with its own course list, the import state and fetch progress.
 - When a folder list with in-page entries opens: the platform and the session IDs of the rows on that page, to show "Imported", fetching progress or "Needs refresh" on the rows. This only asks LectureFlow on your computer and nothing goes online; if LectureFlow is not running, it is not started for this.
 - When you open "Update this course in LectureFlow" or change its course: the session IDs of the lectures on that page, their titles as listed, and the course you chose, to recognise lectures already imported.
-- When you send a lecture (the send button in the popup or the in-page card, or sending several at once): the addresses of the tracks you chose, the address of the current page (as the Referer; only the page's scheme, domain and port when the tracks are on another origin, see the table above), the cookies of the website hosting those tracks (none when the platform profile says they are not needed), the lecture's title, recording date and length, the session ID, the course you chose, and whether you confirmed that you want to continue when the stream may be restricted (or turned that reminder off for the platform). When sending several, one such set per lecture.
+- When you send a lecture (the send button in the popup or the in-page card, or sending several at once): the addresses of the tracks you chose, the address of the current page (as the Referer; only the page's scheme, domain and port when the tracks are on another origin, see the table above), the cookies of the website hosting those tracks (none when the platform profile says they are not needed), the lecture's title (the one a platform profile's selectors read; without a profile, the page's own title, see the table above, which may be empty), recording date and length, the session ID, the course you chose, and whether you confirmed that you want to continue when the stream may be restricted (or turned that reminder off for the platform). When sending several, one such set per lecture.
 - When you click "Open in LectureFlow": only LectureFlow's own number for that lecture or fetch.
 
 The extension itself sends none of this to any remote address.
 
 ### Network requests the extension makes itself
 
-To count the tracks and estimate their size, the extension fetches HLS / DASH playlists from **the server that hosts the tracks** and sends `HEAD` requests for single media files; when a server does not answer `HEAD` or gives no size, it sends one `GET` request for the first byte only (`Range: bytes=0-0`) and stops as soon as the response headers arrive, without reading the file. These are the same addresses the page's own player requests, and the browser attaches that website's cookies just as it does during playback; the extension adds nothing else to these requests. There is one other kind of request: when you send lectures from a folder list, the extension requests the details of those lectures from **the platform the page belongs to** (at the page's own origin; see "What it does on recording platform pages" above). The extension makes no other network requests; watching the platform's own requests involves no request of its own.
+To count the tracks and estimate their size, the extension fetches HLS / DASH playlists from **the server that hosts the tracks** and sends `HEAD` requests for single media files; when a server does not answer `HEAD` or gives no size, it sends one `GET` request for the first byte only (`Range: bytes=0-0`) and stops as soon as the response headers arrive, without reading the file. These are the same addresses the page's own player requests. The requests are first made from within the page, by the page or frame that refers to the address, and the browser attaches that website's cookies just as it does during playback. When that fails (or gives no file size), the extension requests the address itself, only on websites you have allowed, and attaches that website's cookies only when: the address is on the same origin as the page being looked at (the same scheme, domain and port; the page's address is taken from the browser, not from what the page says); or the page being looked at itself matches a platform profile and the address is on a website that profile declares; or the profile matches a player frame embedded in the page and the address is one that frame refers to itself, on that frame's own origin. Any other address is requested without cookies. The request with cookies does not follow redirects; on a redirect the extension asks for the original address once more without cookies, and that request follows the redirect (possibly to a website you have not allowed, again without cookies). So the extension's own retry takes two requests per address at most. A playlist is read up to 2 MB at most, and each request is given 10 seconds at most from start to the last byte read; beyond either, it is stopped and counts as failed. The extension adds nothing else to these requests. There is one other kind of request: when you send lectures from a folder list, the extension requests the details of those lectures from **the platform the page belongs to** (at the page's own origin; see "What it does on recording platform pages" above). The extension makes no other network requests; watching the platform's own requests involves no request of its own.
 
 ### What the extension keeps, and what it doesn't
 
@@ -207,6 +210,7 @@ In the browser's extension storage, the extension keeps only:
 - the platforms for which you chose "Don’t remind me again for this platform": only the platform's identifier (for example panopto) and when you chose it, nothing about courses or lectures; turning the reminder back on in the settings deletes it;
 - which of the three choices (Main audio & video, Two cameras, Audio only) each lecture you sent was sent with, only so that "Resume" starts with the same tracks: keyed by a hash of the platform and session ID, without title, address or course, the latest 200 at most;
 - the embedding websites you trust (when a recording page is embedded in one of them, you confirm sending on the page itself): only the website (scheme, domain and port, for example `https://canvas.example.edu`) and when you added it, no page address, course or lecture, 100 at most; removing it in the settings deletes it.
+- profiles stopped because a regular expression was too slow: only the profile's identifier and version, which rule (its place in the file, for example `/tracks/1/detect/urlPattern`), how many milliseconds it took, the extension version and the date, no page address or page content, 64 at most; importing that file again, removing it, or enabling a built-in profile again in the settings deletes it.
 
 The extension **does not keep** cookies, track addresses, page addresses or a fetch history (the choices above are only hashes and option names; no lecture title or address can be read from them). What it finds on a page is held in memory for that tab only and is dropped when the tab closes or moves to another page; lecture details fetched for a folder list are likewise held in memory only, and dropped after 30 minutes or when the tab closes.
 
@@ -218,7 +222,7 @@ Site access is managed by the browser; you can withdraw it at any time in the ex
 - LectureFlow fetches the files to your computer with its built-in fetch tool, aria2c. The cookies and the Referer are handed to aria2c only through an interface on the local loopback address (127.0.0.1) protected by a random secret (after LectureFlow has checked that this interface really belongs to the aria2c it started), and aria2c uses them to request the files **directly from the server that hosts the tracks**, the same server the player uses. Each cookie is sent only to the website it belongs to. Track addresses that point to this computer are refused; addresses on the local network are fetched only when the recording page itself is on the local network.
 - LectureFlow keeps a fetch record in its local database, to show progress and recognise a lecture you send twice: the platform, session ID, lecture title, recording date and length, the course you chose, the page's domain (without its path), each track's type, domain and a hash of its path (**neither paths nor query parameters are kept**: on some platforms the media path alone is enough to get the file, and signatures and tokens are usually in query parameters), the state and progress, and whether you confirmed that you want to continue when the stream may be restricted. Like the rest of LectureFlow's data, these records stay on your computer only. Failed or cancelled fetches can be removed on the course page; deleting a course deletes its fetch records. Records of finished fetches are kept to recognise duplicates.
 - Its logs record track addresses only as the domain and a hash of the path, without the path or query parameters.
-- When fetching is done, the recording becomes a lecture in LectureFlow. Transcription, correction and translation then follow LectureFlow's own privacy terms (see the [Privacy section of the README](https://github.com/ShouldBeQuincy/LectureFlow#privacy)): transcription runs on your computer; transcribed text is sent only to the model provider you set up, if you set one up; if you choose to transcribe with Google Colab, the recording is uploaded to Google's servers, and you are told so when you choose it.
+- When fetching is done, the recording becomes a lecture in LectureFlow. Transcription, correction and translation then follow LectureFlow's own privacy terms (see the [Privacy section of the README](https://github.com/ShouldBeQuincy/LectureFlow#privacy)): transcription runs on your computer; transcribed text is sent only to the model provider you set up, if you set one up; the lecture title the extension hands over becomes the lecture's original file name, and when you have set up a model provider, LectureFlow sends that file name together with the lecture's summary to the provider when it works out a title for the lecture (LectureFlow's own behaviour, and only when a provider is set up); if you choose to transcribe with Google Colab, the recording is uploaded to Google's servers, and you are told so when you choose it.
 
 ### What it never does
 
@@ -231,7 +235,7 @@ Site access is managed by the browser; you can withdraw it at any time in the ex
 
 ### Detection reports
 
-"Export detection report" in the popup and in the settings creates a report only when you click it, and redacts it first: cookies are removed; addresses keep only the scheme, domain, path structure and the **names** of query parameters; text from the page is replaced by placeholders. The report is saved on your computer like any other download, and the extension never uploads it. If you choose to attach it to a public contribution (pull request), it becomes public, so please check it yourself first.
+"Export detection report" in the popup and in the settings creates a report only when you click it, and redacts it first: cookies are removed; addresses keep only the scheme, the site name, the path (long IDs in it replaced by fakes of the same shape) and the **names** of query parameters (their values replaced by placeholders); text from the page is replaced by placeholders, and the page title read without a platform profile is left out altogether. The report is saved on your computer like any other download, and the extension never uploads it. If you choose to attach it to a public contribution (pull request), it becomes public, so please check it yourself first.
 
 ### Your choices
 

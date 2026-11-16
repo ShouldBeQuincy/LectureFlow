@@ -30,6 +30,34 @@ function onlyFirst(arg) {
   return arg;
 }
 
+// The page's transient user activation (a click or key press within the
+// last few seconds), as Chromium keeps it; false when it cannot be read.
+function userActive() {
+  const ua = typeof navigator === 'object' && navigator ? navigator.userActivation : null;
+  return !!ua && ua.isActive === true;
+}
+
+// The page may send the paths of a drop back for a copy by path; the
+// service takes only paths the main process granted (security audit FB1
+// L-7, T-SEC-08). Only paths webUtils found for real dropped files are
+// granted: page script reaches this world through the bridge alone. The
+// page asks for one file at a time (web/api.js attachDroppedPaths), so the
+// paths of one drop are collected and sent once, as one batch of grants.
+let droppedPending = [];
+function grantDropped(paths) {
+  if (!paths.length) return;
+  const first = droppedPending.length === 0;
+  droppedPending.push(...paths);
+  if (!first) return;
+  Promise.resolve().then(() => {
+    const all = droppedPending;
+    droppedPending = [];
+    for (let i = 0; i < all.length; i += MAX_DROPPED) {
+      ipcRenderer.invoke('lf:grant-dropped', all.slice(i, i + MAX_DROPPED)).catch(() => {});
+    }
+  });
+}
+
 if (loc.protocol === 'http:' && loc.hostname === '127.0.0.1') {
   const api = {
     pickFiles: (opts) => ipcRenderer.invoke('lf:pick-files', onlyFirst(opts)),
@@ -46,12 +74,21 @@ if (loc.protocol === 'http:' && loc.hostname === '127.0.0.1') {
         const p = webUtils.getPathForFile(f);
         if (typeof p === 'string' && p !== '') out.push(p);
       }
+      grantDropped(out);
       return out;
     },
     pickFolder: () => ipcRenderer.invoke('lf:pick-folder'),
     notify: (n) => ipcRenderer.invoke('lf:notify', onlyFirst(n)),
     getPowerState: () => ipcRenderer.invoke('lf:power-state'),
-    openExternal: (url) => ipcRenderer.invoke('lf:open-external', onlyFirst(url)),
+    openExternal: (url) => {
+      // Only right after a click or key press of the person (security
+      // audit FB1 L-6). navigator.userActivation is read here, in the
+      // preload's isolated world: script in the page can neither replace
+      // it for this world nor create an activation without real input. The
+      // main process limits how often it opens links (lib/ratelimit.js).
+      if (!userActive()) return Promise.reject(new Error('openExternal: only from a click or key press'));
+      return ipcRenderer.invoke('lf:open-external', onlyFirst(url));
+    },
     getAppVersion: () => ipcRenderer.invoke('lf:app-version'),
     components: Object.freeze({
       importFile: () => ipcRenderer.invoke('lf:components-import-file'),

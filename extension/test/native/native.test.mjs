@@ -268,7 +268,9 @@ function register() {
       const page = await openPage(site.viewerUrl(s), 'body[data-ready="1"]');
       const popup = await openPopup(page, 'ready');
       assert.equal(await popup.getAttribute('#conn', 'data-nm-state'), 'connected', 'the real host reached the isolated LectureFlow');
-      assert.match(await popup.textContent('#lecture'), /Panopto 对策文件/);
+      // the platform's name; its profile in the tooltip (T26 G11)
+      assert.match(await popup.textContent('#lecture .lec-meta'), /Panopto$/);
+      assert.match(await popup.getAttribute('#lecture .lec-meta', 'title'), /^Panopto 对策文件 /);
       assert.equal(await popup.inputValue('#course'), course.id, 'LectureFlow’s own course list');
       if (c.name !== 'main') await popup.click(`#presets [data-preset="${c.name}"]`);
       assert.equal(await popup.getAttribute(`#presets [data-preset="${c.name}"]`, 'aria-pressed'), 'true');
@@ -612,7 +614,7 @@ function register() {
     site.stall();
     const page = await openPage(site.genericUrl, 'video');
     const popup = await openPopup(page, 'ready');
-    assert.match(await popup.textContent('#lecture'), /通用探测/);
+    assert.match(await popup.textContent('#lecture'), /在页面上找到/);
     await recordCookieCalls();
     await popup.click('#primary');
     await popup.waitForSelector('body[data-view="queued"]', { timeout: 20000 });

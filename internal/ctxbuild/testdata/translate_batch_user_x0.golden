@@ -1,0 +1,16 @@
+[BEFORE]
+(none)
+[TARGET #1]
+Today we talk about the cache hierarchy in modern processors.
+[ASR]
+(Raw speech recognition output; may contain errors. For reference only.)
+Today we talk about the cash hierarchy in modern processors.
+[TARGET #2]
+A write-back cache only writes a line to memory on eviction.
+[ASR]
+(Raw speech recognition output; may contain errors. For reference only.)
+A right back cache only writes a line to memory on eviction.
+[TARGET #3]
+Each cache line is 64 bytes on most x86 machines.
+[AFTER]
+(none)

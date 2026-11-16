@@ -39,6 +39,10 @@ const (
 	// sent; provider is the provider's display name.
 	CodeThinkingInvalid     = "settings.thinking_invalid"     // value
 	CodeThinkingUnsupported = "settings.thinking_unsupported" // provider
+	// v3.2.x (D1, P2): the role's (or a manual retry's) output limit and the
+	// translate role's sentences per request.
+	CodeMaxTokensInvalid = "settings.max_tokens_invalid" // min, max
+	CodeBatchInvalid     = "settings.batch_invalid"      // min, max
 
 	// ASR and general settings (§17.2, A5)
 	CodeASRModelMissing    = "settings.asr_model_missing"    //
@@ -49,6 +53,8 @@ const (
 	CodeVRAMReserveInvalid = "settings.vram_reserve_invalid" // min, max
 	CodeVRAMPerJobInvalid  = "settings.vram_per_job_invalid" // min, max
 	CodeBudgetInvalid      = "settings.budget_invalid"       //
+	// v3.2.x (P1-c): general llm_idle_timeout_s out of range.
+	CodeIdleTimeoutInvalid = "settings.idle_timeout_invalid" // min, max
 	// SPEC-v2 I8 (phase 3b freeze): value is the rejected device_mode as sent.
 	CodeDeviceModeInvalid = "settings.device_mode_invalid" // value
 	CodeMemReserveInvalid = "settings.mem_reserve_invalid" // min, max
@@ -79,6 +85,10 @@ const (
 	// is stored in the clear.
 	CodeCredentialsUnavailable = "settings.credentials_unavailable"  // error
 	CodeProviderKeyUnprotected = "settings.provider_key_unprotected" // provider
+	// SEC8 low-3 (helpers.go applyInput): an API key entered that starts
+	// with "enc:", the prefix of a stored sealed value, is refused, so a
+	// ciphertext copied from one row cannot be stored in another.
+	CodeAPIKeyLooksSealed = "settings.api_key_looks_sealed" //
 )
 
 // ErrorCodes lists the codes this package defines (CodeProviderNotFound and
@@ -89,12 +99,13 @@ var ErrorCodes = []string{
 	CodeRPMInvalid, CodeBalanceAPIInvalid, CodePriceInvalid, CodeTariffInvalid, CodeOffpeakNeedsPeak,
 	CodeRoleNotConfigured, CodeRoleProviderDeleted, CodeRoleUnknown, CodeRoleProviderMissing,
 	CodeRoleModelMissing, CodeTemperatureInvalid, CodeWindowInvalid, CodeThinkingInvalid, CodeThinkingUnsupported,
+	CodeMaxTokensInvalid, CodeBatchInvalid,
 	CodeASRModelMissing, CodeComputeTypeInvalid, CodeDeviceInvalid, CodeLanguageMissing,
-	CodeMaxParallelInvalid, CodeVRAMReserveInvalid, CodeVRAMPerJobInvalid, CodeBudgetInvalid,
+	CodeMaxParallelInvalid, CodeVRAMReserveInvalid, CodeVRAMPerJobInvalid, CodeBudgetInvalid, CodeIdleTimeoutInvalid,
 	CodeDeviceModeInvalid, CodeMemReserveInvalid,
 	CodeManualDevicesEmpty, CodeManualDevicesCPU, CodeManualDevicesUnknown,
 	CodeLocaleUnsupported, CodeZhDisplayInvalid,
 	CodeSnapshotNotRecorded, CodeSnapshotInvalid, CodeSnapshotProviderDeleted, CodeSnapshotNoAPIKey,
 	CodeSnapshotKeyUnreadable, CodeProviderKeyUnreadable,
-	CodeCredentialsUnavailable, CodeProviderKeyUnprotected,
+	CodeCredentialsUnavailable, CodeProviderKeyUnprotected, CodeAPIKeyLooksSealed,
 }

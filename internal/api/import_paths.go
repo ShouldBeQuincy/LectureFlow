@@ -91,14 +91,15 @@ func foreignStoredPaths(ctx context.Context, dbPath, dir string) (count int, fir
 }
 
 // checkImportPaths refuses an import whose database (dbPath) has paths to
-// other computers outside dir (data_import.network_path).
+// other computers outside dir (data_import.network_path; the path it
+// names cleaned and cut: relocate.ShownPath, SEC44c information-1).
 func checkImportPaths(ctx context.Context, dbPath, dir string) error {
 	n, first, err := foreignStoredPaths(ctx, dbPath, dir)
 	if err != nil {
 		return err
 	}
 	if n > 0 {
-		return model.Errorf(codeImportNetworkPath, map[string]any{"count": n, "path": first},
+		return model.Errorf(codeImportNetworkPath, map[string]any{"count": n, "path": relocate.ShownPath(first)},
 			errors.New("the database stores paths on other computers"))
 	}
 	return nil

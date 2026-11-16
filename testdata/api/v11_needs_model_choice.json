@@ -25,7 +25,8 @@
     "model": "claude-sonnet-4-5",
     "params": {
      "temperature": 0.3,
-     "window": 3
+     "window": 3,
+     "batch": 4
     },
     "prompt_version": 2
    },

@@ -214,7 +214,7 @@ func execCell(ctx context.Context, b *Backend, code string) (string, error) {
 		return "", err
 	}
 	var buf strings.Builder
-	out, err := rt.kernelExec(ctx, kid, code, func(x string) error { buf.WriteString(x); return nil }, b.o.Sleep, nil)
+	out, err := rt.kernelExec(ctx, kid, code, func(x string) error { buf.WriteString(x); return nil }, b.newReconnector(nil), nil)
 	if err != nil {
 		return buf.String(), err
 	}

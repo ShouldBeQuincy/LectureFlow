@@ -240,7 +240,7 @@ func TestDiagnosticsWindowsDesktopComponents(t *testing.T) {
 		t.Fatalf("python %+v pypdf %+v", by["python"], by["pypdf"])
 	}
 	wantCheck(t, by["faster-whisper"], codeFWNotInstalled, codeHintInstallFW)
-	if runs := strings.Join(log.list(), "\n"); !strings.Contains(runs, compBasePython+" --version") || !strings.Contains(runs, compBasePython+" -c import pypdf") {
+	if runs := strings.Join(log.list(), "\n"); !strings.Contains(runs, compBasePython+" --version") || !strings.Contains(runs, compBasePython+" -I -c import pypdf") {
 		t.Fatalf("runs:\n%s", runs)
 	}
 }
@@ -388,7 +388,7 @@ func TestDiagnosticsMacDesktopMLX(t *testing.T) {
 	}
 	wantCheck(t, by[checkMLXModel], codeMLXModelOK, "")
 	runs := strings.Join(log.list(), "\n")
-	for _, w := range []string{basePy + " --version", basePy + " -c import pypdf", mlxPy + " --version", mlxPy + " -c " + mlxImport} {
+	for _, w := range []string{basePy + " --version", basePy + " -I -c import pypdf", mlxPy + " --version", mlxPy + " -I -c " + mlxImport} {
 		if !strings.Contains(runs, w) {
 			t.Errorf("did not run %q; runs:\n%s", w, runs)
 		}
@@ -427,7 +427,7 @@ func TestDiagnosticsMacWeb(t *testing.T) {
 		t.Errorf("hint path %v, want %s", p["path"], dir)
 	}
 	runs := strings.Join(log.list(), "\n")
-	if !strings.Contains(runs, de.cfg.Python+" --version") || !strings.Contains(runs, de.cfg.PythonMLX+" -c "+mlxImport) || strings.Contains(runs, "--selftest") {
+	if !strings.Contains(runs, de.cfg.Python+" --version") || !strings.Contains(runs, de.cfg.PythonMLX+" -I -c "+mlxImport) || strings.Contains(runs, "--selftest") {
 		t.Errorf("runs:\n%s", runs)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -444,7 +444,7 @@ func TestDiagnosticsMacWeb(t *testing.T) {
 
 	// A failing import: the developer's hint.
 	de.srv.runCmd = func(ctx context.Context, name string, args ...string) (string, string, error) {
-		if len(args) == 2 && args[1] == mlxImport {
+		if len(args) == 3 && args[2] == mlxImport {
 			return "", "ModuleNotFoundError: No module named 'mlx'", errUnknownCmd
 		}
 		return fakeCmd(ctx, name, args...)

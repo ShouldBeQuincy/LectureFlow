@@ -9,8 +9,10 @@
 // refresh requests. Pure: the background reads the cookies and talks to the
 // native host (src/background/actions.js).
 
-import { urlKey, parseHttpUrl, requestableOrigin, potentiallyTrustworthy } from './url.js';
+import { urlKey, parseHttpUrl, requestableOrigin, potentiallyTrustworthy, hostMatches } from './url.js';
 import { isBlockedUrl, blockedCategory } from './blocklist.js';
+import { RETAIN_LIMITS } from './retain.js';
+import { SRC_WEBREQUEST } from './merge.js';
 
 export const GENERIC = 'generic';
 
@@ -24,6 +26,36 @@ export function listedTracks(result) {
   if (!result) return [];
   if (result.named) return [...result.named.tracks, ...result.named.others];
   return result.tracks || [];
+}
+
+/**
+ * The tracks a card lists, at most limit (RETAIN_LIMITS.tracksShown) of
+ * them, in list order: whatever the three choices (presetSelection) pick
+ * over the whole list, then the first others. So the choices, the default
+ * ticks and "续传" pick the same tracks from the shown ones as from all,
+ * and a page with any sendable track shows one. Returns { tracks, hidden }
+ * (hidden: how many were left out).
+ */
+export function shownTracks(list, presets = null, limit = RETAIN_LIMITS.tracksShown) {
+  const all = Array.isArray(list) ? list : [];
+  if (all.length <= limit) return { tracks: all, hidden: 0 };
+  const must = new Set();
+  for (const p of PRESETS) for (const id of presetSelection(all, p, presets) || []) must.add(id);
+  let slots = Math.max(0, limit - must.size);
+  const tracks = [];
+  for (const t of all) {
+    if (must.has(t.id)) tracks.push(t);
+    else if (slots > 0) {
+      tracks.push(t);
+      slots--;
+    }
+  }
+  return { tracks, hidden: all.length - tracks.length };
+}
+
+/** The tracks of a detection a card shows, and so the only ones a send may take. */
+export function shownOf(result) {
+  return shownTracks(listedTracks(result), (result && result.presets) || null).tracks;
 }
 
 /** audio, or video (unknown counts with video: LectureFlow takes one audio and up to two other tracks). */
@@ -138,22 +170,392 @@ export function cookieTargets(request, tracks) {
   return out;
 }
 
+// An IPv4 or IPv6 literal: a cookie for one is only ever host-only.
+const isIpLiteral = (host) => /^[0-9.]+$/.test(host) || host.includes(':') || host.startsWith('[');
+
+/**
+ * Whether any cookie could be sent to both hosts: the same host, or two
+ * names under a common parent of at least two labels (a cookie's Domain
+ * cannot be a single label; whether the parent is a public suffix the
+ * browser decided when it took the cookie, so a cookie that reaches both
+ * really is shared). Only decides whether reading is worth it at all
+ * (cookiePlan); cookieAllowed decides cookie by cookie.
+ */
+export function mayShareCookies(a, b) {
+  const x = String(a || '').toLowerCase().replace(/\.$/, '');
+  const y = String(b || '').toLowerCase().replace(/\.$/, '');
+  if (!x || !y) return false;
+  if (x === y) return true;
+  if (isIpLiteral(x) || isIpLiteral(y)) return false;
+  const p = x.split('.');
+  const q = y.split('.');
+  let n = 0;
+  while (n < p.length && n < q.length && p[p.length - 1 - n] === q[q.length - 1 - n]) n++;
+  return n >= 2;
+}
+
+/**
+ * Whether the browser would send this cookie (cookies.getAll) to that host,
+ * as far as its domain goes (RFC 6265 domain matching): a host-only cookie
+ * to its own host only, a domain cookie to its domain and every name under
+ * it.
+ */
+export function cookieGoesTo(cookie, host) {
+  const d = String((cookie && cookie.domain) || '').toLowerCase().replace(/^\./, '').replace(/\.$/, '');
+  const h = String(host || '').toLowerCase().replace(/\.$/, '');
+  if (!d || !h) return false;
+  if (cookie.hostOnly) return h === d;
+  return h === d || h.endsWith(`.${d}`);
+}
+
+const hostOf = (raw) => parseHttpUrl(raw)?.hostname.toLowerCase().replace(/\.$/, '') || '';
+const bareDomain = (d) => String(d || '').toLowerCase().replace(/^\./, '').replace(/\.$/, '');
+
+// The Domain values of the domain cookies (not host-only) of the
+// cookies.getAll answer a cookie came in (withAnswerDomains): a property
+// the browser's cookie objects never have, not enumerable, so never copied
+// into a message (toBridgeCookie takes named fields only).
+export const ANSWER_DOMAINS = Symbol('answerDomains');
+
+/**
+ * Marks each cookie of one cookies.getAll answer with the Domain values of
+ * that answer's domain cookies (ANSWER_DOMAINS), for cookieAllowed's
+ * same-site proof (sameSiteProven); src/background/cookies.js marks every
+ * answer. A cookie that cannot be marked has no proof. Returns the list.
+ */
+export function withAnswerDomains(list) {
+  if (!Array.isArray(list)) return list;
+  const domains = Object.freeze([...new Set(list.filter((c) => c && typeof c === 'object' && !c.hostOnly).map((c) => bareDomain(c.domain)).filter(Boolean))].sort());
+  for (const c of list) {
+    try {
+      if (c && typeof c === 'object') Object.defineProperty(c, ANSWER_DOMAINS, { value: domains, configurable: true, enumerable: false });
+    } catch {
+      // a frozen object: no proof from it
+    }
+  }
+  return list;
+}
+
+const answerDomains = (cookie) => (cookie && Array.isArray(cookie[ANSWER_DOMAINS]) ? cookie[ANSWER_DOMAINS] : []);
+
+/**
+ * Whether two hosts are proven the same site without a public suffix list
+ * (SEC46 低-3): the same host; or, among `domains` (the Domain values of
+ * domain cookies the browser holds for the track: ANSWER_DOMAINS), the
+ * hosts' nearest common parent itself, of two labels or more, with each
+ * host that parent or one label below it. The browser took a cookie for
+ * that Domain only because the parent is not a public suffix (no public
+ * suffix can take a domain cookie, evil.github.io and a.co.uk included),
+ * and with no label between the parent and either host there is no name
+ * for a public suffix in between either: both hosts are on the parent's
+ * site. A common parent further up (storage.example above the public
+ * suffix s3.storage.example) proves nothing. What it does not cover: a
+ * public suffix list entry that makes every child of the parent a public
+ * suffix ("*.parent") while the parent itself is not one, or a host that is
+ * itself a public suffix — then a domain cookie on the parent, which one
+ * child can set for all, joins two sites; cookieAllowed takes the proof
+ * only for a page or frame on a host the user granted, so that case needs
+ * the user to have granted both sites.
+ */
+export function sameSiteProven(a, b, domains) {
+  const x = bareDomain(a);
+  const y = bareDomain(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  if (isIpLiteral(x) || isIpLiteral(y)) return false;
+  const p = x.split('.');
+  const q = y.split('.');
+  let n = 0;
+  while (n < p.length && n < q.length && p[p.length - 1 - n] === q[q.length - 1 - n]) n++;
+  if (n < 2 || p.length - n > 1 || q.length - n > 1) return false;
+  const parent = p.slice(p.length - n).join('.');
+  return Array.isArray(domains) && domains.includes(parent);
+}
+
+/**
+ * The tab's top-level site as the browser computed it, from Chrome's
+ * cookies.getPartitionKey({ tabId, frameId: 0 }) (132+): { partitionKey:
+ * { topLevelSite: "https://uni.example", hasCrossSiteAncestor } } → its
+ * host name, lower case ("uni.example"): the top page's registrable domain
+ * by the browser's own public suffix list, or the host itself when it has
+ * none (an address, a public suffix). '' for anything else — no answer,
+ * another shape, not an http(s) origin — and then a send goes by the cookie
+ * proof alone, as before (cookieAllowed; src/background/actions.js).
+ * Chrome answers only with host access to that site's own origin
+ * ("https://uni.example/", not the page's "https://lms.uni.example/"): on
+ * most pages, granted by their host, it throws (SEC51 低-1); it answers
+ * where the top host is its own site (evil.github.io, an address) or the
+ * user granted the bare site.
+ */
+export function topSiteOf(answer) {
+  const key = answer && typeof answer === 'object' ? answer.partitionKey : null;
+  const site = key && typeof key === 'object' ? key.topLevelSite : null;
+  if (typeof site !== 'string' || !site || site.length > 300) return '';
+  const u = parseHttpUrl(site);
+  if (!u || !u.hostname || u.username || u.password || u.pathname !== '/' || u.search || u.hash) return '';
+  return bareDomain(u.hostname);
+}
+
+// How many entries of location.ancestorOrigins a scan keeps
+// (src/content/scan.js): a list that long may have lost its top-level page.
+export const MAX_ANCESTORS = 64;
+
+/**
+ * The hosts of a frame's location.ancestorOrigins as the scan read it
+ * (nearest first, the top-level page last; Chrome, Firefox 153+), lower
+ * case, '' for an entry that is not an http(s) origin ("null": a sandboxed
+ * frame; per the HTML standard also one embedded with
+ * referrerpolicy="no-referrer", which Chrome 156 does not hide, SEC51).
+ * null when the frame reported none (the top frame; Firefox before 153).
+ * For cookiePlan (result.frameAncestors, src/background/detector.js) only.
+ */
+export function ancestorHosts(list) {
+  if (!Array.isArray(list) || list.length === 0) return null;
+  return list.slice(0, MAX_ANCESTORS).map((o) => {
+    const s = typeof o === 'string' ? o : '';
+    const u = s && s !== 'null' && s.length <= 2048 ? parseHttpUrl(s) : null;
+    return u ? bareDomain(u.hostname) : '';
+  });
+}
+
+/** Whether a host is the site (a host name, topSiteOf) or under it; an address only when it is the same. */
+function onSite(host, site) {
+  const h = bareDomain(host);
+  const s = bareDomain(site);
+  if (!h || !s) return false;
+  if (h === s) return true;
+  if (isIpLiteral(h) || isIpLiteral(s)) return false;
+  return h.endsWith(`.${s}`);
+}
+
+/** Whether a host is one of a profile's declared hosts (its permission patterns, profile.origins). */
+function declaredHost(profile, host) {
+  for (const o of (profile && Array.isArray(profile.origins) ? profile.origins : [])) {
+    const m = /^[a-z*]+:\/\/([^/]+)\/\*$/.exec(String(o));
+    if (m && hostMatches(m[1], host)) return true;
+  }
+  return false;
+}
+
+/**
+ * The hosts whose media, a profile says, need no cookie (request.cookieUrls
+ * without "track", as Panopto's []): its match.hosts and match.mediaHosts.
+ * A generic send reads no cookie of them either (cookiePlan), so that what
+ * the profile promises holds on pages it does not cover too.
+ * profiles: [{ profile }] (src/background/profiles.js allProfiles).
+ */
+export function quietHostsOf(profiles) {
+  const out = new Set();
+  for (const e of Array.isArray(profiles) ? profiles : []) {
+    const p = e && e.profile;
+    const kinds = p && p.request && Array.isArray(p.request.cookieUrls) ? p.request.cookieUrls : null;
+    if (!kinds || kinds.includes('track') || !p.match) continue;
+    for (const h of [...(p.match.hosts || []), ...(p.match.mediaHosts || [])]) if (typeof h === 'string') out.add(h.toLowerCase());
+  }
+  return [...out].sort();
+}
+
+/** The frames that referenced or requested a track (detect.js: the top frame when it says none). */
+const framesOf = (t) => (Array.isArray(t.frameIds) && t.frameIds.length ? t.frameIds : [0]);
+
+/**
+ * Which cookies a send may hand over (security audit AUD3 中-1): the page
+ * alone must not be able to name an address and so get another site's
+ * cookies handed to LectureFlow. For each URL cookieTargets names, one of:
+ *   { url, all: true } — a host the matching profile declares (match.hosts,
+ *     match.mediaHosts; profile.origins): every cookie the browser has for
+ *     the URL, as before;
+ *   { url, all: false, topHost, siteHosts, frameHosts, thirdParty, grantedHosts, topSite? } — any other host
+ *     (generic detection always): only the cookies the browser would itself
+ *     attach to the request in this tab, as cookieAllowed reads them:
+ *     ① those it also sends to the tab's top-level page (topHost: same
+ *       site, so even SameSite=Lax or Strict) and to a frame on that site
+ *       that referenced or requested the track (siteHosts) — a request from
+ *       a frame of another site gets no Lax or Strict cookie from the
+ *       browser, whatever page it sits in (SEC46 低-1, B1);
+ *     ② SameSite=None ones that the site of a frame that referenced the
+ *       track shares (frameHosts) — only when the browser itself requested
+ *       the track (or the manifest it came from) in this tab, the request
+ *       records ("webrequest" among its sources) — and only where the
+ *       browser sends such a frame its unpartitioned cookies at all
+ *       (thirdParty "shared", from result.thirdPartyCookies: the Chrome
+ *       build). Firefox keys an embedded frame's cookies by the top-level
+ *       site (Total Cookie Protection, on by default; SEC46 低-2): there
+ *       (thirdParty "partitioned", also when a result does not say) ② hands
+ *       over the tab's partition only, which the entry still has read.
+ *     Under ① and ② also the track host's own host-only cookies, where the
+ *     browser would send them: when the track host is proven on the site
+ *     of the page or frame (sameSiteProven: a domain cookie of the browser's
+ *     on their nearest common parent) and that page or frame is on a host
+ *     the user granted (grantedHosts, from result.grantedHosts; SEC46 低-3).
+ *     The tab's partition (src/lib/partition.js) is read as before.
+ *   topSite (Chrome 132+: the tab's top-level site as the browser computed
+ *   it, topSiteOf, where the extension has host access to the site's own
+ *   origin — rarely, SEC51 低-1; '' or absent elsewhere): rides along in the entry, and a
+ *   frame counts as on the page's site (siteHosts) only when it is on that
+ *   site too; under ① the track host's own host-only cookies then also need
+ *   the track host, the page and those frames on it (cookieAllowed; SEC48
+ *   低-1: a parent-domain cookie no longer passes for a page the browser
+ *   makes a site of its own). It only ever takes away.
+ * The frames are the track's frameIds: documents the scan read that showed
+ * the address, and the frames of request records, which belong to a
+ * scanned document (Chrome: its document id) or came at request time from
+ * the origin of the document the scan read in that frame (Firefox: the
+ * record's initiator; src/background/requests.js), so a frame's host here
+ * is the host the request came from. A URL for which no cookie could pass
+ * (no host above shares a cookie domain with it: mayShareCookies), or on a
+ * host whose media a profile says need no cookie (quietHosts, from
+ * quietHostsOf), is left out, so its cookies are not read at all. A page
+ * that only writes another site's address, or loads it from its own
+ * document, gets none of that site's cookies. topUrl: the tab's top-level
+ * address (the popup's detection, the in-page card's sender);
+ * result.frameHosts: frame id → host of the frames the detection scanned
+ * (src/background/detector.js); a result without it (a listed session's,
+ * src/lib/inpage.js) has the host of its pageUrl for every frame, for ①
+ * only. result.frameAncestors: frame id → the hosts of the frame's
+ * location.ancestorOrigins (ancestorHosts; Chrome, Firefox 153+): a frame
+ * that reported them counts as on the page's site (siteHosts) only when
+ * every one of them is too (SEC48 低-2: Chrome judges SameSite by the whole
+ * ancestor chain), a chain of MAX_ANCESTORS never; a frame without them, as
+ * before. An unreadable entry ("null"): in the Chrome build (result
+ * thirdPartyCookies "shared") off the site — Chrome sends a frame under an
+ * opaque ancestor no Lax or Strict cookie and does not hide an ancestor for
+ * referrerpolicy="no-referrer" (SEC51); elsewhere (the Firefox build, a
+ * result that does not say) it says nothing, and the frame counts as one
+ * that reported no ancestors (SEC51 低-2: Firefox might hide a same-site
+ * embedding's ancestor and still send its cookies). It only ever takes
+ * away.
+ */
+export function cookiePlan(result, tracks, topUrl, { quietHosts = [], topSite = '' } = {}) {
+  const r = result || {};
+  const urls = cookieTargets(r.request, tracks || []);
+  const topHost = hostOf(topUrl);
+  const site = typeof topSite === 'string' ? bareDomain(topSite) : '';
+  // on the page's site as far as can be told: may share a cookie with the
+  // top page and, with the browser's top-level site, on it
+  const onTopSite = (h) => !!h && !!topHost && mayShareCookies(h, topHost) && (!site || onSite(h, site));
+  // and every ancestor a frame reported with it (SEC48 低-2: a frame of the
+  // page's site inside another site's frame gets no Lax or Strict cookie
+  // from the browser); a frame that reported none, as before
+  const ancestry = r.frameAncestors && typeof r.frameAncestors === 'object' ? r.frameAncestors : null;
+  const unreadableIsOff = r.thirdPartyCookies === 'shared'; // the Chrome build
+  const ancestorsOnTopSite = (id) => {
+    const chain = ancestry && Array.isArray(ancestry[id]) ? ancestry[id] : [];
+    if (chain.length === 0) return true;
+    // the Firefox build: a hidden ancestor makes the chain say nothing
+    if (!unreadableIsOff && chain.includes('')) return true;
+    return chain.length < MAX_ANCESTORS && chain.every(onTopSite);
+  };
+  const scanned = r.frameHosts && typeof r.frameHosts === 'object' ? r.frameHosts : null;
+  const frameHost = (id) => (scanned && typeof scanned[id] === 'string' ? scanned[id] : '');
+  const pageHost = scanned ? '' : hostOf(r.pageUrl);
+  const thirdParty = r.thirdPartyCookies === 'shared' ? 'shared' : 'partitioned';
+  const granted = new Set(Array.isArray(r.grantedHosts) ? r.grantedHosts : []);
+  const plan = [];
+  for (const url of urls) {
+    const host = hostOf(url);
+    const same = (tracks || []).filter((t) => urlKey(t.url) === url);
+    if (r.profile && declaredHost(r.profile, host)) {
+      plan.push({ url, all: true });
+      continue;
+    }
+    if ((quietHosts || []).some((h) => hostMatches(h, host))) continue;
+    const siteHosts = new Set();
+    const frameHosts = new Set();
+    for (const t of same) {
+      const requested = Array.isArray(t.sources) && t.sources.includes(SRC_WEBREQUEST);
+      for (const id of framesOf(t)) {
+        const h = frameHost(id);
+        const own = h || pageHost;
+        if (onTopSite(own) && ancestorsOnTopSite(id)) siteHosts.add(own);
+        if (requested && h && mayShareCookies(h, host)) frameHosts.add(h);
+      }
+    }
+    const top = topHost && siteHosts.size > 0 && mayShareCookies(topHost, host) ? topHost : '';
+    if (!top && frameHosts.size === 0) continue;
+    const sites = top ? [...siteHosts].sort() : [];
+    const frames = [...frameHosts].sort();
+    const grantedHosts = [...new Set([top, ...sites, ...frames])].filter((h) => h && granted.has(h)).sort();
+    const entry = { url, all: false, topHost: top, siteHosts: sites, frameHosts: frames, thirdParty, grantedHosts };
+    if (site) entry.topSite = site;
+    plan.push(entry);
+  }
+  return plan;
+}
+
+/**
+ * Whether one (unpartitioned) cookie that cookies.getAll gave for a URL of
+ * cookiePlan may be handed over under its entry. The proof for a track
+ * host's own host-only cookie comes from the same answer (ANSWER_DOMAINS,
+ * marked by src/background/cookies.js); an unmarked cookie has none.
+ */
+export function cookieAllowed(cookie, entry) {
+  if (!cookie || !entry) return false;
+  if (entry.all) return true;
+  const sites = entry.siteHosts || [];
+  // ① the page's site: a cookie of the top page that also goes to the frame that asked
+  if (entry.topHost && cookieGoesTo(cookie, entry.topHost) && sites.some((h) => cookieGoesTo(cookie, h))) return true;
+  // The track host's own host-only cookie (SEC46 低-3), which the browser
+  // sends wherever it sends that host's cookies of the same SameSite: under
+  // ① and ② when the track host is proven on the site of the page or frame
+  // (sameSiteProven), and that page or frame is on a host the user granted
+  // (grantedHosts; an attacker's page the user only opened is not one).
+  const host = hostOf(entry.url);
+  const own = !!cookie.hostOnly && !!host && bareDomain(cookie.domain) === host;
+  const granted = entry.grantedHosts || [];
+  const proof = own ? answerDomains(cookie) : [];
+  const proven = (h) => granted.includes(h) && sameSiteProven(host, h, proof);
+  // Under ① also, with the tab's top-level site as the browser computed it
+  // (entry.topSite, Chrome 132+; SEC48 低-1): the track host, the page and
+  // every frame on its site that asked are on that site — on top of the
+  // proof, never instead of it.
+  const onTop = !entry.topSite || (onSite(host, entry.topSite) && onSite(entry.topHost, entry.topSite) && sites.every((h) => onSite(h, entry.topSite)));
+  if (own && entry.topHost && onTop && proven(entry.topHost) && sites.some((h) => h === entry.topHost || h === host || proven(h))) return true;
+  // ② an embedded player's site: SameSite=None only, and none unpartitioned in Firefox
+  if (entry.thirdParty !== 'shared' || cookie.sameSite !== 'no_restriction') return false;
+  const frames = entry.frameHosts || [];
+  return frames.some((h) => cookieGoesTo(cookie, h)) || (own && frames.some(proven));
+}
+
 /**
  * Site access the popup offers ("在此网站自动探测"; security review L4): the
  * page's own origin, and apart from it the hosts whose cookies a send would
  * read — the sendable tracks' hosts other than the page's, when the profile
- * reads cookies at all (cookieUrls "track", also generic detection) — for
- * the user to tick one by one. HTTPS only, as the manifest offers.
- * Returns { page, cookieHosts }.
+ * reads cookies at all (cookieUrls "track", also generic detection), of
+ * the tracks a card shows (shownTracks), and only those whose cookies the
+ * send could hand over at all (cookiePlan, from the page: a host the
+ * profile declares, one that may share a cookie with the page, or the site
+ * of an embedded player whose request the browser made; AUD3 中-1), and a
+ * host that may share a cookie with a scanned frame that showed or
+ * requested the track, though the browser's request is not on record yet
+ * (SEC46 低-3: an embedded player's CDN, which the browser reports only
+ * once the user granted it; offering it reads and hands over nothing — a
+ * send still goes by cookiePlan); not a host whose media a profile says
+ * need no cookie (result.quietHosts, from quietHostsOf: a send reads none
+ * there; SEC46 信-2) — for the user to tick one by one. HTTPS only, as the
+ * manifest offers. Returns { page, cookieHosts }.
  */
 export function accessOffer(result) {
   if (!result || result.status !== 'ok') return { page: '', cookieHosts: [] };
   const page = requestableOrigin(result.pageUrl);
   if (!page) return { page: '', cookieHosts: [] };
   const hosts = new Set();
-  for (const u of cookieTargets(result.request, listedTracks(result).filter(sendable))) {
+  const quietHosts = Array.isArray(result.quietHosts) ? result.quietHosts : [];
+  const offer = (u) => {
     const o = requestableOrigin(u);
     if (o && o !== page) hosts.add(o);
+  };
+  // the shown tracks only: a track the card does not list cannot be sent
+  const shown = shownOf(result).filter(sendable);
+  for (const { url } of cookiePlan(result, shown, result.pageUrl, { quietHosts })) offer(url);
+  // a scanned frame's own host (never the page's address for a frame the
+  // scan did not read) that may share a cookie with the track's
+  const scanned = result.frameHosts && typeof result.frameHosts === 'object' ? result.frameHosts : {};
+  for (const url of cookieTargets(result.request, shown)) {
+    const host = hostOf(url);
+    if (quietHosts.some((h) => hostMatches(h, host))) continue;
+    const frames = shown.filter((t) => urlKey(t.url) === url).flatMap(framesOf);
+    if (frames.some((id) => typeof scanned[id] === 'string' && mayShareCookies(scanned[id], host))) offer(url);
   }
   return { page, cookieHosts: [...hosts].sort() };
 }
@@ -215,13 +617,36 @@ export function refererFor(result, tracks = []) {
   return crossOrigin ? `${u.origin}/` : u.href;
 }
 
-/** A track name for people: the profile's label, else "Video · 720p · en". */
+/**
+ * A track name for people: the profile's label, else "Video · 720p" or
+ * "Audio · English" — the playlist's own name for a rendition (HLS NAME)
+ * before its language code (T26 J5).
+ */
 export function trackName(track, msg) {
   if (track.label) return track.label;
   const parts = [msg(`kind_${track.kind}`)];
   if (track.quality) parts.push(track.quality);
-  if (track.language) parts.push(track.language);
+  if (track.name || track.language) parts.push(track.name || track.language);
   return parts.join(' · ');
+}
+
+/**
+ * The names a card shows for its tracks (id → name): trackName, with tracks
+ * of the same name numbered in list order ("Audio 1", "Audio 2"), so that
+ * two of them can be told apart (T26 G12).
+ */
+export function trackNames(tracks, msg) {
+  const base = (tracks || []).map((t) => [t.id, trackName(t, msg)]);
+  const count = new Map();
+  for (const [, n] of base) count.set(n, (count.get(n) || 0) + 1);
+  const seen = new Map();
+  return new Map(
+    base.map(([id, n]) => {
+      if (count.get(n) < 2) return [id, n];
+      seen.set(n, (seen.get(n) || 0) + 1);
+      return [id, `${n} ${seen.get(n)}`];
+    }),
+  );
 }
 
 function bridgeTrack(t, msg) {
@@ -267,8 +692,9 @@ export function platformOf(result) {
 
 /**
  * The enqueue request (bridge.EnqueueRequest without type and id). Generic
- * detection reads no page text, so it sends an empty title and LectureFlow
- * names the lecture (lead ruling 9).
+ * detection sends the page's own title (src/lib/profile.js pageTitleFor),
+ * or an empty one when the page has none worth using and LectureFlow names
+ * the lecture (lead ruling 9).
  */
 export function buildEnqueue({ result, ids, courseId, cookies, overrideDisabled, msg }) {
   const tracks = pickTracks(result, ids);
@@ -280,7 +706,7 @@ export function buildEnqueue({ result, ids, courseId, cookies, overrideDisabled,
     platform: platformOf(result),
     sessionId: result.sessionId,
     lecture: {
-      title: result.profile ? String(lecture.title || '') : '',
+      title: String(lecture.title || ''),
       recordedAt: String(lecture.recordedAt || ''),
       durationSec: Number.isFinite(lecture.durationSec) && lecture.durationSec > 0 ? Math.round(lecture.durationSec) : 0,
     },

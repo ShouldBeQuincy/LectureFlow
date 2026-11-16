@@ -32,7 +32,7 @@
 // classic script (content scripts cannot be modules).
 
 import { el, icon, t, useCatalog, uiLang } from '../ui/dom.js';
-import { createSendCard } from '../ui/sendcard.js';
+import { createSendCard, fitSend } from '../ui/sendcard.js';
 import { createBulkCard } from '../ui/bulkcard.js';
 import { rowSessionId, sessionInfoRequest, extractPointers, rowState } from '../lib/inpage.js';
 import { progressOf } from '../lib/popupstate.js';
@@ -40,6 +40,7 @@ import { guardClicks, watchVisibility } from '../ui/clickguard.js';
 import { cardFits, cardPlacement } from '../lib/embed.js';
 import { INPAGE_CSS } from '../ui/inpage-css.js';
 import { BUILD } from '../build-info.js';
+import { setRegexGuard, PAGE_WINDOW_MS } from '../lib/regexguard.js';
 
 const api = globalThis.browser || globalThis.chrome;
 const MAX_INFO = 4 * 1024 * 1024;
@@ -61,6 +62,18 @@ async function main() {
     return;
   }
   if (!cfg || (cfg.mode !== 'player' && cfg.mode !== 'list')) return;
+  // a profile regex too slow here (src/lib/regexguard.js): it stops in this
+  // page at once; the background records it (src/background/health.js)
+  setRegexGuard({
+    windowMs: PAGE_WINDOW_MS,
+    onTrip: (tr) => {
+      try {
+        Promise.resolve(api.runtime.sendMessage({ cmd: 'regexSlow', owner: tr.owner, source: tr.source, ms: tr.ms, reason: tr.reason })).catch(() => {});
+      } catch {
+        // the background is gone; the page stays unblocked anyway
+      }
+    },
+  });
   // the language chosen in the extension's settings, if any
   if (cfg.i18n && cfg.i18n.messages && typeof cfg.i18n.lang === 'string') useCatalog(cfg.i18n);
   const ui = createInpage(cfg);
@@ -286,7 +299,11 @@ function createInpage(cfg) {
     card.host.style.left = `${Math.round(left)}px`;
     card.host.style.top = `${Math.round(top)}px`;
     card.frame.style.width = `${W}px`;
-    card.frame.style.maxHeight = `${Math.max(160, Math.round(maxH))}px`;
+    const height = Math.max(160, Math.round(maxH));
+    card.frame.style.maxHeight = `${height}px`;
+    // the send block keeps in sight only in a card tall enough for it; in a
+    // low one it scrolls with the rest (SEC42 中-1)
+    fitSend(card.frame, height);
   }
 
   function onOutside(ev) {
@@ -369,7 +386,8 @@ function createInpage(cfg) {
       openerHost,
       'sendButton',
       (mount) => {
-        const ctl = createSendCard({ mount, ask, host: 'inpage', openUrl: (url) => window.open(url, '_blank', 'noopener') });
+        // every view may change the send block: place the card again
+        const ctl = createSendCard({ mount, ask, host: 'inpage', onView: () => positionCard(), openUrl: (url) => window.open(url, '_blank', 'noopener') });
         ctl.start();
         return ctl;
       },
@@ -616,7 +634,7 @@ function createInpage(cfg) {
     function scan() {
       const fresh = [];
       for (const tr of document.querySelectorAll(L.row)) {
-        const sid = rowSessionId(tr.getAttribute(L.idAttr), L);
+        const sid = rowSessionId(tr.getAttribute(L.idAttr), L, cfg.key);
         if (!sid) continue;
         const anchor = tr.querySelector(L.anchor);
         if (!anchor) continue;

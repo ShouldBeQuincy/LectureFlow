@@ -12,7 +12,7 @@
 import { h, clear, btn, iconBtn, openDialog } from './dom.js';
 import { icon } from './icons.js';
 import { t } from './i18n.js';
-import { fmtHM, fmtDecimal, fmtMonthDay, fmtDayShort, weekdayNames, clauseJoin } from './util.js';
+import { fmtHM, fmtDecimal, fmtMonthDay, fmtDayShort, weekdayNames, clauseJoin, upperFirst } from './util.js';
 import { ymd, addDays, parseYMD } from './calendar_ui.js';
 
 const BEIJING = 'Asia/Shanghai';
@@ -180,7 +180,14 @@ function daysText(days) {
   return (days || []).map((d) => names[d - 1]).join(t('tariff.list_sep'));
 }
 
-/** "Beijing time Weekdays 09:00–12:00, 14:00–18:00 · off-peak ×0.5 · public holidays off-peak". */
+/**
+ * "Beijing time · Weekdays 09:00–12:00, 14:00–18:00 · off-peak ×0.5 ·
+ * public holidays off-peak". The zone is a part of its own (round 2, T6
+ * #12): run into the day names ("Beijing time Weekdays …") a capital stood
+ * mid-sentence in en and ru. The line starts with a capital (T8: ru's
+ * "пекинское время" opened it in lower case; upperFirst leaves scripts
+ * without letter case alone).
+ */
 export function tariffSummary(tariff) {
   if (!tariff) return '';
   const groups = new Map();
@@ -191,13 +198,14 @@ export function tariffSummary(tariff) {
   }
   const parts = [];
   if (groups.size) {
-    parts.push(`${zoneName(tariff.timezone)} ${clauseJoin([...groups].map(([d, ws]) => `${d} ${ws.join(t('tariff.list_sep'))}`))}`);
+    parts.push(zoneName(tariff.timezone));
+    parts.push(clauseJoin([...groups].map(([d, ws]) => `${d} ${ws.join(t('tariff.list_sep'))}`)));
     parts.push(t('tariff.summary.multiplier', { m: fmtDecimal(Number(tariff.offpeak_multiplier), 2) }));
     if (tariff.exclude_holidays === 'CN') parts.push(t('tariff.summary.holidays'));
   } else parts.push(t('tariff.summary.no_windows'));
   const n = Object.keys(tariff.models || {}).length;
   if (n) parts.push(t('tariff.summary.models', { n }));
-  return parts.join(' · ');
+  return upperFirst(parts.join(' · '));
 }
 
 // ---------- the tariff editor (provider dialog) ----------
@@ -463,7 +471,7 @@ function parseLines(text) {
 export function openHolidaysEditor(view, save) {
   return openDialog(
     t('settings.holidays.edit_title'),
-    (close) => {
+    (close, busy) => {
       const ta = h('textarea', { class: 'input mono hol-text', rows: '14', spellcheck: 'false', autofocus: true, 'aria-label': t('settings.holidays.edit_label') });
       ta.value = linesOf(view.years);
       const err = h('p', { class: 'dlg-field-error', role: 'alert' });
@@ -483,7 +491,7 @@ export function openHolidaysEditor(view, save) {
             }
             ok.disabled = true;
             try {
-              close(await save(years));
+              close(await busy(save(years)));
             } catch (ex) {
               ok.disabled = false;
               err.textContent = ex.message;

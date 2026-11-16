@@ -116,6 +116,52 @@ func TestProviderKeyUnreadable(t *testing.T) {
 	}
 }
 
+// sec3 I4: the one-time DeepSeek tariff preset writes the providers back
+// in a transaction (db.UpdateProvider with the key they were read with); a
+// key that cannot be decrypted here (read as "") stays stored, so the right
+// key file still opens it.
+func TestTariffPresetKeepsAnUnreadableKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lectureflow.db")
+	st, err := db.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	st.SetKV(bg(), model.KVSettingsImported, "1")
+	useDataKey(t, 3) // the other installation
+	ds := model.Provider{ID: "ds", Name: "DeepSeek", Type: model.ProviderOpenAI, BaseURL: "https://api.deepseek.com",
+		APIKey: fakeKey, MaxConcurrency: 4, RPM: 60, BalanceAPI: model.BalanceDeepSeek}
+	if err := st.InsertProvider(bg(), ds); err != nil {
+		t.Fatal(err)
+	}
+	sealed := storedKey(t, path, "ds")
+	useDataKey(t, 4) // this installation
+	s, err := Open(bg(), st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.KeyUnreadable("ds") {
+		t.Fatal("control: the key opens")
+	}
+	names, _, err := s.ApplyPhase2Defaults(bg())
+	if err != nil || len(names) != 1 || names[0] != "DeepSeek" {
+		t.Fatalf("preset %v %v", names, err)
+	}
+	if got, _ := s.Provider("ds"); got.Tariff == nil {
+		t.Fatal("no preset")
+	}
+	if storedKey(t, path, "ds") != sealed || !s.KeyUnreadable("ds") {
+		t.Fatal("the tariff preset removed the key to enter again")
+	}
+	useDataKey(t, 3) // the key file is put back
+	if err := s.Load(bg()); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Provider("ds"); got.APIKey != fakeKey || got.Tariff == nil {
+		t.Fatalf("with the right key: %q %v", got.APIKey, got.Tariff)
+	}
+}
+
 // Deleting a provider (in a transaction) leaves no copy of its key.
 func TestDeleteProviderScrubsKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lectureflow.db")

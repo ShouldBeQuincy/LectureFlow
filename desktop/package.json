@@ -1,7 +1,7 @@
 {
   "name": "lectureflow-desktop",
   "productName": "LectureFlow",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "description": "LectureFlow desktop shell: starts the local LectureFlow service and shows it in a window.",
   "private": true,
   "license": "AGPL-3.0-or-later",
@@ -18,8 +18,5 @@
     "@playwright/test": "1.64.1",
     "electron": "44.9.3",
     "electron-builder": "26.17.0"
-  },
-  "dependencies": {
-    "electron-updater": "6.8.10"
   }
 }

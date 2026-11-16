@@ -5,7 +5,10 @@ package components
 
 import (
 	"fmt"
+	"net/url"
 	"sort"
+	"strings"
+	"unicode"
 )
 
 // Presets are the cost tiers of onboarding step 4 (SPEC-v3 V4.2): they come
@@ -108,6 +111,23 @@ func (p Presets) validate() []string {
 		if pr.Free && pr.TermsURL == "" {
 			add("provider %s: a free provider needs terms_url", pr.ID)
 		}
+		// AUD5 info-1: these links become the href of the onboarding page's
+		// external links; only https addresses (the optional ones may be
+		// empty)
+		for _, l := range []struct {
+			field, url string
+			optional   bool
+		}{{"signup_url", pr.SignupURL, false}, {"keys_url", pr.KeysURL, false},
+			{"pricing_url", pr.PricingURL, true}, {"terms_url", pr.TermsURL, true}} {
+			if !(l.optional && l.url == "") && !isHTTPSLink(l.url) {
+				add("provider %s: %s %q is not an https:// address", pr.ID, l.field, l.url)
+			}
+		}
+		for _, r := range pr.Refs {
+			if !isHTTPSLink(r) {
+				add("provider %s: refs entry %q is not an https:// address", pr.ID, r)
+			}
+		}
 	}
 	free := func(id string) bool { pr, ok := provs[id]; return ok && pr.Free }
 	if p.Free.Default == "" || !free(p.Free.Default) {
@@ -148,4 +168,16 @@ func (p Presets) validate() []string {
 		add("default tier %q", p.Default)
 	}
 	return errs
+}
+
+// isHTTPSLink: an absolute "https://" address (lower-case scheme, as the
+// page's own check ^https://\S+$ expects) with a host and without spaces or
+// control characters.
+func isHTTPSLink(s string) bool {
+	if !strings.HasPrefix(s, "https://") ||
+		strings.IndexFunc(s, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return false
+	}
+	u, err := url.Parse(s)
+	return err == nil && u.Host != ""
 }

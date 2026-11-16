@@ -14,6 +14,14 @@ export const SOURCE_ORDER = [SRC_ELEMENT, SRC_PERFORMANCE, SRC_WEBREQUEST];
 
 const MAX_RESOURCES_PER_FRAME = 2000;
 
+// The longest address a candidate may have, without its fragment (it is
+// keyed so): LIMITS.urlLength in detect.js, where the reasons are.
+export const MAX_URL_LENGTH = 8192;
+
+// The address of u as candidates key it (http(s), no fragment) fits within
+// urlLength; false for one too long. u is a parsed URL.
+const keyFits = (u, urlLength) => u.href.length - u.hash.length <= urlLength;
+
 /**
  * Raw scan results → candidates.
  *
@@ -24,12 +32,24 @@ const MAX_RESOURCES_PER_FRAME = 2000;
  * webRequests: [{ url, frameId, resourceType, statusCode, contentType,
  *   contentLength, contentRangeTotal }]
  *
- * Returns { candidates: [{ url, source, frameId, hints }], evidence }
- * where evidence records what the page says about MSE and EME.
+ * Returns { candidates: [{ url, source, frameId, hints }], evidence,
+ * longUrls } where evidence records what the page says about MSE and EME,
+ * and longUrls counts the addresses left out because, without their
+ * fragment, they are longer than opts.urlLength (SEC28b 中-4: every table
+ * keyed by address stays linear, see LIMITS.urlLength).
  */
-export function buildCandidates({ frames = [], webRequests = [] }) {
+export function buildCandidates({ frames = [], webRequests = [] }, { urlLength = MAX_URL_LENGTH } = {}) {
   const candidates = [];
   const evidence = { mse: false, mediaKeys: false, mediaKeysOnStream: false, encrypted: false, mediaKeysUrls: [], mediaDurations: [] };
+  let longUrls = 0;
+  // an http(s) address that fits; counts one that does not
+  const usable = (raw) => {
+    const u = parseHttpUrl(raw);
+    if (!u) return false;
+    if (keyFits(u, urlLength)) return true;
+    longUrls++;
+    return false;
+  };
 
   for (const f of frames) {
     // An "encrypted" event (seen by the observer on authorized sites) means
@@ -40,6 +60,7 @@ export function buildCandidates({ frames = [], webRequests = [] }) {
     }
     for (const el of f.elements || []) {
       const urls = [];
+      const tried = []; // each address of the element once (src and currentSrc are often the same)
       const push = (u, type) => {
         if (!u) return;
         if (/^blob:/i.test(u)) {
@@ -47,8 +68,9 @@ export function buildCandidates({ frames = [], webRequests = [] }) {
           if (el.mediaKeys) evidence.mediaKeysOnStream = true;
           return;
         }
-        if (!parseHttpUrl(u)) return;
-        if (!urls.some((x) => x.u === u)) urls.push({ u, type });
+        if (tried.includes(u)) return;
+        tried.push(u);
+        if (usable(u)) urls.push({ u, type });
       };
       push(el.currentSrc);
       push(el.src);
@@ -75,7 +97,7 @@ export function buildCandidates({ frames = [], webRequests = [] }) {
       }
     }
     for (const r of (f.resources || []).slice(0, MAX_RESOURCES_PER_FRAME)) {
-      if (!parseHttpUrl(r.url)) continue;
+      if (!usable(r.url)) continue;
       candidates.push({
         url: r.url,
         source: SRC_PERFORMANCE,
@@ -89,7 +111,7 @@ export function buildCandidates({ frames = [], webRequests = [] }) {
   }
 
   for (const w of webRequests) {
-    if (!parseHttpUrl(w.url)) continue;
+    if (!usable(w.url)) continue;
     candidates.push({
       url: w.url,
       source: SRC_WEBREQUEST,
@@ -103,7 +125,19 @@ export function buildCandidates({ frames = [], webRequests = [] }) {
     });
   }
   evidence.mediaKeysUrls = [...new Set(evidence.mediaKeysUrls)].sort();
-  return { candidates, evidence };
+  return { candidates, evidence, longUrls };
+}
+
+/**
+ * The longest of the page's media durations (evidence.mediaDurations), or
+ * `none` when there is none. A loop, not Math.max(...list): spreading one
+ * argument per media element throws a RangeError once a page has some
+ * hundred thousand of them (SEC23b 信息-9).
+ */
+export function longestDuration(durations, none = null) {
+  let best = -Infinity;
+  for (const d of durations || []) if (d > best) best = d;
+  return best === -Infinity ? none : best;
 }
 
 /** Total size from a response's headers: Content-Range total for 206. */

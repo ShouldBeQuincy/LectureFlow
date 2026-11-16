@@ -15,7 +15,9 @@ package main
 // Scenario "unset" (?mock=unset) serves a separate settings world in which
 // 大纲整理 has no provider and 翻译 points at a deleted provider (the
 // settings page's error states; v2: no janitor, chapters or organizer);
-// everything else uses the default data.
+// everything else uses the default data. Scenario "nolimits" is the
+// default data without the observed account limits (T-PERF-03; the
+// default data's Anthropic provider has them).
 //
 // v2 P12 (web-course-p2): providers carry a tariff (a new DeepSeek provider
 // gets tariff.DeepSeekPreset, like the real settings), offpeak_only and the
@@ -35,6 +37,7 @@ import (
 	"time"
 
 	"lectureflow/internal/api"
+	"lectureflow/internal/llm"
 	"lectureflow/internal/model"
 	"lectureflow/internal/settings"
 	"lectureflow/internal/tariff"
@@ -72,12 +75,16 @@ var unsetWorlds sync.Map // *mock → *unsetWorld
 
 var oldModelWorlds sync.Map // *mock → *unsetWorld (scenario "oldmodel")
 
+var noLimitsWorlds sync.Map // *mock → *unsetWorld (scenario "nolimits")
+
 // settingsStore is the store whose settings a request reads and writes.
 func (m *mock) settingsStore(r *http.Request, s *store) (*store, error) {
 	switch scenario(r) {
 	case "unset":
 	case "oldmodel":
 		return m.oldModelStore()
+	case "nolimits":
+		return m.noLimitsStore()
 	default:
 		return s, nil
 	}
@@ -117,6 +124,22 @@ func (m *mock) oldModelStore() (*store, error) {
 				if p := &u.s.settings.Providers[i]; p.ID == "deepseek" {
 					p.Models = []string{"deepseek-flash", "deepseek-v4-pro"} // what the DeepSeek API lists now
 				}
+			}
+		}
+	})
+	return u.s, u.err
+}
+
+// noLimitsStore is the settings world of scenario "nolimits" (T-PERF-03):
+// the default data before any answer reported the account's limits (no
+// provider has rate_limits; the settings page shows no suggestion).
+func (m *mock) noLimitsStore() (*store, error) {
+	v, _ := noLimitsWorlds.LoadOrStore(m, &unsetWorld{})
+	u := v.(*unsetWorld)
+	u.once.Do(func() {
+		if u.s, u.err = loadStore(m.dataDir, time.Now(), false); u.err == nil {
+			for i := range u.s.settings.Providers {
+				u.s.settings.Providers[i].RateLimits = nil
 			}
 		}
 	})
@@ -220,12 +243,42 @@ func (st *store) providerView(p api.ProviderView) api.ProviderView {
 	// the real rule (DeepSeek and Anthropic; the other OpenAI-compatible
 	// provider, OpenRouter, only "off")
 	p.SupportsThinking = settings.SupportsThinking(model.Provider{ID: p.ID, Name: p.Name, Type: p.Type, BaseURL: p.BaseURL, BalanceAPI: p.BalanceAPI})
+	p.DefaultBatchClaude = settings.ClaudeBatch(model.Provider{Type: p.Type, BaseURL: p.BaseURL, BalanceAPI: p.BalanceAPI})
 	p.TariffState = nil
 	if ts := st.tariffStateOf(p, time.Now()); ts != nil {
 		v := api.TariffState(*ts)
 		p.TariffState = &v
 	}
+	p.RateLimits = mockRateLimits(p)
 	return p
+}
+
+// mockRateLimits is the provider's observed limits (T-PERF-03) with the
+// suggestion for its current settings, as the real server computes it
+// (llm.AdviseLimits, with mockMeasured standing in for measured answers);
+// none for a provider that is not Anthropic at api.anthropic.com.
+func mockRateLimits(p api.ProviderView) *api.ProviderRateLimits {
+	rl := p.RateLimits
+	if rl == nil || p.Type != model.ProviderAnthropic || !llm.OfficialAnthropicHost(p.BaseURL) {
+		return nil
+	}
+	val := func(v *int64) int64 {
+		if v == nil {
+			return 0
+		}
+		return *v
+	}
+	at, _ := time.Parse(time.RFC3339, rl.ObservedAt)
+	return api.RateLimitsView(mockMeasured(llm.RateLimits{Model: rl.Model, Requests: rl.RequestsPerMinute, InputTokens: val(rl.InputTokensPerMinute),
+		OutputTokens: val(rl.OutputTokensPerMinute), Tokens: val(rl.TokensPerMinute), ObservedAt: at}), p.MaxConcurrency, p.RPM)
+}
+
+// mockMeasured adds the measured answers the mock pretends to have seen:
+// one-sentence translations as in the performance audit's T5 run (about
+// 2.3 s, 2000 uncached input and 300 output tokens each).
+func mockMeasured(l llm.RateLimits) llm.RateLimits {
+	l.Samples, l.MeanSeconds, l.MeanUncachedInput, l.MeanOutput = 20, 2.3, 2000, 300
+	return l
 }
 
 func (st *store) providerIndex(id string) int {
@@ -301,9 +354,22 @@ func (m *mock) putRole(w http.ResponseWriter, r *http.Request, s *store) {
 			return 0, nil, codedErr(http.StatusBadRequest, settings.CodeThinkingUnsupported, map[string]any{"provider": p.Name},
 				fmt.Sprintf("提供商「%s」不支持深度思考，请选择“关闭”", p.Name))
 		}
+		// v3.2.x (settings.checkParams): max_tokens 1..1e6, batch 1..20 and
+		// translate only; both shown as set, absent while unset
+		if role != model.RoleTranslate {
+			params.Batch = nil
+		} else if b := params.Batch; b != nil && (*b < 1 || *b > settings.MaxBatch) {
+			return 0, nil, codedErr(http.StatusBadRequest, settings.CodeBatchInvalid, map[string]any{"min": 1, "max": settings.MaxBatch},
+				fmt.Sprintf("每批翻译的句数必须在 1 到 %d 之间", settings.MaxBatch))
+		}
+		if mt := params.MaxTokens; mt != nil && (*mt < 1 || *mt > settings.MaxTokensLimit) {
+			return 0, nil, codedErr(http.StatusBadRequest, settings.CodeMaxTokensInvalid, map[string]any{"min": 1, "max": settings.MaxTokensLimit},
+				fmt.Sprintf("输出上限（max_tokens）必须是 1 到 %d 之间的整数", settings.MaxTokensLimit))
+		}
 		res := settings.ResolveParams(role, params)
 		pid := in.ProviderID
-		rv := api.RoleView{Role: role, Label: label, ProviderID: &pid, Model: &name, Temperature: *res.Temperature, Window: res.Window, Thinking: thinking}
+		rv := api.RoleView{Role: role, Label: label, ProviderID: &pid, Model: &name, Temperature: *res.Temperature, Window: res.Window, Thinking: thinking,
+			MaxTokens: res.MaxTokens, Batch: res.Batch}
 		if idx < 0 {
 			st.settings.Roles = append(st.settings.Roles, rv)
 		} else {
@@ -392,22 +458,44 @@ func (m *mock) putASR(w http.ResponseWriter, r *http.Request, s *store) {
 	})
 }
 
-// putGeneral mirrors settings.SetGeneral.
+// putGeneral mirrors settings.SetGeneral and the real handler's merge
+// (v3.2.x): a field the body leaves out keeps its value, null resets
+// auto_chapters / llm_idle_timeout_s to their defaults (absent).
 func (m *mock) putGeneral(w http.ResponseWriter, r *http.Request, s *store) {
-	var g model.GeneralSettings
-	if err := decodeBody(r, &g); err != nil {
+	var patch map[string]json.RawMessage
+	if err := decodeBody(r, &patch); err != nil {
 		writeErr(w, err)
 		return
 	}
-	if !(g.DailyBudget >= 0) || g.DailyBudget > 1e12 {
-		writeErr(w, errBad("每日预算必须是不小于 0 的数（0 表示不限制）"))
-		return
-	}
 	m.withSettings(w, r, s, func(st *store) (int, any, error) {
+		g := st.settings.General
+		g.AutoChapters, g.LLMIdleTimeoutS = clonePtr(g.AutoChapters), clonePtr(g.LLMIdleTimeoutS)
+		b, _ := json.Marshal(patch)
+		if err := json.Unmarshal(b, &g); err != nil {
+			return 0, nil, errBad("请求体不是有效的 JSON：" + err.Error())
+		}
+		// r4 T5: the checks and codes of settings.SetGeneral
+		if !(g.DailyBudget >= 0) || g.DailyBudget > 1e12 {
+			return 0, nil, codedErr(http.StatusBadRequest, settings.CodeBudgetInvalid, nil, "每日预算必须是不小于 0 的数（0 表示不限制）")
+		}
+		if v := g.LLMIdleTimeoutS; v != nil && *v != 0 && (*v < settings.MinLLMIdleTimeoutS || *v > settings.MaxLLMIdleTimeoutS) {
+			return 0, nil, codedErr(http.StatusBadRequest, settings.CodeIdleTimeoutInvalid,
+				map[string]any{"min": settings.MinLLMIdleTimeoutS, "max": settings.MaxLLMIdleTimeoutS},
+				fmt.Sprintf("模型请求的空闲超时必须是 0（关闭）或 %d 到 %d 之间的整数秒", settings.MinLLMIdleTimeoutS, settings.MaxLLMIdleTimeoutS))
+		}
 		st.settings.General = g
 		st.settingsChanged()
 		return http.StatusOK, st.settingsView(), nil
 	})
+}
+
+// clonePtr copies the value behind p (nil stays nil).
+func clonePtr[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
 }
 
 // ---------- providers ----------
@@ -656,6 +744,7 @@ func applyProviderInput(p *api.ProviderView, in api.ProviderInput) error {
 		if k := strings.TrimSpace(*in.APIKey); k != "" {
 			p.KeyHint = model.KeyHint(k) // the key itself is not kept
 			newKey = true
+			p.RateLimits = nil // another key may be another account (llm.RateLimits)
 		}
 	}
 	if oldBase != "" && !newKey && !settings.SameOrigin(oldBase, p.BaseURL) {

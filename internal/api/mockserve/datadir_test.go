@@ -25,7 +25,8 @@ func fastRestrict(t *testing.T) {
 }
 
 type restrictAnswer struct {
-	Check api.SystemCheck `json:"check"`
+	Check         api.SystemCheck `json:"check"`
+	RollbackReset bool            `json:"rollback_reset"`
 }
 
 func TestMockDataDirRows(t *testing.T) {
@@ -75,16 +76,25 @@ func TestMockRestrictDataDir(t *testing.T) {
 			t.Errorf("%s: %+v", sc, got.Check)
 		}
 		wantCatalogCode(t, sc+" answer", got.Check.DetailInfo, codes)
+		// the rollback state goes when others could change the folder
+		if got.RollbackReset != (sc == "datadir_shared") {
+			t.Errorf("%s: rollback_reset %v", sc, got.RollbackReset)
+		}
 		if c := systemChecks(t, srv.URL, sc)["data_dir"]; c.Status != "ok" || c.HintInfo != nil || c.DetailInfo.Code != "check.dir_writable" {
 			t.Errorf("%s after restricting: %+v", sc, c)
 		}
 	}
 	// a drive without permissions: 409 with the real server's code, the row stays
-	var body api.ErrorBody
+	// (and the rollback state went with the old permissions, as the real
+	// server says next to the error)
+	var body struct {
+		api.ErrorBody
+		RollbackReset bool `json:"rollback_reset"`
+	}
 	restrict("datadir_fat", http.StatusConflict, &body)
 	reason, _ := body.Error.Params["error"].(string)
-	if body.Error.Code != "data_dir.restrict_failed" || body.Error.Params["path"] != `E:\LectureFlow` || !strings.Contains(reason, "Everyone") {
-		t.Errorf("datadir_fat: %+v", body.Error)
+	if body.Error.Code != "data_dir.restrict_failed" || body.Error.Params["path"] != `E:\LectureFlow` || !strings.Contains(reason, "Everyone") || !body.RollbackReset {
+		t.Errorf("datadir_fat: %+v %v", body.Error, body.RollbackReset)
 	}
 	wantCatalogCode(t, "datadir_fat", &body.Error, codes)
 	if c := systemChecks(t, srv.URL, "datadir_fat")["data_dir"]; c.Status != "warn" || c.HintInfo == nil {

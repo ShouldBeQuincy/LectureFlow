@@ -9,7 +9,9 @@ package main
 //
 //	POST /api/system/data-dir/restrict  200 {"check": the data_dir row, ok};
 //	                                    409 data_dir.restrict_failed {path, error}
-//	                                    when other accounts can still reach it
+//	                                    when other accounts can still reach it;
+//	                                    "rollback_reset": true with either when
+//	                                    other accounts could change the folder
 //
 // Scenarios (GET /api/system turns the data_dir row into the server's
 // warning, with the hint check.hint_data_dir_restrict):
@@ -135,15 +137,23 @@ func (m *mock) restrictDataDir(w http.ResponseWriter, r *http.Request, s *store)
 		writeJSON(w, http.StatusOK, map[string]any{"check": dataDirOK(path)})
 		return
 	}
+	// other accounts could change it, the shell's profile lies in it (the
+	// default folder): the update's rollback state goes, also with a 409
+	rollbackReset := d.code == "check.data_dir_shared"
 	if d.stuck {
 		// internal/api/system_datadir.go restrictIncomplete
 		reason := "other accounts can still reach it (" + d.who + "): another account owns the folder, or the drive keeps no permissions (FAT, exFAT)"
-		writeErr(w, codedErr(http.StatusConflict, "data_dir.restrict_failed", map[string]any{"path": d.path, "error": reason}, reason))
+		info := model.ErrorInfo{Code: "data_dir.restrict_failed", Params: map[string]any{"path": d.path, "error": reason}, Detail: reason}
+		writeJSON(w, http.StatusConflict, map[string]any{"error": info, "rollback_reset": rollbackReset})
 		return
 	}
 	st := m.dataDirs()
 	st.mu.Lock()
 	st.done[sc] = true
 	st.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]any{"check": dataDirOK(d.path)})
+	out := map[string]any{"check": dataDirOK(d.path)}
+	if rollbackReset {
+		out["rollback_reset"] = true
+	}
+	writeJSON(w, http.StatusOK, out)
 }

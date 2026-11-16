@@ -32,6 +32,14 @@ const (
 	CodeUnpackFailed   = "components.unpack_failed"   // file
 	CodeIO             = "components.io"              // a local file operation failed
 	CodeLockMissing    = "components.lock_missing"    // id: the lock file is missing or does not match the manifest
+	// CodeRedirectRefused: the source redirected to an address the
+	// downloads do not follow (download.go "Redirects": this computer, the
+	// local network, plain http, more than five hops). Not transient: the
+	// same source answers the same, so the next source is tried at once,
+	// and the last one fails the task (SEC47 low-3; a mirror's falls back
+	// to the default, mirror_fallback's reason). Params: host (the
+	// redirect's, printable ASCII), file for a download's.
+	CodeRedirectRefused = "components.redirect_refused"
 
 	// Requests (HTTP 4xx in wave 2).
 	CodeUnknown             = "components.unknown"              // id
@@ -70,7 +78,7 @@ const (
 // wave 2).
 var ErrorCodes = []string{
 	CodeNetwork, CodeDiskFull, CodeChecksum, CodeHTTPStatus, CodeCancelled, CodeUVFailed,
-	CodeUVMissing, CodeVerifyFailed, CodeSelfTestFailed, CodeUnpackFailed, CodeIO, CodeLockMissing,
+	CodeUVMissing, CodeVerifyFailed, CodeSelfTestFailed, CodeUnpackFailed, CodeIO, CodeLockMissing, CodeRedirectRefused,
 	CodeUnknown, CodeUnavailable, CodeUnsupportedPlatform, CodeBusy, CodeInUse, CodeInUseByTask, CodeNotInstalled,
 	CodeBundled, CodeUpToDate, CodeTaskNotFound, CodeTaskState, CodePathTooLong,
 	CodeImportInvalid, CodeImportUnknown, CodeImportChecksum, CodeImportMissingDeps,
@@ -83,7 +91,9 @@ func cerr(code string, params map[string]any, err error) error {
 }
 
 // ErrorInfoOf returns the ErrorInfo of err (Detail = the error text); a
-// plain error becomes components.io.
+// plain error becomes components.io. A user name and password in a URL of
+// the text are removed (redactText): Detail reaches the log, the task's
+// status and the page.
 func ErrorInfoOf(err error) model.ErrorInfo {
 	var ce *model.CodedError
 	if errors.As(err, &ce) {
@@ -91,9 +101,10 @@ func ErrorInfoOf(err error) model.ErrorInfo {
 		if info.Detail == "" && ce.Err != nil {
 			info.Detail = ce.Err.Error()
 		}
+		info.Detail = redactText(info.Detail)
 		return info
 	}
-	return model.ErrorInfo{Code: CodeIO, Detail: err.Error()}
+	return model.ErrorInfo{Code: CodeIO, Detail: redactText(err.Error())}
 }
 
 // CodeOf returns the code of a coded error, "" otherwise.
@@ -120,7 +131,10 @@ func classify(err error) string {
 	if c := CodeOf(err); c != "" {
 		return c
 	}
+	var rr *redirectRefusedError
 	switch {
+	case errors.As(err, &rr):
+		return CodeRedirectRefused
 	case errors.Is(err, errCancelled), errors.Is(err, context.Canceled):
 		return CodeCancelled
 	case isDiskFull(err):
@@ -135,10 +149,19 @@ func classify(err error) string {
 	return CodeIO
 }
 
-// asCoded wraps a plain error with its classified code.
+// asCoded wraps a plain error with its classified code; a refused redirect
+// gets its host among the params.
 func asCoded(err error, params map[string]any) error {
 	if err == nil || CodeOf(err) != "" {
 		return err
+	}
+	var rr *redirectRefusedError
+	if errors.As(err, &rr) {
+		p := map[string]any{"host": printableHost(rr.host)}
+		for k, v := range params {
+			p[k] = v
+		}
+		return cerr(CodeRedirectRefused, p, err)
 	}
 	return cerr(classify(err), params, err)
 }

@@ -75,7 +75,7 @@ func fakeWorker(mode string) int {
 	}
 	var job map[string]any
 	_ = json.Unmarshal(jb, &job)
-	logFakeJob(job)
+	logFakeJob(job, in, out)
 	for _, k := range []string{"audio", "pdf"} {
 		if p, ok := job[k].(string); ok && !filepath.IsAbs(p) {
 			fmt.Fprintf(os.Stderr, "ERROR: job.%s %q is not absolute\n", k, p)
@@ -139,6 +139,13 @@ func fakeWorker(mode string) int {
 			return 1
 		}
 		return 0
+	case "argsenv": // worker_isolation_test.go: --out gets the arguments and the environment
+		b, _ := json.Marshal(map[string][]string{"args": os.Args[1:], "env": os.Environ()})
+		if err := os.WriteFile(out, b, 0o644); err != nil {
+			fmt.Fprintln(os.Stderr, "ERROR:", err)
+			return 1
+		}
+		return 0
 	case "chinese":
 		fmt.Fprint(os.Stderr, longChineseStderr())
 		return 1
@@ -168,26 +175,35 @@ func fakeWorker(mode string) int {
 // The same binary plays worker/asr_openvino.py (brief section 4): STATUS
 // preparing_model / compiling_model, ERROR_CODE lines, a partial --out file
 // at the moment of a kill. LF_FAKE_JOBLOG, when set, gets one JSON line per
-// invocation: {"script", "job"}.
+// invocation: {"script", "job", "cwd", "in", "out"}.
 
 const fakeJobLogEnv = "LF_FAKE_JOBLOG"
 
-func logFakeJob(job map[string]any) {
+func logFakeJob(job map[string]any, in, out string) {
 	p := os.Getenv(fakeJobLogEnv)
 	if p == "" {
 		return
 	}
-	script := ""
-	if len(os.Args) > 1 {
-		script = filepath.Base(os.Args[1])
-	}
-	b, _ := json.Marshal(map[string]any{"script": script, "job": job})
+	script := filepath.Base(fakeScriptArg())
+	cwd, _ := os.Getwd()
+	b, _ := json.Marshal(map[string]any{"script": script, "job": job, "cwd": cwd, "in": in, "out": out})
 	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
 	f.Write(append(b, '\n'))
+}
+
+// fakeScriptArg is the worker script the fake was started with: the first
+// argument after the interpreter's options ("-s"), "" without one.
+func fakeScriptArg() string {
+	for _, a := range os.Args[1:] {
+		if !strings.HasPrefix(a, "-") {
+			return a
+		}
+	}
+	return ""
 }
 
 // waitFlag waits (up to 10 s) for the file name in the working directory.
@@ -390,7 +406,7 @@ func fakeCheckpointWorker(jobJSON []byte, out string) int {
 	}
 	cj := job.Checkpoint
 	backend := model.BackendFasterWhisper
-	if len(os.Args) > 1 && filepath.Base(os.Args[1]) == "asr_openvino.py" {
+	if filepath.Base(fakeScriptArg()) == "asr_openvino.py" {
 		backend = model.BackendOpenVINO
 	}
 	writes := backend == model.BackendFasterWhisper || cj.ChunkS > 0
@@ -513,6 +529,10 @@ func (e *env) readCheckpoint(l model.Lecture) (devices.Checkpoint, bool) {
 type fakeJob struct {
 	Script string         `json:"script"`
 	Job    map[string]any `json:"job"`
+	// Cwd is the worker's working directory; In and Out its --in / --out.
+	Cwd string `json:"cwd"`
+	In  string `json:"in"`
+	Out string `json:"out"`
 }
 
 // fakeJobs reads the LF_FAKE_JOBLOG file: one fakeJob per worker run.

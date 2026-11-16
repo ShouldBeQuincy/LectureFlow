@@ -36,7 +36,7 @@
   /* text */
   --text-1: light-dark(#161a21, #e8eaee);
   --text-2: light-dark(#4b5261, #a8afba);
-  --text-3: light-dark(#7d8492, #737b88);
+  --text-3: light-dark(#616773, #8d949f);
   --text-on-accent: #ffffff;
 
   /* borders */
@@ -53,9 +53,9 @@
   --focus-ring: light-dark(#1f6feb, #5aa0ff);
 
   /* semantic */
-  --ok: light-dark(#1d8a4b, #4cc684);
+  --ok: light-dark(#1c7d45, #4cc684);
   --ok-soft: light-dark(#e3f4ea, #152c1f);
-  --warn: light-dark(#b05c00, #f0a94a);
+  --warn: light-dark(#a95800, #f0a94a);
   --warn-soft: light-dark(#fdf1df, #33250f);
   --err: light-dark(#c92f31, #ff7b78);
   --err-soft: light-dark(#fce9e9, #3a1719);
@@ -88,7 +88,7 @@
   --mk-auto: light-dark(#1f6feb, #5aa0ff);
   --mk-absorb: light-dark(#6b7280, #a0a7b1);
   --mk-decide: light-dark(#c0306a, #f472a8);
-  --mk-human: light-dark(#0f7c72, #5fd0c4);
+  --mk-human: light-dark(#0f766d, #5fd0c4);
 
   /* elevation */
   --shadow-color: light-dark(rgb(16 24 40 / 0.07), rgb(0 0 0 / 0.4));
@@ -350,6 +350,14 @@ main { padding: 24px 32px 64px; max-width: 1520px; margin: 0 auto; outline: none
 .page-title { font-family: var(--font-display); font-size: var(--fs-3xl); font-weight: 650; letter-spacing: -0.015em; line-height: 1.2; overflow-wrap: anywhere; }
 .page-sub { margin: 6px 0 0; color: var(--text-2); font-size: var(--fs-md); font-variant-numeric: tabular-nums; }
 .page-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* a narrow page (a browser at phone width): the head's buttons stay inside
+   the page and wrap a long label (R4 B2: ru "Обновить устаревшие лекции"
+   ran 7 / 22px out of main at 375 / 360) */
+@container (max-width: 480px) {
+  .page-actions { max-width: 100%; min-width: 0; }
+  .page-actions > .btn { max-width: 100%; height: auto; min-height: 32px; padding-top: 6px; padding-bottom: 6px; line-height: 1.25; white-space: normal; text-align: center; }
+  .page-actions > .btn > .icon { flex: none; }
+}
 .page-foot { margin-top: 16px; }
 
 .card {
@@ -365,6 +373,23 @@ main { padding: 24px 32px 64px; max-width: 1520px; margin: 0 auto; outline: none
 .card-title .icon { color: var(--text-3); }
 .card-count { padding: 1px 7px; border-radius: var(--r-pill); background: var(--bg-sunken); color: var(--text-2); font-size: var(--fs-xs); font-weight: 600; font-variant-numeric: tabular-nums; }
 .card-tools { display: flex; align-items: center; gap: 8px; }
+/* a narrow card (a browser at phone width; the desktop app is at least 880
+   wide): what stands right of the title (buttons, a hint) wraps onto a line
+   of its own, at the right, rather than squeeze the title under it (R4:
+   "Providers 3" ran under "Add provider" at 375); the title keeps its
+   content's width (min-width: auto, the flex default). Wider cards are as
+   they were. */
+@container (max-width: 480px) {
+  .card-hd { flex-wrap: wrap; row-gap: 8px; }
+  .card-hd > .card-title { min-width: auto; }
+  .card-hd > .card-title + * { margin-left: auto; }
+  /* R90: two buttons side by side were wider than the card (ru settings,
+     "Провайдеры": 337px from 93 to 430 at 360, the page 430 wide); they
+     wrap within the card, at the right, and a label longer than the card
+     wraps inside its button */
+  .card-hd > .card-tools { flex-wrap: wrap; justify-content: flex-end; min-width: 0; max-width: 100%; }
+  .card-hd > .card-tools > .btn { max-width: 100%; height: auto; min-height: 26px; white-space: normal; text-align: center; }
+}
 .card-hint { font-size: var(--fs-sm); color: var(--text-3); }
 .card-link { display: inline-flex; align-items: center; gap: 2px; font-size: var(--fs-sm); color: var(--text-2); text-decoration: none; border-radius: var(--r-sm); padding: 2px 4px; }
 .card-link:hover { color: var(--accent-text); }
@@ -388,16 +413,29 @@ main { padding: 24px 32px 64px; max-width: 1520px; margin: 0 auto; outline: none
 }
 .btn:hover:not(:disabled) { background: color-mix(in srgb, var(--bg-card) 92%, var(--text-1)); border-color: var(--border-3); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+/* display above would beat the hidden attribute (the player's chapters
+   button showed while the chapters were loading) */
+.btn[hidden] { display: none; }
+/* busy but keeping the keyboard focus (aria-disabled instead of disabled,
+   e.g. "Test connection" while it runs): looks like :disabled; no pointer
+   events, so no hover, press or click. With the keyboard focus it is not
+   faded (opacity would fade the focus ring too) but drawn as an inactive
+   grey button, whatever its kind, so the ring stays at full strength and
+   the button still reads as unavailable */
+.btn[aria-disabled="true"] { opacity: 0.5; pointer-events: none; }
+.btn[aria-disabled="true"]:focus-visible { opacity: 1; background: var(--bg-sunken); border-color: var(--border-1); color: var(--text-3); box-shadow: none; }
 .btn .icon { color: currentColor; opacity: 0.85; }
 .btn-sm, .btn-small { height: 26px; padding: 0 9px; gap: 5px; font-size: var(--fs-sm); border-radius: 7px; }
 .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); box-shadow: 0 1px 2px color-mix(in srgb, var(--accent) 40%, transparent); }
 .btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
 .btn-primary .icon { opacity: 1; }
 .btn-warn { background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 35%, transparent); color: var(--warn); box-shadow: none; }
-.btn-warn:hover:not(:disabled) { background: color-mix(in srgb, var(--warn-soft) 70%, var(--warn) 12%); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
+/* the darker fill takes the label towards --text-1, so it keeps 4.5:1 (T7,
+   T8: plain --warn was 3.98 there in the light theme) */
+.btn-warn:hover:not(:disabled) { background: color-mix(in srgb, var(--warn-soft) 70%, var(--warn) 12%); border-color: color-mix(in srgb, var(--warn) 55%, transparent); color: color-mix(in srgb, var(--warn) 80%, var(--text-1)); }
 .btn-danger { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border-2)); }
 .btn-danger:hover:not(:disabled) { background: var(--err-soft); border-color: color-mix(in srgb, var(--err) 60%, transparent); }
-.btn-danger-solid { background: var(--err); border-color: var(--err); color: #fff; }
+.btn-danger-solid { background: var(--err); border-color: var(--err); color: light-dark(#fff, var(--inverse-fg)); }
 .btn-danger-solid:hover:not(:disabled) { background: color-mix(in srgb, var(--err) 88%, #000); border-color: transparent; }
 .btn-ghost, .btn-quiet { background: transparent; border-color: transparent; box-shadow: none; color: var(--text-2); }
 .btn-ghost:hover:not(:disabled), .btn-quiet:hover:not(:disabled) { background: var(--bg-hover); border-color: transparent; color: var(--text-1); }
@@ -409,8 +447,10 @@ main { padding: 24px 32px 64px; max-width: 1520px; margin: 0 auto; outline: none
   display: inline-grid; place-items: center; border-radius: var(--r-pill);
   background: var(--bg-sunken); color: var(--text-2); font-size: 10.5px; font-weight: 600; font-variant-numeric: tabular-nums;
 }
-.btn-primary .btn-count { background: rgb(255 255 255 / 0.22); color: inherit; }
-.btn-warn .btn-count { background: color-mix(in srgb, var(--warn) 18%, transparent); color: inherit; }
+/* the counts reach 4.5:1 (N41): darker than the light blue fill, lighter
+   than the dark one; on a warning button the amber text is deepened */
+.btn-primary .btn-count { background: light-dark(rgb(0 0 0 / 0.2), rgb(255 255 255 / 0.22)); color: inherit; }
+.btn-warn .btn-count { background: color-mix(in srgb, var(--warn) 18%, transparent); color: color-mix(in srgb, var(--warn) 70%, var(--text-1)); }
 .btn-inverse .btn-count, .btn-inverse-danger .btn-count { background: var(--inverse-btn-hover); color: inherit; }
 .btn-caret { margin-right: -3px; opacity: 0.6 !important; }
 .btn kbd { font-size: 10px; padding: 0 4px; border-radius: 3px; border: 1px solid currentColor; opacity: 0.7; }
@@ -523,6 +563,9 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
 .pipe-segs { flex: 1; min-width: 0; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 3px; }
 .pipe-pct { flex: none; width: 2.9em; text-align: right; font-size: var(--fs-xs); font-weight: 600; color: var(--accent-text); font-variant-numeric: tabular-nums; }
 .pipe-pct:empty { visibility: hidden; }
+/* the lecture page's large bar: room for a longer figure, on one line
+   (were inline styles in pipeline.js) */
+.pipe-lg .pipe-pct { width: auto; min-width: 2.9em; white-space: nowrap; }
 /* the share a queued stage keeps in its checkpoint (nothing runs) */
 .pipe-pct.is-ckpt { color: var(--text-2); font-weight: 500; }
 .seg-wrap { position: relative; min-width: 0; display: flex; flex-direction: column; }
@@ -544,6 +587,14 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
 .seg:hover .seg-bar { filter: brightness(0.94) saturate(1.1); }
 .seg-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; border-radius: inherit; }
 .seg-name { margin-top: 2px; font-size: var(--fs-xs); color: var(--text-3); text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* a page too narrow for the names under the lecture page's bar (about 33px
+   a segment at phone width: "Pr…", "Tra…"; user 2026-11-11: hide them).
+   The names are aria-hidden: each segment is named by its aria-label, and
+   its card is headed by the stage's name, so nothing is lost to a screen
+   reader or to the card */
+@container (max-width: 480px) {
+  .pipe-lg .seg-name { display: none; }
+}
 
 .seg[data-st="pending"] .seg-bar { background: var(--st-pending); }
 .seg[data-st="queued"] .seg-bar {
@@ -583,6 +634,27 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
 .seg-wrap:hover .seg-card, .seg-wrap:focus-within .seg-card { display: block; animation: lf-pop var(--dur) var(--ease); }
 /* Esc closed it (3.2.0 L13): hidden until the pointer and the focus have left */
 .seg-wrap.is-dismissed .seg-card, .seg-wrap.is-dismissed:hover .seg-card, .seg-wrap.is-dismissed:focus-within .seg-card { display: none; }
+/* narrow windows (a browser at phone width; the desktop app is at least
+   880 wide): a 330px card hung from its segment ran off the right edge (the
+   first stages) or the left one (the last stages, their buttons out of
+   reach). There:
+   - the lecture page's large bar (on the left of its row) gives the card
+     its own width, at least 240px, growing away from its own side;
+   - the small bars (lecture rows, glossary, materials, dashboard), often
+     at the right of a row, give it the width of the enclosing card (.card
+     or another positioned block of the content column): no position on
+     .pipe or .seg-wrap, left and right 0, and the vertical place left to
+     the static position, right under the segment (.seg-wrap as a block);
+     opened upwards it is moved up by its height plus the segment's 20px. */
+@media (max-width: 640px) {
+  .pipe-lg { position: relative; }
+  .pipe-lg .seg-wrap { position: static; }
+  .pipe-lg .seg-card { left: 0; right: auto; width: 100%; min-width: min(240px, calc(100vw - 32px)); max-width: none; }
+  .pipe-lg .seg-card-end { left: auto; right: 0; }
+  .pipe:not(.pipe-lg) .seg-wrap { position: static; display: block; }
+  .pipe:not(.pipe-lg) .seg-card { top: auto; bottom: auto; left: 0; right: 0; width: auto; max-width: calc(100vw - 32px); }
+  .pipe:not(.pipe-lg) .seg-up .seg-card { padding-top: 0; padding-bottom: 4px; translate: 0 calc(-100% - 20px); }
+}
 .seg-card-body {
   background: var(--bg-raised); color: var(--text-1);
   border: 1px solid var(--border-2); border-radius: var(--r-lg); box-shadow: var(--shadow-lg);
@@ -618,7 +690,20 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
   background: var(--err-soft); color: var(--err); border-radius: var(--r-sm); font-size: 11px; line-height: 1.5;
 }
 .card-warning .card-errtext { background: var(--warn-soft); color: var(--warn); max-height: 240px; }
+/* a stage card's folded error detail; were inline styles (R7, for the
+   lecture page's line) */
+.card-errdetail { margin: 4px 0 6px; }
+.card-errdetail > summary { cursor: pointer; color: var(--text-3); }
 .card-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-1); }
+/* v3.2.x: "临时指定" on the model line */
+.card-manual { height: 16px; padding: 0 5px; font-size: 10px; vertical-align: 1px; }
+/* v3.2.x: the tokens of each attempt, one line each */
+.card-attempt-line { display: block; }
+/* v3.2.x: the retry model dialog ("临时指定" fields, the translate note) */
+.dlg-retry-model [hidden] { display: none !important; }
+.dlg-retry-model .dlg-manual { margin: 12px 0 0 26px; }
+.dlg-retry-model .dlg-manual .select { width: 100%; }
+.dlg-retry-model .dlg-field-error { margin-top: 8px; }
 
 .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; padding: 10px 16px 12px; border-top: 1px solid var(--border-1); font-size: var(--fs-xs); color: var(--text-3); }
 .legend-item { display: inline-flex; align-items: center; gap: 6px; }
@@ -645,6 +730,12 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
 .lt.is-empty .lt-head { display: none; }
 .lt-h-end { text-align: right; }
 .lt-check { display: flex; align-items: center; justify-content: center; }
+/* r8-web-lecture WL-12 (R70 low 2): a click on the check box's cell is one
+   on the box (lecture_list.js cellClicks), so the cell fills the row's
+   height (into its 8px padding) and the header's: the wider hit area the
+   box's ::after gave in Chromium only */
+.lrow > .lt-check { align-self: stretch; margin: -8px 0; cursor: pointer; }
+.lt-head > .lt-check { align-self: stretch; cursor: pointer; }
 .lrow { min-height: 60px; padding-top: 8px; padding-bottom: 8px; border-top: 1px solid var(--border-1); transition: background-color var(--dur); }
 .lrow:hover { background: var(--bg-hover); }
 .lrow.is-selected { background: var(--bg-selected); }
@@ -662,16 +753,81 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
 .lrow-meta { flex: 0 100 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text-3); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .lrow-meta::before { content: "·"; margin-right: 8px; color: var(--border-3); }
 .lrow-pipe { min-width: 0; }
-.lrow-end { display: flex; align-items: center; justify-content: flex-end; gap: 4px; min-width: 0; }
-.lrow-end .btn { margin-right: 4px; }
+/* 8px beside the primary action on one line (it had a 4px right margin
+   besides the 4px gap); no margin, so on two lines it ends at the same
+   right edge as the line under it (T18: it stopped 4px short) */
+.lrow-end { display: flex; align-items: center; justify-content: flex-end; min-width: 0; flex-wrap: wrap; row-gap: 4px; column-gap: 8px; }
+/* The actions column has one width for every row (196px; each .lrow is a
+   grid of its own, so it cannot be max-content and stay aligned). Actions
+   that do not fit wrap inside it, in DOM order (T18c: ru's "Смотреть +
+   К проверке: 3 + ⋯" ran 23px out over the stage bar, a four-action row
+   64px): first the review chip, the downloads and the menu (.lrow-tail)
+   go under the primary action, then the tail wraps inside, the chip on
+   one line and the downloads + menu (.lrow-dlmenu, never split: the menu
+   is never alone, T16 D3) on the next. Rows that fit stay on one line. */
+.lrow-tail { display: inline-flex; flex: 0 1 auto; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 4px; row-gap: 4px; max-width: 100%; min-width: 0; }
+.lrow-dlmenu { display: inline-flex; flex: none; align-items: center; gap: 4px; }
 .lec-empty { padding: 16px; }
 .lec-empty p { text-align: center; margin-top: 10px; }
 
 @container (max-width: 760px) {
   .lt { --lt-cols: 22px var(--lt-kind-w) minmax(0, 1fr) auto; }
-  .lt-head > :nth-child(4) { display: none; }
+  /* the progress column's head: its bar moved under the title; hidden from
+     view only (R34b: display: none took it from screen readers' table
+     navigation too, the desktop app at 1280 with both side panels open
+     included), out of the grid's flow as .visually-hidden */
+  .lt-head > :nth-child(4) { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
   .lrow-pipe { grid-column: 3 / 5; grid-row: 2; margin-top: 4px; }
   .lrow-end { grid-column: 4; grid-row: 1; }
+}
+/* a list too narrow for the kind, the title and the actions side by side
+   (a browser at phone width; the desktop app is at least 880 wide): the
+   kind and the actions on the first line, the title with its status on a
+   line of its own under them, the stage bar under that as wide as the row
+   (T8: the title column was squeezed to 0 and the bar's segments to half
+   a pixel) */
+@container (max-width: 480px) {
+  .lt { --lt-cols: 22px minmax(4em, 1fr) auto; }
+  /* the heads of the columns that moved under the kind: hidden from view
+     only, so a screen reader's table navigation keeps them (R34); out of
+     the grid's flow (absolute), so they take no room (as .visually-hidden) */
+  .lt-head > :nth-child(n+3) { display: block; position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .lrow { row-gap: 2px; }
+  .lrow > .lt-check { grid-column: 1; grid-row: 1; }
+  .lrow-kind { grid-column: 2; grid-row: 1; }
+  /* the actions wrap (Play, "3 to review", the menu) rather than leave the
+     kind no room; in their DOM order, so the Tab order is the order they
+     are seen in (R34b: no order, no reversed wrap). "3 to review", the
+     downloads and the menu are one unit (.lrow-tail): when they do not fit
+     beside the primary action they go to the second line together (T16
+     D3, R58: the menu was alone on a line of its own). Where that line is
+     too narrow for the tail as well (360 wide), the tail wraps inside it
+     (below), so a row can take three lines. */
+  /* flex-wrap and row-gap repeat the wide rule (T18c): kept here, where
+     the phone-width layout is read and checked */
+  .lrow-end { grid-column: 3; grid-row: 1; flex-wrap: wrap; row-gap: 4px; }
+  /* T18 N1: in an actions column too narrow for the whole tail (84px at
+     360 wide) it shrinks to the cell and wraps inside, the review chip on
+     one line and the downloads + menu on the next, right-aligned, in DOM
+     order; it no longer runs out to the left over the kind. The same as
+     the wide rule since T18c, repeated here for the same reason */
+  .lrow-tail { flex: 0 1 auto; flex-wrap: wrap; justify-content: flex-end; row-gap: 4px; max-width: 100%; min-width: 0; }
+  .lrow-main { grid-column: 2 / -1; grid-row: 2; }
+  .lrow-pipe { grid-column: 2 / -1; grid-row: 3; margin-top: 4px; }
+  /* status and warning chip on one line (the chip wraps under a long
+     status), the meta always on a line of its own, without its "·" */
+  .lrow-sub { flex-wrap: wrap; row-gap: 2px; }
+  /* a warning chip wider than the row wraps and shows all of its text
+     (R34b: cut with "…" a mouse user could not read the rest; its title is
+     a hint, not the text) */
+  .lrow-sub > .chip { max-width: 100%; height: auto; min-height: 20px; padding-top: 2px; padding-bottom: 2px; overflow: hidden; white-space: normal; overflow-wrap: anywhere; line-height: 1.3; border-radius: 10px; }
+  .lrow-meta { flex-basis: 100%; }
+  .lrow-meta::before { content: none; }
+  /* the status takes up to three lines, the meta two, rather than one cut
+     with "…": the full text was only in a title a touch screen cannot show
+     (148 of 349px at 360, T23 general 11) */
+  .lrow-status, .lrow-meta { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; white-space: normal; overflow-wrap: anywhere; }
+  .lrow-status { -webkit-line-clamp: 3; line-clamp: 3; }
 }
 
 .batchbar {
@@ -694,6 +850,16 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
 /* =========================================================================
    8. Dashboard (v1.1 A9)
    ========================================================================= */
+
+/* T28 S1 (convention C1): the dashboard's render() clears the page and
+   builds it again on every refresh (SSE, a dialog cancelled), and the
+   browser's scroll anchoring, anchored on the focused control, moved the
+   page up by the height above the cards (174-192px) each time. The page's
+   own fix is view_dashboard.js keeping its scroll position (r9-web-dash
+   WD-01); this rule is the second line: no anchor is taken in the
+   dashboard, so a rebuild leaves the page where it was. Other pages keep
+   the browser's anchoring. */
+.page-dashboard { overflow-anchor: none; }
 
 /* wide: main column (in progress, recently finished) + side column (to-do,
    usage); narrower: one flow, to-do and usage side by side, equal height */
@@ -742,17 +908,32 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
 @container (max-width: 560px) {
   .ip-list { grid-template-columns: max-content minmax(0, max-content) minmax(0, 1fr); }
   .ip-pipe { grid-column: 1 / -1; padding: 6px 0 0; }
+  /* the status (what runs, what it waits for) takes up to three lines
+     rather than one cut with "…" (182 of 347px at 360, T23 general 11) */
+  .ip-status { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; white-space: normal; overflow-wrap: anywhere; }
+}
+/* a narrow card (a browser at phone width): code and kind took the whole
+   first line and left the title 0 wide (T8); the title and its status get
+   a line of their own under them, the stage bar the next one */
+@container (max-width: 460px) {
+  .ip-row { row-gap: 2px; }
+  .ip-main { grid-column: 1 / -1; grid-row: 2; }
+  .ip-pipe { grid-row: 3; }
 }
 
 .todo { display: flex; flex-direction: column; }
 .todo-group { padding: 12px 0; border-top: 1px solid var(--border-1); }
 .todo-group:first-child { border-top: 0; padding-top: 2px; }
-.todo-head { display: flex; align-items: center; gap: 8px; min-height: 26px; }
+.todo-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; min-height: 26px; }
 .todo-icon { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 7px; background: var(--bg-sunken); color: var(--text-2); flex: none; }
 .todo-group.is-error .todo-icon { background: var(--err-soft); color: var(--err); }
 .todo-title { font-weight: 600; }
 .todo-count { font-weight: 600; color: var(--text-3); font-variant-numeric: tabular-nums; }
-.todo-action { margin-left: auto; }
+/* R4 S3: a long label (ru) takes the next line, and wraps there rather
+   than run under the inspector rail */
+.todo-action { margin-left: auto; max-width: 100%; }
+.todo-action > .btn { max-width: 100%; height: auto; min-height: 26px; padding-top: 4px; padding-bottom: 4px; line-height: 1.25; white-space: normal; text-align: center; }
+.todo-action > .btn > .icon { flex: none; }
 .todo-sub { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0 32px; }
 .todo-chip { display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 4px 0 8px; border-radius: var(--r-pill); background: var(--bg-sunken); color: var(--text-2); font-family: var(--font-mono); font-size: 11.5px; text-decoration: none; }
 .todo-chip b { display: inline-grid; place-items: center; min-width: 16px; height: 16px; padding: 0 4px; border-radius: var(--r-pill); background: var(--bg-card); color: var(--text-1); font-family: var(--font-sans); font-size: 10.5px; }
@@ -785,14 +966,33 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
 @container (max-width: 460px) {
   .lgrid-review .todo-link-title { grid-column: 1 / -1; grid-row: 2; }
   .lgrid-review .todo-link { row-gap: 1px; }
+  /* the kind takes the rest of the first line, up to the count and the
+     arrow, which keep their places so the title keeps its whole line
+     (T28 suggestion 7; moving them to the title's line, C154c, took the
+     title from 150 to 106px at 360) */
+  .lgrid-review .lref-tag { grid-column: 2 / 4; grid-row: 1; }
   .lgrid-fail .fail-title { grid-column: 1 / 4; grid-row: 2; }
-  .fail-end { grid-row: 1; }
+  /* the kind takes the rest of the first line and Retry goes to the
+     title's line, whose fourth column it kept free anyway: beside Retry
+     the kind was 5px wide at 360 (R70 (f), as T23 general 2) */
+  .lgrid-fail .lref-tag { grid-column: 2 / -1; grid-row: 1; }
+  .fail-end { grid-row: 2; }
   .fail-sub { grid-column: 1 / -1; }
 }
 .fail-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-1); font-weight: 500; text-decoration: none; }
 .fail-title:hover { text-decoration: underline; text-underline-offset: 3px; }
 .fail-meta { font-size: var(--fs-xs); color: var(--text-3); }
-.fail-err { margin-top: 3px; padding: 4px 7px; border-radius: var(--r-sm); background: var(--err-soft); color: var(--err); font-family: var(--font-mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* why it failed, the whole sentence at any width: its way out ends it, a
+   cut took it away (T23 general 11, T24 G1; .fail-err cut it to one line,
+   or three in a narrow card) */
+.fail-why { margin-top: 3px; padding: 4px 7px; border-radius: var(--r-sm); background: var(--err-soft); color: var(--err); font-family: var(--font-mono); font-size: 11px; white-space: normal; overflow-wrap: anywhere; }
+/* what to do instead of a plain retry (a damaged file, another model) */
+.fail-hint { margin-top: 3px; color: var(--text-2); }
+/* a reason several lectures failed for heads its rows: the dashed line
+   goes above the head, none between it and its first row */
+.lgrid-fail .fail-reason { padding: 7px 0 2px; border-top: 1px dashed var(--border-1); }
+.lgrid-fail .fail-reason:first-child { border-top: 0; }
+.lgrid-fail .fail-reason + .fail-row { border-top: 0; }
 
 /* recently finished: code | kind | title | badge (reserved) | date | length | cost | actions */
 .rd-list { grid-template-columns: max-content minmax(0, max-content) minmax(0, 1fr) max-content max-content max-content max-content max-content; column-gap: 12px; }
@@ -811,6 +1011,34 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
   .rd-m { justify-self: auto; }
   .rd-m:empty { display: none; }
   .rd-end { grid-row: 1; grid-column: 5; }
+}
+/* narrower still (a phone-width browser): the title on a line of its own
+   under code and kind, the figures under it (as the in-progress list) */
+@container (max-width: 460px) {
+  .rd-title { grid-column: 1 / -1; grid-row: 2; }
+  /* "N to review" has a place of its own: left to the grid, it went into
+     the first line's empty title column and, aligned to its end, covered
+     the code and kind (T11). At the end of the title's line it left the
+     title 94px of 182 at 360 (T28 suggestion 7): it takes a line of its
+     own under the title, at the start, before the figures and actions
+     (in the order of the row's content), and the title keeps its line. */
+  .rd-badge { grid-column: 4 / -1; grid-row: 2; }
+  .rd-row.has-review .rd-badge { grid-column: 1 / -1; grid-row: 3; justify-self: start; }
+  .rd-row.has-review .rd-meta, .rd-row.has-review .rd-end { grid-row: 4; }
+  /* the kind takes the rest of the first line, the actions go to the end
+     of the figures' line: beside the actions the kind ("Week 3 · Lecture")
+     was 5–16px wide at 360 (T23 general 2) */
+  .rd-row > .lref-tag { grid-column: 2 / -1; grid-row: 1; }
+  .rd-meta { grid-column: 1 / 5; grid-row: 3; }
+  .rd-end { grid-row: 3; }
+}
+/* narrowest (a 360px window: the card's content 182px wide, 236 at 414):
+   the date, the length and the cost did not fit the 106px beside the
+   actions and took two lines on almost every row, 12px higher each (R70
+   low 3); a smaller gap was not enough (en 121px, ru 131). The cost is left
+   out here (the lecture page and the usage card show it). */
+@container (max-width: 200px) {
+  .rd-m2 { display: none; }
 }
 
 .ucard { display: flex; flex-direction: column; gap: 14px; }
@@ -831,8 +1059,10 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
 .urow-cache { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px; margin-top: 6px; font-size: var(--fs-xs); }
 .urow-rate { font-weight: 600; font-variant-numeric: tabular-nums; min-width: 3.4em; text-align: right; }
 
-.ccards { display: grid; grid-template-columns: repeat(auto-fill, minmax(208px, 1fr)); gap: 12px; }
-.ccards-lg { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; }
+/* min(…, 100%): narrower than one card's minimum, the one column is as
+   wide as the list (360: the 240px card ran 24px out of main, T23 general 6) */
+.ccards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(208px, 100%), 1fr)); gap: 12px; }
+.ccards-lg { grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr)); gap: 14px; }
 .ccard {
   position: relative; display: flex; flex-direction: column; gap: 4px; min-width: 0;
   padding: 12px 14px; border: 1px solid var(--border-1); border-radius: var(--r-lg);
@@ -841,6 +1071,15 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
 }
 .card .ccard { background: var(--bg-content); }
 .ccard:hover { border-color: var(--border-2); box-shadow: var(--shadow-md); }
+/* r8-web-dash WD-03 (T22 G15): a course card's visible "⋯" (course_card.js),
+   the link's sibling in a wrapper that takes the card's place in the grid;
+   at the card's top right, the top line leaving it room; the card looks
+   hovered while the pointer is on its "⋯" too. Its focus ring is the
+   global :focus-visible one; on a touch screen it reaches 40px (below). */
+.ccard-wrap { position: relative; display: grid; min-width: 0; }
+.ccard-wrap > .ccard-more { position: absolute; top: 8px; right: 8px; }
+.ccard-wrap > .ccard .ccard-top { padding-right: 26px; }
+.ccard-wrap:hover > .ccard { border-color: var(--border-2); box-shadow: var(--shadow-md); }
 .ccard-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .ccard-code { font-family: var(--font-mono); font-size: var(--fs-xs); font-weight: 600; color: var(--accent-text); letter-spacing: 0.03em; }
 .ccard-code.is-none { color: var(--text-3); font-family: var(--font-sans); font-weight: 500; letter-spacing: 0; }
@@ -933,7 +1172,9 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
 .insp-rail { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 12px 0; }
 .insp-rail .insp-toggle { margin: 0 0 4px; }
 .rail-stat { display: flex; flex-direction: column; align-items: center; gap: 1px; width: 100%; color: var(--text-3); cursor: default; }
-.rail-k { font-size: 9.5px; letter-spacing: 0.03em; }
+/* 9px untracked: "Temperature" (en) fits the 51px rail (at 9.5px tracked it
+   was 56px, both ends cut, R4 D1); a longer label ends in "…" */
+.rail-k { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; letter-spacing: 0; }
 .rail-v { font-size: 11.5px; font-weight: 600; color: var(--text-1); font-variant-numeric: tabular-nums; }
 .rail-stat.is-warn, .rail-stat.is-warn .rail-v { color: var(--warn); }
 
@@ -947,6 +1188,9 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
   background: var(--bg-raised); color: var(--text-1); box-shadow: var(--shadow-lg);
   animation: lf-pop var(--dur) var(--ease);
   outline: none;
+  /* a menu limited in height scrolls inside (menu.js); at its end the wheel
+     must not scroll the page, which would close it (T21 M1) */
+  overscroll-behavior: contain;
 }
 .ctx-item {
   display: grid; grid-template-columns: 18px minmax(0, 1fr) auto 14px; align-items: center; gap: 8px;
@@ -959,7 +1203,22 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
 .ctx-icon { display: grid; place-items: center; color: var(--text-3); }
 .ctx-label { overflow: hidden; text-overflow: ellipsis; }
 .ctx-hint { font-size: var(--fs-xs); color: var(--text-3); font-variant-numeric: tabular-nums; }
+/* on the highlighted item (--bg-active, or --bg-hover, over --bg-raised) the
+   dark --text-3 was 3.59 / 4.16:1; a lighter grey of the same hue (the
+   channel steps of #8d949f: +7, +11) reaches 4.5 (contrast_test.go and
+   testdata/contrast_test.mjs) */
+.ctx-item:focus .ctx-hint, .ctx-item[aria-expanded="true"] .ctx-hint { color: light-dark(var(--text-3), #a3aab5); }
 .ctx-arrow { display: grid; place-items: center; color: var(--text-3); }
+/* an item with a description (menu.js desc, T22 S4): the label's line as
+   any item's, the description under the label and the hint, wrapping
+   within the menu's width (a menu is at most 340px wide) */
+.ctx-item.has-desc { height: auto; min-height: 30px; padding: 5px 8px; row-gap: 1px; }
+.ctx-item.has-desc > .ctx-icon, .ctx-item.has-desc > .ctx-label { grid-row: 1; }
+.ctx-item.has-desc > .ctx-hint { grid-row: 1; grid-column: 3; }
+.ctx-item.has-desc > .ctx-arrow { grid-row: 1; grid-column: 4; }
+.ctx-desc { grid-row: 2; grid-column: 2 / 4; font-size: var(--fs-xs); line-height: 1.35; color: var(--text-3); white-space: normal; overflow-wrap: anywhere; }
+/* on the highlighted item, the lighter grey of its hint (contrast) */
+.ctx-item:focus .ctx-desc, .ctx-item[aria-expanded="true"] .ctx-desc { color: light-dark(var(--text-3), #a3aab5); }
 .ctx-item.is-danger, .ctx-item.is-danger .ctx-icon { color: var(--err); }
 .ctx-item.is-danger:focus { background: var(--err-soft); }
 .ctx-sep { height: 1px; margin: 4px 6px; background: var(--border-1); }
@@ -1036,6 +1295,24 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
 .toast-count { font-size: var(--fs-xs); color: var(--text-3); margin-top: 2px; }
 .toast-close { display: grid; place-items: center; width: 22px; height: 22px; border: 0; border-radius: var(--r-sm); background: none; color: var(--text-3); cursor: pointer; }
 .toast-close:hover { background: var(--bg-hover); color: var(--text-1); }
+/* T28 G6, R86 L4: the notices that stay until closed (a failed recording
+   fetch, one each, with its file's name) had no limit and stacked up the
+   window. The newest show, as many as stay within about half the window's
+   height; the older ones are hidden, not removed, and come back as newer
+   ones are closed or expire (a text told again is the newest, dom.js).
+   Measured with the longest (a failed fetch with its retry window): 120 /
+   178 / 198px each (zh-CN / en / ru) at 440px wide, so three need a window
+   about 1250px high (ru: 610px; R90b L6, three took 609 of 1024 at
+   768x1024), two 640; in a window up to 480px wide two took 403px of 740
+   at 360, 481 of 896 at 414 (ru), so there two from 970px high, else one.
+   A wizard keeps its own four (below). */
+:not(.wiz) > .toasts > .toast:nth-last-child(n+4) { display: none; }
+@media (max-height: 1249px), (max-width: 480px) {
+  :not(.wiz) > .toasts > .toast:nth-last-child(n+3) { display: none; }
+}
+@media (max-height: 639px), (max-width: 480px) and (max-height: 969px) {
+  :not(.wiz) > .toasts > .toast:nth-last-child(n+2) { display: none; }
+}
 
 /* =========================================================================
    13. Course page: uploads, materials, glossary
@@ -1142,11 +1419,17 @@ a.chip-review:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn)
 /* ---- glossary ---- */
 
 .card-sub { font-size: var(--fs-xs); font-weight: 500; color: var(--text-3); font-variant-numeric: tabular-nums; }
-.term-filters { flex-wrap: wrap; justify-content: flex-end; }
-.term-search { width: 210px; height: 28px; font-size: var(--fs-sm); }
+.term-filters { flex-wrap: wrap; justify-content: flex-end; min-width: 0; max-width: 100%; }
+.term-search { width: 210px; max-width: 100%; height: 28px; font-size: var(--fs-sm); }
 .term-source { height: 28px; font-size: var(--fs-sm); }
+/* R4 S2: the header wraps (the filters under the title) rather than squeeze
+   the title to 0 under the search box */
+.card-terms > .card-hd { flex-wrap: wrap; }
+.card-terms > .card-hd > .card-title { flex: none; max-width: 100%; }
 .term-tools { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px 20px; margin: 0 0 12px; }
-@container (max-width: 900px) { .term-tools { grid-template-columns: 1fr; } }
+/* minmax(0, …): a plain 1fr was as wide as the 240px input (R4 S2), and the
+   form and its note ran out of the card */
+@container (max-width: 900px) { .term-tools { grid-template-columns: minmax(0, 1fr); } }
 .term-add { display: flex; gap: 6px; flex-wrap: wrap; }
 .term-add .input { height: 30px; width: 180px; }
 .term-add .input + .input { width: 240px; }
@@ -1199,8 +1482,11 @@ table.terms, table.checks, table.table { width: 100%; border-collapse: collapse;
 .jan-icon { display: grid; place-items: center; flex: none; width: 30px; height: 30px; border-radius: 9px; background: var(--accent-soft); color: var(--accent-text); }
 .jan-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .jan-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-height: 20px; font-size: var(--fs-md); }
-.jan-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 0; font-size: var(--fs-sm); color: var(--text-2); font-variant-numeric: tabular-nums; }
-.jan-meta > span + span::before { content: "·"; margin: 0 7px; color: var(--text-3); }
+/* the "·" between the parts sits in the column gap; a part that starts a
+   line has its "·" left of the box, clipped (R4 D4: it led the new line) */
+.jan-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 15px; overflow: hidden; font-size: var(--fs-sm); color: var(--text-2); font-variant-numeric: tabular-nums; }
+.jan-meta > span { position: relative; min-width: 0; overflow-wrap: anywhere; }
+.jan-meta > span + span::before { content: "·"; position: absolute; left: -15px; width: 15px; text-align: center; color: var(--text-3); }
 .jan-model { font-weight: 500; color: var(--text-1); }
 .jan-model.is-rule { font-weight: 400; color: var(--text-2); }
 .jan-note { display: flex; align-items: flex-start; gap: 6px; margin: 4px 0 0; font-size: var(--fs-sm); color: var(--text-2); line-height: 1.5; }
@@ -1212,6 +1498,10 @@ table.terms, table.checks, table.table { width: 100%; border-collapse: collapse;
 @container (max-width: 760px) {
   .jan-bar { flex-wrap: wrap; }
   .jan-actions { max-width: none; width: 100%; justify-content: flex-start; padding-left: 42px; }
+  /* R4 B3: a button wider than the indented row wraps its label ("View
+     cleanup report" ran 9px out of the card at 375) */
+  .jan-actions > .btn { max-width: 100%; height: auto; min-height: 26px; padding-top: 3px; padding-bottom: 3px; line-height: 1.25; white-space: normal; text-align: center; }
+  .jan-actions > .btn > .icon { flex: none; }
 }
 
 /* ---- v2 glossary: tier groups, drag and drop, markers (G1, G6) ---- */
@@ -1258,6 +1548,21 @@ table.terms, table.checks, table.table { width: 100%; border-collapse: collapse;
 .td-grip .icon { display: block; opacity: 0.35; transition: opacity var(--dur); }
 .term-row:hover .td-grip .icon, .term-row:focus-within .td-grip .icon { opacity: 1; }
 .term-row[draggable="false"] .td-grip { cursor: default; }
+/* T28 G5: the table is at least 680px wide and its box less on a desktop
+   with the resource inspector open (606px at 1280, 559 at 768), so every
+   term's "⋯" (td.td-end, its header the last th) was out of sight to the
+   right. That column stays at the right edge of the box, over the columns
+   scrolled under it: opaque, as its row looks (hovered or focused within,
+   a drop target's group, a busy row's dimmed content); its header is
+   sticky on both edges, above the cells. At 360 the table still scrolls
+   sideways in its box, the "⋯" in view. */
+.terms-grouped thead th:last-child, .terms-grouped td.td-end { position: sticky; right: 0; }
+.terms-grouped thead th:last-child { z-index: 2; }
+.terms-grouped td.td-end { background-color: var(--bg-card); }
+.terms tbody tr:hover > td.td-end, .terms tbody tr:focus-within > td.td-end { background-image: linear-gradient(var(--bg-hover), var(--bg-hover)); }
+.tg.is-drop td.td-end { background: var(--accent-soft); }
+.term-row.is-busy td.td-end { opacity: 1; }
+.term-row.is-busy td.td-end > * { opacity: 0.55; }
 .tier-tag {
   display: inline-flex; align-items: center; height: 17px; margin-left: 6px; padding: 0 6px; vertical-align: 1px;
   border: 1px dashed var(--border-3); border-radius: var(--r-pill); color: var(--text-3); font-size: 10.5px; font-weight: 500; white-space: nowrap;
@@ -1284,6 +1589,8 @@ table.terms, table.checks, table.table { width: 100%; border-collapse: collapse;
 .mk-card { display: none; position: fixed; z-index: 60; width: 280px; max-width: calc(100vw - 24px); padding-top: 6px; }
 .mk-card.mk-up { padding-top: 0; padding-bottom: 6px; }
 .mk-wrap:hover .mk-card, .mk-wrap:focus-within .mk-card { display: block; animation: lf-pop var(--dur) var(--ease); }
+/* Esc closed it (C2): hidden until the pointer and the focus have left */
+.mk-wrap.is-dismissed .mk-card, .mk-wrap.is-dismissed:hover .mk-card, .mk-wrap.is-dismissed:focus-within .mk-card { display: none; }
 .mk-card-body {
   background: var(--bg-raised); color: var(--text-1); text-align: left;
   border: 1px solid var(--border-2); border-radius: var(--r-lg); box-shadow: var(--shadow-lg);
@@ -1687,7 +1994,44 @@ textarea.syl-paste { flex: 1; min-height: 240px; font-family: var(--font-mono); 
 .lec-notice.is-failed { background: var(--err-soft); color: var(--err); }
 .lec-notice.is-failed .lec-notice-text, .lec-notice.is-cancelled .lec-notice-text { display: flex; align-items: baseline; gap: 10px; color: var(--text-1); }
 .lec-notice.is-failed b { color: var(--err); flex: none; }
-.lec-notice-err { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); font-size: 11.5px; color: var(--text-2); }
+/* the error beside its heading while at least 14em are left, else on the
+   next line (a narrow window); up to three lines of it at any width, the
+   rest cut with an ellipsis (the full text is in the stage card and "Copy
+   full error") */
+.lec-notice-text:has(> .lec-notice-err) { flex-wrap: wrap; row-gap: 4px; }
+.lec-notice-text:has(> .lec-notice-err) > b { flex: 0 1 auto; min-width: 0; }
+.lec-notice-err {
+  flex: 1 1 14em; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3;
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--text-2);
+}
+/* a narrow notice (a browser at phone width) puts the button on a line of
+   its own instead of over the text: the text keeps at least 14em */
+.lec-notice.is-failed, .lec-notice.is-cancelled { flex-wrap: wrap; row-gap: 6px; }
+.lec-notice.is-failed > .lec-notice-text, .lec-notice.is-cancelled > .lec-notice-text { flex: 1 1 14em; }
+.lec-notice.is-failed > .btn, .lec-notice.is-cancelled > .btn { margin-left: auto; }
+/* a second (third) button stays beside the first, at the right; one that
+   goes to a line of its own (a phone) stays at the right as well, and a
+   label wider than the notice ("Retry with another model…", 169px in 160 at
+   360) wraps inside its button rather than run out of the notice */
+.lec-notice.is-failed > .btn + .btn { margin-left: 0; }
+.lec-notice.is-failed { justify-content: flex-end; }
+.lec-notice.is-failed > .btn { max-width: 100%; height: auto; min-height: 26px; padding-top: 4px; padding-bottom: 4px; line-height: 1.25; white-space: normal; text-align: center; }
+/* the same for a stage that waits (its button on a line of its own when
+   the text would get less than 14em); were inline styles in the lecture
+   page's script (R7, for that line) */
+.lec-notice.is-wait { flex-wrap: wrap; row-gap: 6px; }
+.lec-notice.is-wait > .lec-notice-text { flex: 1 1 14em; }
+.lec-notice.is-wait > .btn { margin-left: auto; }
+/* a cancelled stage's (or a failed title's) last error stays one line
+   with an ellipsis, as before, wherever the window is wider than a phone */
+@media (min-width: 641px) {
+  .lec-notice.is-cancelled .lec-notice-text { flex-wrap: nowrap; }
+  .lec-notice.is-cancelled .lec-notice-err { -webkit-line-clamp: 1; line-clamp: 1; }
+}
+/* test-media I6: what to do instead of retrying (a damaged file), on its own line */
+.lec-notice.is-failed .lec-notice-text:has(.lec-notice-hint) { flex-wrap: wrap; row-gap: 4px; }
+.lec-notice-hint { flex-basis: 100%; }
 .lec-notice.is-cancelled { background: var(--bg-sunken); color: var(--text-2); }
 .lec-notice.is-draft { background: var(--bg-sunken); color: var(--text-2); border: 1px dashed var(--border-3); }
 .lec-notice.is-draft .icon { color: var(--accent-text); }
@@ -1701,13 +2045,26 @@ textarea.syl-paste { flex: 1; min-height: 240px; font-family: var(--font-mono); 
   transition: background-color var(--dur);
 }
 a.lec-stat:hover { background: var(--bg-hover); }
-a.lec-stat:focus-visible { outline-offset: -2px; border-radius: var(--r-sm); }
+/* inside the cell (.lec-stats clips what overflows it): the links, and the
+   cells with an explanation, which take the focus (a group; r8-web-lecture
+   WL-8) */
+.lec-stat:focus-visible { outline-offset: -2px; border-radius: var(--r-sm); }
 .lec-stat-k { display: inline-flex; align-items: center; gap: 5px; font-size: var(--fs-xs); color: var(--text-3); white-space: nowrap; }
 .lec-stat-v { font-family: var(--font-display); font-size: 19px; font-weight: 650; letter-spacing: -0.015em; line-height: 1.25; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lec-stat-sub { font-size: var(--fs-xs); color: var(--text-3); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .lec-stat.is-warn .lec-stat-v { color: var(--warn); }
 .lec-stat.is-warn .lec-stat-k .icon { color: var(--warn); }
 .lec-stat-meter { height: 5px; margin-top: 5px; }
+/* a phone-width browser: two per line, less padding (T6 #15, T8: three per
+   line showed "1…" for a number) */
+@container (max-width: 480px) {
+  .lec-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lec-stat { padding: 10px 12px 11px; }
+  /* a long figure ("551K / 42.7K") breaks at its spaces instead of "…" */
+  .lec-stat-v { white-space: normal; overflow-wrap: anywhere; }
+  /* so does the line under it (the running totals were cut) */
+  .lec-stat-sub { white-space: normal; overflow-wrap: anywhere; }
+}
 
 /* ---- tabs ---- */
 
@@ -1727,6 +2084,15 @@ a.lec-stat:focus-visible { outline-offset: -2px; border-radius: var(--r-sm); }
 .lec-tab:focus-visible { outline-offset: -2px; }
 .lec-tab-count { min-width: 18px; height: 18px; padding: 0 6px; display: inline-grid; place-items: center; border-radius: var(--r-pill); background: var(--bg-sunken); color: var(--text-2); font-size: var(--fs-xs); font-weight: 600; font-variant-numeric: tabular-nums; }
 .lec-tab-count.is-warn { background: var(--warn-soft); color: var(--warn); }
+/* a phone: the two tabs ran out of main (en: "Review 3" 24px under the
+   inspector rail at 360; ru: the page scrolled sideways, T23 general 3).
+   Narrow, they drop their icons and some padding; still too wide (ru),
+   the second goes under the first */
+@container (max-width: 480px) {
+  .lec-tabs { flex-wrap: wrap; }
+  .lec-tab { gap: 5px; padding: 0 8px; }
+  .lec-tab > .icon { display: none; }
+}
 
 /* ---- shared: word diff, segmented toggle ---- */
 
@@ -1759,6 +2125,8 @@ a.lec-stat:focus-visible { outline-offset: -2px; border-radius: var(--r-sm); }
   font-size: var(--fs-lg); line-height: 1.62;
   transition: background-color var(--dur);
 }
+/* the search hides the rows that do not match (T22 S1) */
+.srow[hidden] { display: none; }
 .tx-list .srow:first-child { border-top: 0; }
 .srow:hover { background: var(--bg-hover); }
 .s-head { padding-top: 0; padding-bottom: 0; height: 30px; align-items: center; border-top: 0; border-bottom: 1px solid var(--border-1); background: var(--bg-sunken); color: var(--text-3); font-size: var(--fs-xs); font-weight: 600; line-height: 1; letter-spacing: 0.02em; }
@@ -1847,6 +2215,21 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
    provider is set up: English only, no empty Chinese column */
 .tx-card.is-en-only { --tx-cols: 66px 22px minmax(0, 1fr) 30px; }
 .tx-card.is-en-only .s-head > :nth-child(4), .tx-card.is-en-only .srow > .s-zh { display: none; }
+/* a phone-width browser: time, mark and menu on the first line, the
+   English and the Chinese each on a full line under them (T8: a text
+   column some 35px wide broke the words letter by letter); the column
+   heads (hidden from screen readers anyway) are dropped */
+@container (max-width: 440px) {
+  /* the search box on a line of its own, as wide as the card (it was
+     46cqw, some 95px at 360: "Search", T23 general 4) */
+  .tx-search { flex: 1 1 100%; min-width: 0; }
+  .tx-search-input { width: 100%; max-width: none; }
+  .tx-card, .tx-card.is-en-only { --tx-cols: auto 22px minmax(0, 1fr) 30px; }
+  .tx-card .s-head { display: none; }
+  .srow > .s-en { grid-column: 1 / -1; grid-row: 2; }
+  .srow > .s-zh { grid-column: 1 / -1; grid-row: 3; }
+  .s-detail, .s-edit, .s-audio { grid-column: 1 / -1; }
+}
 
 /* ---- review (§9.7) ---- */
 
@@ -2002,6 +2385,14 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 .abar.is-error .abar-err { display: block; min-width: 0; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-xs); color: var(--err); }
 .abar.is-error .abar-retry { display: inline-grid; place-items: center; width: 24px; height: 24px; border: 1px solid var(--border-2); border-radius: var(--r-sm); background: var(--bg-card); color: var(--text-2); cursor: pointer; }
 .abar.is-error .abar-retry:hover { color: var(--text-1); border-color: var(--border-3); }
+/* a phone: the time ("0:00.5 / 0:04.7", 87px at least) beside an 80px
+   track ran 55px out of the sentence row at 360 (T23 general 5); it goes
+   under the track, at its end, as does an error's message */
+@container (max-width: 440px) {
+  .abar { grid-template-columns: auto auto minmax(0, 1fr) auto; row-gap: 2px; }
+  .abar-time { grid-column: 3 / -1; grid-row: 2; min-width: 0; }
+  .abar.is-error .abar-err { grid-column: 1 / -1; grid-row: 2; max-width: none; }
+}
 
 @media (prefers-reduced-motion: reduce) {
   .abar.is-loading .abar-rail { animation: none; background: color-mix(in srgb, var(--accent) 22%, var(--ab-buf)); }
@@ -2039,10 +2430,21 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
   .set-toc-list { flex-direction: row; flex-wrap: wrap; }
   .set-toc-item { width: auto; height: 30px; }
 }
+/* a phone-width browser: the wrapped sections took some 360px and, kept
+   at the top while scrolling, covered nearly half the window (T8); one
+   line that scrolls sideways instead */
+@container (max-width: 560px) {
+  /* 4px: room for the focus ring (outline and offset), which the scroll box clips (T11) */
+  .set-toc-list { flex-wrap: nowrap; overflow-x: auto; padding: 4px; scrollbar-width: thin; }
+  .set-toc-list > li { flex: none; }
+}
 
 .set-alerts:empty { display: none; }
 .set-banner { gap: 10px; }
 .set-banner-text { flex: 1; min-width: 0; line-height: 1.5; }
+/* R4 S3: the limits banner's button wraps its label (ru) inside the banner
+   instead of running out of it (the banner itself wraps, inline style) */
+.pv-limits > .btn { max-width: 100%; height: auto; min-height: 26px; padding-top: 4px; padding-bottom: 4px; line-height: 1.25; white-space: normal; text-align: center; }
 .set-card { scroll-margin-top: 16px; transition: border-color var(--dur), box-shadow var(--dur-slow) var(--ease); }
 .set-card .card-title:focus { outline: none; }
 .set-card .card-title:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; border-radius: var(--r-xs); }
@@ -2174,12 +2576,38 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 .rl-msg.is-warn, .rl-msg.is-warn .icon { color: var(--warn); }
 .rl-msg.rl-hint .icon { color: var(--accent-text); }
 .rl-default { background: var(--accent-soft); color: var(--accent-text); }
+/* v3.2.x: the output limit (every role) and the folded, experimental
+   sentences-per-request field (translate), on a line under the row's cells */
+.rl-extra { grid-column: 2 / -1; display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px 24px; margin-top: 8px; }
+.rl-extra-field { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
+.rl-extra-title { font-size: var(--fs-sm); color: var(--text-2); }
+.rl-extra .rl-max-in { width: 112px; flex: none; }
+.rl-batch { min-width: 0; max-width: 46rem; }
+.rl-batch > summary { cursor: pointer; display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-height: 32px; }
+.rl-batch-body { display: flex; flex-direction: column; gap: 4px; padding: 4px 0 2px 14px; }
+.rl-batch-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-width: 0; }
+.rl-batch-ctl .rl-batch-in { width: 72px; flex: none; }
+.rl-batch [hidden] { display: none !important; }
+.rl-think-floor { display: inline-flex; align-items: center; gap: 2px; cursor: help; }
+.set-note.is-err, .set-note.is-err .icon { color: var(--err); }
+.set-limits-note .set-link { display: inline-flex; align-items: center; gap: 3px; }
 @container set-main (max-width: 780px) {
   .rl-head { display: none; }
   .rl-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); row-gap: 10px; }
-  .rl-role, .rl-notes { grid-column: 1 / -1; }
+  .rl-role, .rl-notes, .rl-extra { grid-column: 1 / -1; }
   .rl-cap { display: block; }
   .rl-win.is-empty { display: none; }
+}
+/* T28 G3: in the two columns the temperature's slider (56px at least), its
+   10px gap and the number box (68px) need 134px, and a column has less in
+   a settings column under 316px (84px at a 360px window, 111 at 414): the
+   number box ran 36px (9 at 414) under the thinking level's select, which
+   took the clicks on it. There the slider is left out and the number box,
+   the same control by the keyboard and the same name, stays in its column;
+   no row gets higher (a temperature on a row of its own made seven of the
+   eight roles 62px higher). Wider, as before. */
+@container set-main (max-width: 320px) {
+  .rl-temp-ctl > .set-range { display: none; }
 }
 
 .set-range {
@@ -2299,8 +2727,10 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 .sys-check-state.is-warn { background: var(--warn-soft); color: var(--warn); }
 .sys-check-state.is-error { background: var(--err-soft); color: var(--err); }
 .sys-check-detail { margin-top: 1px; font-size: var(--fs-sm); color: var(--text-2); overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
-.sys-hint { display: flex; align-items: flex-start; gap: 6px; margin-top: 6px; padding: 7px 10px; border-radius: var(--r-md); background: var(--bg-sunken); color: var(--text-1); font-size: var(--fs-sm); }
-.sys-hint > span { flex: 1; min-width: 0; }
+.sys-hint { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; margin-top: 6px; padding: 7px 10px; border-radius: var(--r-md); background: var(--bg-sunken); color: var(--text-1); font-size: var(--fs-sm); }
+/* the link ("Open Settings") moves under the text rather than leave it a
+   column of one or two words (T8, a phone-width browser) */
+.sys-hint > span { flex: 1 1 12em; min-width: 0; overflow-wrap: anywhere; } /* a long path breaks (T11: the install and data directories) */
 .sys-hint > .icon { margin-top: 3px; flex: none; color: var(--text-3); }
 .sys-hint.is-error { background: var(--err-soft); }
 .sys-hint.is-error > .icon { color: var(--err); }
@@ -2345,7 +2775,9 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 .sys-cfg-note { margin: 0 0 14px; font-size: var(--fs-sm); color: var(--text-2); }
 .sys-cfg-note .icon { margin-right: 6px; vertical-align: -2px; color: var(--text-3); }
 .sys-cfg-note a { margin: 0 2px; }
-.sys-cfg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px 24px; align-items: start; }
+.sys-gpu-note { margin: 0; font-size: var(--fs-sm); color: var(--text-2); }
+.sys-gpu-note .icon { margin-right: 6px; vertical-align: -2px; color: var(--text-3); }
+.sys-cfg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap: 12px 24px; align-items: start; }
 .sys-cfg { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
 .sys-cfg caption { padding: 0 0 6px; text-align: left; font-size: var(--fs-xs); font-weight: 600; color: var(--text-3); }
 .sys-cfg th, .sys-cfg td { padding: 6px 0; border-top: 1px solid var(--border-1); text-align: left; vertical-align: top; }
@@ -2381,7 +2813,17 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 }
 @media (max-width: 960px) {
   .upload-row { grid-template-columns: 1fr; }
+  /* a failed row's error spans columns 2–3 of the wide row; in the one
+     column it made two implicit ones beside the name (R4: at 375 the name
+     118px, the error 69px wide and 126px high) */
+  .upload-failed .up-status { grid-column: auto; }
   .onboard-steps { grid-template-columns: 1fr; }
+}
+/* a browser at phone width (the desktop app is at least 880 wide): the
+   nav and inspector rails stay, the page keeps a 16px gutter so the
+   content column has some 230px instead of 215 (T8) */
+@media (max-width: 640px) {
+  main { padding: 16px 16px 48px; }
 }
 
 /* === v2:player (SPEC-v2 P2–P10) — owned by the player agent === */
@@ -2512,9 +2954,15 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 /* ---- stage overlays: spinner, resume notice, OSD, messages ---- */
 
 .pl-spinner { position: absolute; left: 50%; top: 42%; z-index: 3; transform: translate(-50%, -50%); color: var(--text-2); pointer-events: none; }
+/* centred by margins, not left: 50% + transform (T23 severe 1): left: 50%
+   left the box half the stage to grow in (the text broke into three lines
+   and the button's label ran out of it), and lf-pop's transform replaced
+   the translateX(-50%) while it ran (the notice and its × out of a phone's
+   window) */
 .pl-notice {
-  position: absolute; left: 50%; top: 14px; z-index: 4; transform: translateX(-50%);
-  display: flex; align-items: center; gap: 10px; max-width: calc(100% - 32px);
+  position: absolute; left: 0; right: 0; top: 14px; z-index: 4;
+  width: fit-content; max-width: calc(100% - 16px); margin: 0 auto;
+  display: flex; align-items: center; gap: 10px;
   padding: 6px 6px 6px 14px; border-radius: var(--r-pill);
   background: color-mix(in srgb, var(--bg-raised) 94%, transparent); border: 1px solid var(--border-2);
   color: var(--text-1); box-shadow: var(--shadow-md); font-size: var(--fs-md);
@@ -2523,11 +2971,12 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 .pl-notice[hidden] { display: none; }
 .pl-notice .icon { color: var(--accent-text); }
 .pl-notice-btn {
+  flex: none; white-space: nowrap;
   height: 26px; padding: 0 10px; border-radius: var(--r-pill); border: 1px solid var(--border-3);
   background: transparent; color: var(--text-1); font-size: var(--fs-sm); font-weight: 500; cursor: pointer;
 }
 .pl-notice-btn:hover { background: var(--bg-hover); }
-.pl-notice-x { display: inline-grid; place-items: center; width: 26px; height: 26px; border: 0; border-radius: 50%; background: transparent; color: var(--text-3); cursor: pointer; }
+.pl-notice-x { display: inline-grid; place-items: center; flex: none; width: 26px; height: 26px; border: 0; border-radius: 50%; background: transparent; color: var(--text-3); cursor: pointer; }
 .pl-notice-x:hover { background: var(--bg-hover); color: var(--text-1); }
 .pl-osd {
   position: absolute; right: 16px; top: 14px; z-index: 4;
@@ -2580,8 +3029,15 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
   padding: 2px 10px 6px;
   background: var(--bg-card); border-top: 1px solid var(--border-1);
 }
-.pl-bar { display: flex; align-items: center; gap: 4px; height: 42px; }
-.pl-bar-group { display: flex; align-items: center; gap: 2px; min-width: 0; }
+/* when the two groups do not fit one line (a phone: 394px of buttons and
+   clock at 360, T23 severe 1), the right one (speed … full screen) wraps
+   under the left one, flush right; a wide bar is one line as before. The
+   left group with the 5 s back button (.pl-ctl-back, beside play) is 248px
+   (360: 10–258 of 340; 320: of 300); a group wider than its line wraps
+   inside rather than run its last item (the clock) under the next one */
+.pl-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; min-height: 42px; }
+.pl-bar-group { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; min-width: 0; }
+.pl-bar-group:last-child { margin-left: auto; }
 .pl-bar-spacer { flex: 1; }
 .pl-ctl {
   display: inline-grid; place-items: center; flex: none;
@@ -2709,7 +3165,7 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 .pl-list-error p { margin: 0; }
 .pl-row {
   position: relative;
-  display: grid; grid-template-columns: 46px minmax(0, 1fr) 14px; gap: 2px 8px;
+  display: grid; grid-template-columns: 46px minmax(0, 1fr) 26px; gap: 2px 8px;
   padding: 7px 10px 7px 14px; cursor: pointer;
   transition: background-color var(--dur);
 }
@@ -2737,9 +3193,25 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 .pl-row.is-hit-cur { box-shadow: inset 3px 0 0 var(--st-stale); }
 .pl-row.is-hit-cur mark { background: color-mix(in srgb, var(--st-stale) 55%, transparent); }
 .pl-row-pend { align-self: start; display: grid; place-items: center; width: 14px; height: 18px; padding: 0; border: 0; background: transparent; cursor: help; }
+/* r8-web-lecture WL-03 (T22 G15): every sentence's visible "⋯" (its menu,
+   player_transcript.js), in the last column with "change to review": the
+   "⋯" at the top, under the mark when there is one; faint, full on hover,
+   on the current sentence and with the keyboard on the row or on it */
+.pl-row > .pl-row-pend { grid-column: 3; grid-row: 1; justify-self: center; }
+.pl-row > .pl-row-more { grid-column: 3; grid-row: 1; align-self: start; margin: -3px 0 0; }
+.pl-row.is-pending > .pl-row-more { align-self: end; margin: 0 0 -4px; }
+/* a one-line sentence with a mark (one language shown) had its "⋯" right
+   over the mark (both 7–25px from the row's top): its line is at least
+   40px, so the "⋯" starts where the mark ends */
+.pl-row.is-pending { grid-template-rows: minmax(40px, auto); }
+.pl-row:hover .pl-row-more, .pl-row.is-cur .pl-row-more, .pl-row:focus-visible .pl-row-more { opacity: 1; }
 .pl-pend-glyph { display: inline-block; width: 8px; height: 8px; transform: rotate(45deg); border-radius: 1px; background: var(--st-stale); }
+/* centred by margins, as .pl-notice: lf-pop's transform replaced the
+   translateX(-50%) while it ran (R70 (f), T23 suggestion 7: 1132–1305 in a
+   panel ending at 1280) */
 .pl-back-current {
-  position: absolute; left: 50%; bottom: 12px; z-index: 3; transform: translateX(-50%);
+  position: absolute; left: 0; right: 0; bottom: 12px; z-index: 3;
+  width: fit-content; max-width: calc(100% - 16px); margin: 0 auto;
   box-shadow: var(--shadow-md); border-radius: var(--r-pill); padding: 0 12px; height: 30px;
   animation: lf-pop var(--dur) var(--ease);
 }
@@ -2805,7 +3277,7 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
    and preview, course settings, the provider tariff editor, holidays. */
 
 :root {
-  --offpeak: light-dark(#2f7d4f, #6fcf97);
+  --offpeak: light-dark(#2b7649, #6fcf97); /* light: 4.93:1 on its soft fill (#2f7d4f was 4.48, T8) */
   --offpeak-soft: light-dark(#e7f5ec, #17301f);
   --peak-soft: light-dark(#eef0f3, #262a31);
 }
@@ -3039,11 +3511,17 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 .hol-y { font-weight: 600; font-variant-numeric: tabular-nums; }
 .hol-n { font-variant-numeric: tabular-nums; }
 .hol-ranges { display: flex; flex-wrap: wrap; gap: 4px; }
+/* narrow (R4 G1): the year and its count on one line, the date chips under
+   them as wide as the card (a 57px column let them run out of it) */
+@container (max-width: 480px) {
+  .hol-year { grid-template-columns: auto minmax(0, 1fr); }
+  .hol-ranges { grid-column: 1 / -1; }
+}
 .hol-missing .icon { color: var(--text-3); }
 .dlg.dlg-hol { width: min(560px, calc(100vw - 32px)); }
 .hol-text { font-size: var(--fs-sm); }
 
-.set-title-preview { display: flex; align-items: baseline; gap: 12px; margin: 10px 0 6px; padding: 10px 12px; border: 1px solid var(--border-1); border-radius: var(--r-md); background: var(--bg-card); max-width: 520px; }
+.set-title-preview { display: flex; align-items: baseline; gap: 12px; margin: 10px 0 6px; padding: 10px 12px; border: 1px solid var(--border-1); border-radius: var(--r-md); background: var(--bg-card); max-width: min(520px, 100%); }
 .set-title-preview-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .set-title-preview-t { font-weight: 600; }
 .set-title-preview-sub { color: var(--text-2); font-size: var(--fs-sm); }
@@ -3057,14 +3535,23 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 /* author display rules would otherwise beat the [hidden] attribute */
 .cal-fields [hidden], .cset [hidden], .fn-dlg [hidden], .set-dlg-tariff [hidden], .fn-notice [hidden] { display: none !important; }
 .card-errmsg { margin: 0 0 4px; font-weight: 600; color: var(--err); font-size: var(--fs-sm); line-height: 1.45; }
+.card-errhint { margin: 0 0 4px; font-size: var(--fs-sm); line-height: 1.45; }
+.card-tried { margin: 0 0 4px; color: var(--text-2); font-size: var(--fs-sm); line-height: 1.45; font-variant-numeric: tabular-nums; }
 
 /* lecture list: calendar numbers, week groups, titles and blurbs (P13.4, P13.6) */
 .lt-group { padding: 14px 16px 6px; border-top: 1px solid var(--border-1); }
 .lt-group:first-child { border-top: 0; padding-top: 8px; }
 .lt-group + .lrow { border-top: 0; }
-.lt-group-t { display: flex; align-items: baseline; gap: 8px; font-size: var(--fs-sm); font-weight: 600; color: var(--text-2); font-variant-numeric: tabular-nums; }
+/* the week's dates and the count flow as text: the dates wrap at their
+   spaces, the count ("2 节", "2 записи") stays whole and goes on the dates'
+   last line when it fits there, else under them, flush left (the gap is a
+   space, which a line break drops) (R4 M1: as flex items, the count either
+   broke into one letter a line or, kept whole, ran 11–18px under the slides
+   button in ru at 375) */
+.lt-group-t { display: block; font-size: var(--fs-sm); font-weight: 600; color: var(--text-2); font-variant-numeric: tabular-nums; }
 .lt-group.is-unknown .lt-group-t { color: var(--text-3); }
-.lt-group-n { font-size: var(--fs-xs); font-weight: 400; color: var(--text-3); }
+.lt-group-n { font-size: var(--fs-xs); font-weight: 400; color: var(--text-3); white-space: nowrap; }
+.lt-group-n::before { content: " "; white-space: normal; word-spacing: 5px; }
 /* Title and subtitle each keep a readable width and end in an ellipsis
    (the full text is the hover title): the subtitle moves to the next line
    rather than shrinking away beside a long title, and in lists narrower
@@ -3111,7 +3598,12 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 .lrow-status { min-width: min(100%, 4.5em); }
 .ktag-inline { flex-direction: row; align-items: baseline; gap: 4px; margin-right: 6px; }
 .lt-group { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
-.lt-group-t { min-width: 0; }
+/* T28 suggestion 6: in a narrow list (92px at 360) the Chinese week title
+   broke inside its dates ("9月28 / 日"). Chinese text breaks only at its
+   spaces and after the "–" of the range, as words of other languages do
+   (keep-all; ru, hi, en are as before), and a part wider than the title
+   still breaks rather than run out of it. */
+.lt-group-t { min-width: 0; word-break: keep-all; overflow-wrap: break-word; }
 .lt-group.is-materials { padding-top: 18px; }
 .lt-group-end { flex: none; }
 .lt-group-mat { display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 9px; border: 1px solid var(--border-2); border-radius: var(--r-pill); background: transparent; color: var(--text-2); font: inherit; font-size: var(--fs-xs); white-space: nowrap; cursor: pointer; }
@@ -3134,6 +3626,20 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 .mat-row.flash { animation: lf-flash 1.8s var(--ease); }
 @keyframes lf-flash { 0%, 45% { background: var(--accent-soft); } 100% { background: transparent; } }
 @media (prefers-reduced-motion: reduce) { .mat-row.flash { animation: none; background: var(--accent-soft); } }
+/* r8-web-settings WS-11: a provider's row reached from another page
+   (#/settings/providers/{id}) is highlighted briefly, as a slide file is */
+.pv-row.flash { animation: lf-flash 1.8s var(--ease); border-radius: var(--r-md); }
+@media (prefers-reduced-motion: reduce) { .pv-row.flash { animation: none; } }
+/* r9 WH-12 (convention C4): a term just added to the glossary is scrolled
+   to and highlighted (glossary.js adds .flash to its tr.term-row, r9-web-
+   views WV-05). The cells carry the colour, a row's own background being
+   under them; the sticky "⋯" cell (WH-03) ends on its own opaque colour,
+   not transparent over the columns under it. With reduced motion: the
+   colour without the fade. */
+.term-row.flash > td { animation: lf-flash 1.8s var(--ease); }
+.term-row.flash > td.td-end { animation-name: lf-flash-solid; }
+@keyframes lf-flash-solid { 0%, 45% { background-color: var(--accent-soft); } 100% { background-color: var(--bg-card); } }
+@media (prefers-reduced-motion: reduce) { .term-row.flash > td { animation: none; background: var(--accent-soft); } }
 
 /* the lecture page: "CSC1003 · Week 1 · Lecture · No. 2", and its slides */
 .page-eyebrow .mono + .lec-kind::before { content: "·"; margin-right: 8px; color: var(--text-3); font-weight: 400; }
@@ -3174,6 +3680,25 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 .kind-group { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sm); color: var(--text-2); }
 .kind-row > :last-child { justify-self: end; }
 .kind-code-input { width: 7em; text-transform: uppercase; }
+/* phone-width settings (T6 #15, T8): the kinds' name over code and group
+   (the name column was 0 wide); the tariff tag of a provider under its
+   label instead of cut off by the card */
+@container set-main (max-width: 480px) {
+  .kind-row { grid-template-columns: auto minmax(0, 1fr) auto; row-gap: 2px; }
+  .kind-head { display: none; }
+  .kind-name { grid-column: 1 / 3; grid-row: 1; }
+  .kind-row > :last-child { grid-column: 3; grid-row: 1; }
+  .kind-code { grid-column: 1; grid-row: 2; }
+  .kind-group { grid-column: 2; grid-row: 2; }
+  .pv-fact.pv-tariff { flex-wrap: wrap; }
+  .pv-tariff .pv-v { max-width: 100%; }
+}
+/* a phone-width course page: a material's state and menu go under its
+   file name rather than leave the name 0 wide */
+@container (max-width: 480px) {
+  .mat-top { flex-wrap: wrap; row-gap: 4px; }
+  .mat-main { flex-basis: 10em; }
+}
 .kind-groups { margin-bottom: 0; }
 /* a custom kind named like a built-in one: a gentle note, saving still allowed */
 .kind-name-clash { font-size: var(--fs-xs); color: var(--warn); }
@@ -3319,6 +3844,10 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 /* on the soft warning background --warn alone is about 4.3:1 in the light
    theme; mixed with the text colour it stays above 4.5:1 in both themes */
 .insp-note.pw-wait { margin: 8px 0 0; padding: 6px 8px; border-radius: var(--r-md); background: var(--warn-soft); font-weight: 500; color: color-mix(in srgb, var(--warn) 72%, var(--text-1)); }
+/* the suspended tasks' notes and their way out (resources.js
+   fillPowerWait): nothing to say, no room taken; the way out's link is an
+   .rc-link (settings_v3.css), as the panel's other links */
+.pw-waits:empty { display: none; }
 .dcard-why { height: 18px; padding: 0 6px; }
 .dcard-why .icon { flex: none; }
 .dcard-next { margin-top: 6px; color: var(--accent-text); }
@@ -3380,6 +3909,12 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 .dash-prompt-text { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
 .dash-prompt-hint { margin: 2px 0 0; font-size: var(--fs-sm); color: var(--text-2); }
 .dash-prompt-actions { display: flex; align-items: center; gap: 6px; flex: none; }
+/* the Colab line's warning state (an .asr-notice): where the calm line is */
+.asr-notice.dash-colab-warn { margin: -8px 0 16px; }
+/* roles not set up (translation …), which keep lectures from starting: the
+   error colour of the "cannot transcribe yet" notice */
+.asr-notice.dash-roles { border-color: color-mix(in srgb, var(--err) 45%, var(--border-1)); border-left-color: var(--err); background: var(--err-soft); }
+.asr-notice.dash-roles .asr-notice-icon { color: var(--err); }
 .dev-results > summary { list-style: none; }
 .dev-results > summary::-webkit-details-marker { display: none; }
 .dev-results-chev { color: var(--text-3); transition: transform var(--dur) var(--ease); }
@@ -3398,6 +3933,26 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 .dl-detail { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dl-row.dl-nobar .up-status { grid-column: 2 / 4; }
 .dl-row .up-actions { justify-self: end; }
+/* a list too narrow for the four columns (a browser at phone width; the
+   desktop app is at least 880 wide): one column, as the upload rows below
+   960px; title, bar, state and buttons each on a line of their own (R4 S1:
+   the buttons and the bar's 56px took the whole width, the title and the
+   state were 0 wide and a row some 900px high). 560, not 480 (R49 B4):
+   below a 560px card the four columns leave the title 130px or less (en;
+   ru 118, its buttons are wider; 103 / 91 at 496), while one column costs
+   the list about a tenth more height; at 768 (a 593px card, title 141px)
+   the four columns stay. */
+@container (max-width: 560px) {
+  .dl-list:not([hidden]) { grid-template-columns: minmax(0, 1fr); }
+  .dl-list > .dl-row { grid-template-columns: minmax(0, 1fr); row-gap: 6px; }
+  .dl-row.dl-nobar .up-status { grid-column: auto; }
+  .dl-row .up-actions:empty { display: none; }
+  /* the detail ("31% · 297.5 MB of 934.6 MB") goes under the state when
+     both do not fit, and takes up to two lines rather than one cut with
+     "…" (89 of 148px at 360, T23 general 11) */
+  .dl-status { flex-wrap: wrap; row-gap: 2px; }
+  .dl-detail { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; white-space: normal; overflow-wrap: anywhere; }
+}
 .dl-note { grid-column: 1 / -1; display: flex; align-items: flex-start; gap: 6px; margin: -2px 0 2px; color: var(--text-1); line-height: 1.5; overflow-wrap: anywhere; }
 .dl-note .icon { flex: none; margin-top: 3px; }
 .dl-note.is-warn .icon { color: var(--warn); }
@@ -3507,3 +4062,51 @@ mark.hl { background: color-mix(in srgb, #f5c400 38%, transparent); color: inher
 .sys-ext-reg { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .sys-ext-details summary { width: fit-content; color: var(--text-2); font-size: var(--fs-sm); cursor: pointer; }
 .sys-ext-details pre { margin: 4px 0 0; padding: 8px 10px; border-radius: var(--r-sm); background: var(--bg-sunken); color: var(--text-2); font-size: var(--fs-xs); white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* v3.2.x P1-b: a lecture's translations from several models, a neutral note
+   (stage card: pipeline.js mixedModelsNote; lecture page: view_lecture.js) */
+.card-note.card-mixed-models { margin: 4px 0 0; padding: 0; color: var(--text-2); overflow-wrap: anywhere; }
+.lec-mixed-models { display: flex; align-items: flex-start; gap: 6px; margin: 8px 0 0; font-size: var(--fs-xs); color: var(--text-2); line-height: 1.5; overflow-wrap: anywhere; }
+.lec-mixed-models > .icon { flex: none; margin-top: 2px; color: var(--text-3); }
+
+/* ---- touch screens (T23 general 12): hit areas of about 40px ----
+   The small controls T23 measured (stage segments 18 × 20, the lecture
+   rows' and the dashboard's icon buttons 28, a sentence's "⋯" 26, the
+   change marks 22, the player's "change to review" 14 × 18, the lecture
+   rows' check boxes 15) get a transparent ::after that reaches 40px where
+   they are smaller (min(0px, …): a larger control keeps its own box); what
+   is seen keeps its size and place. The segments sit 2px apart: theirs
+   grows up and down only (38px: a material's week select sits 10px above
+   its bar); a row's second icon button (4px after the first) grows 2px to
+   the left. A neighbour's own box stays its own: a lecture's
+   title (2px under its "⋯"), its row's buttons, the dashboard's "N to
+   review" (over the play and download buttons) and a material's drag
+   handle (3px left of its check box) are drawn over those areas. Menu
+   items, stacked without a gap, are 40px high. */
+@media (pointer: coarse) {
+  .lrow-end .icon-btn, .rd-end > .icon-btn, .s-more-btn, .mk, button.seg, .pl-row-pend, .lt-check > input.check { position: relative; }
+  .lrow-end .icon-btn::after, .rd-end > .icon-btn::after, .s-more-btn::after, .mk::after, button.seg::after, .pl-row-pend::after, .lt-check > input.check::after {
+    content: ""; position: absolute; inset: min(0px, calc(50% - 20px));
+  }
+  button.seg::after { top: min(0px, calc(50% - 19px)); bottom: min(0px, calc(50% - 19px)); left: -1px; right: -1px; }
+  /* the player's "change to review" stays in its own column, the gap
+     before it and the row's padding (.pl-row: 8px gap, padding 7px 10px),
+     1px short of the sentence and the row's top: around it, its 40px
+     covered the end of the sentence (R70 low 1); 31 × 24: not below the
+     mark, where the sentence's "⋯" is (r8-web-lecture WL-03; it reached
+     15px down over it) */
+  .pl-row-pend::after { inset: -6px -10px 0 -7px; }
+  /* the sentence's "⋯": its area stops at the mark's bottom edge (they
+     meet there on a 40px line) and at its own row's top (the row above
+     keeps its padding) */
+  .pl-row > .pl-row-more::after { top: -4px; }
+  .pl-row.is-pending > .pl-row-more::after { top: 0; }
+  .lrow-end .icon-btn + .icon-btn::after { left: -2px; }
+  .lrow-title, .lrow-end .btn, .chip-review { position: relative; z-index: 1; }
+  .lrow-grip { z-index: 1; }
+  .ctx-item { height: 40px; }
+  .ctx-item.has-desc { min-height: 40px; }
+  /* a course card's "⋯" (28px, absolutely placed 8px inside the card's
+     corner, r8-web-dash WD-03): the same 40px area, inside the card */
+  .ccard-wrap > .ccard-more::after { content: ""; position: absolute; inset: min(0px, calc(50% - 20px)); }
+}

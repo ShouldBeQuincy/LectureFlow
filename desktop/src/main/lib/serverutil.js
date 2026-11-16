@@ -24,9 +24,15 @@ function generateToken() {
  * launcher (the program the browser extension's host starts this app with,
  * lib/nmhost.js), launcherBlocked (why there is none on macOS: the app runs
  * from its disk image or translocated) and portable (the portable build)
- * are for the native messaging registration.
+ * are for the native messaging registration. installDir (the Windows
+ * installation set up by the installer, updatefiles.installDirOf; security
+ * audit M-4) is the folder whose permissions the diagnostics and the
+ * in-app update check. noSelfUpdate: this copy of the app cannot replace
+ * itself (updatefiles.describeInstallation: unsupported — an unpacked or
+ * copied folder); the service then installs no update here and leaves a
+ * pending one to the copy it belongs to (internal/selfupdate NoInstall).
  */
-function buildServerArgs({ port, dataDir, resourcesDir, appVersion, configFile, locationFile, launcher = null, launcherBlocked = null, portable = false }) {
+function buildServerArgs({ port, dataDir, resourcesDir, appVersion, configFile, locationFile, launcher = null, launcherBlocked = null, portable = false, installDir = null, noSelfUpdate = false }) {
   const args = ['-desktop', '-listen', `127.0.0.1:${port}`, '-data-dir', dataDir];
   if (resourcesDir) args.push('-resources', resourcesDir);
   if (appVersion) args.push('-app-version', appVersion);
@@ -35,6 +41,8 @@ function buildServerArgs({ port, dataDir, resourcesDir, appVersion, configFile, 
   if (launcher) args.push('-launcher', launcher);
   else if (launcherBlocked) args.push('-launcher-blocked', launcherBlocked);
   if (portable) args.push('-portable');
+  if (installDir) args.push('-install-dir', installDir);
+  if (noSelfUpdate) args.push('-no-self-update');
   return args;
 }
 

@@ -477,10 +477,12 @@ func MoveDataDir(ctx context.Context, o MoveOptions) (err error) {
 // secretKVKeys, and the providers' API keys) from the database a move left
 // in the old data directory oldDir, leaving no copy in free pages or the
 // WAL (db.ScrubSecrets: secure_delete, VACUUM, TRUNCATE checkpoint;
-// closing the connection removes the WAL), and so are the databases
-// imports replaced in the old backups/ (sec3 L1). Everything else in oldDir
-// stays until the user deletes it (v3 Gate round 2, lead ruling). It runs
-// after the switch, in the service started on the new directory
+// closing the connection removes the WAL), and so are the database a
+// rollback of an in-app update kept beside it (BeforeRollbackName, r6) and
+// the databases imports replaced in the old backups/ (sec3 L1). Everything
+// else in oldDir stays until the user deletes it (v3 Gate round 2, lead
+// ruling). It runs after the switch, in the service started on the new
+// directory
 // currentDir: the old service, the only other user of that database, has
 // exited by then. Missing databases are nothing to do; oldDir must be
 // absolute and must not be currentDir or hold it.
@@ -508,7 +510,21 @@ func ScrubOldDataDir(ctx context.Context, oldDir, currentDir string) error {
 			return err
 		}
 	}
+	// r6: the database a rollback of an in-app update kept beside it
+	// (BeforeRollbackName, with its -wal) held the same credentials. One
+	// that is not a regular file is not the shell's: left alone. One that
+	// cannot be scrubbed (not a usable database) is reported after the
+	// backups below were tried, like one of them.
+	var first error
+	kept := filepath.Join(old, BeforeRollbackName)
+	if fi, err := os.Lstat(kept); err == nil && fi.Mode().IsRegular() {
+		if err := scrubDB(ctx, kept); err != nil {
+			first = fmt.Errorf("%s: %w", BeforeRollbackName, err)
+		}
+	}
 	// sec3 L1: the databases imports replaced, kept in the old backups/
-	_, err = ScrubImportBackups(ctx, old)
-	return err
+	if _, err := ScrubImportBackups(ctx, old); err != nil && first == nil {
+		first = err
+	}
+	return first
 }

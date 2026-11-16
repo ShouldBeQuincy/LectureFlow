@@ -57,13 +57,14 @@ type loginTestEnv struct {
 
 	mu      sync.Mutex
 	changes []LoginStatus
+	changed chan struct{} // signalled (never blocking) after every recorded change
 }
 
 func newLoginTestEnv(t *testing.T, mode string) *loginTestEnv {
 	t.Helper()
 	// Spaces and parentheses, as in C:\Program Files (x86)\Google\Cloud SDK
 	// or ~/Library/Application Support.
-	e := &loginTestEnv{t: t, dir: filepath.Join(t.TempDir(), "Program Files (x86)", "Cloud SDK")}
+	e := &loginTestEnv{t: t, dir: filepath.Join(t.TempDir(), "Program Files (x86)", "Cloud SDK"), changed: make(chan struct{}, 1)}
 	var err error
 	if e.gcloud, err = loginfake.Install(e.dir, loginTestADC); err != nil {
 		t.Fatal(err)
@@ -122,6 +123,10 @@ func (e *loginTestEnv) options() LoginOptions {
 			e.mu.Lock()
 			e.changes = append(e.changes, s)
 			e.mu.Unlock()
+			select {
+			case e.changed <- struct{}{}:
+			default:
+			}
 		},
 	}
 }
@@ -136,6 +141,30 @@ func (e *loginTestEnv) states() []string {
 		}
 	}
 	return out
+}
+
+// waitChange waits until OnChange has reported a status for which cond
+// holds. The Login publishes a status (Status) before it calls OnChange,
+// outside its lock (LoginOptions.OnChange), so a test that saw the final
+// status through Status must wait for its notification before reading the
+// recorded changes.
+func (e *loginTestEnv) waitChange(what string, cond func(LoginStatus) bool) {
+	e.t.Helper()
+	deadline := time.NewTimer(20 * time.Second)
+	defer deadline.Stop()
+	for {
+		e.mu.Lock()
+		seen := slices.ContainsFunc(e.changes, cond)
+		e.mu.Unlock()
+		if seen {
+			return
+		}
+		select {
+		case <-e.changed:
+		case <-deadline.C:
+			e.t.Fatalf("%s: not reported; changes %v", what, e.states())
+		}
+	}
 }
 
 // wait polls the login until cond holds.
@@ -218,6 +247,7 @@ func TestLoginSuccess(t *testing.T) {
 	if st.State != LoginDone || st.Error != nil || st.URL != loginfake.URL {
 		t.Fatalf("final status %+v", st)
 	}
+	e.waitChange("sign-in", ended)
 	if got := e.states(); !slices.Equal(got, []string{LoginWaiting, LoginImporting, LoginDone}) {
 		t.Errorf("status changes %v", got)
 	}
@@ -348,6 +378,7 @@ func TestLoginWithoutADC(t *testing.T) {
 	if st.State != LoginFailed || st.Error == nil || st.Error.Code != CodeADCNotFound {
 		t.Fatalf("status %+v / %+v", st, st.Error)
 	}
+	e.waitChange("no ADC", ended)
 	if got := e.states(); !slices.Equal(got, []string{LoginWaiting, LoginImporting, LoginFailed}) {
 		t.Errorf("changes %v", got)
 	}

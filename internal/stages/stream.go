@@ -244,8 +244,12 @@ func (m *execMedia) FreeSpace(dir string) (int64, error) { return diskFree(dir) 
 type mediaInfo struct {
 	Format       string       // ffprobe format_name, e.g. "mov,mp4,m4a,3gp,3g2,mj2"
 	Video        *mediaStream // the first video stream that is not a cover picture; nil = none
-	Audio        *mediaStream // the first audio stream; nil = none
+	Audio        *mediaStream // the lecture's audio stream (see parseProbe); nil = none
 	CreationTime *time.Time   // the container's (or a stream's) creation_time, UTC; nil = unknown
+	// Duration is the declared duration in seconds of the lecture's audio
+	// (declaredDuration); 0 = unknown or not to be trusted. prep compares
+	// audio.wav with it (noteTruncation, test-media I9).
+	Duration float64
 }
 
 type mediaStream struct {
@@ -261,16 +265,25 @@ type probeJSON struct {
 		CodecType   string            `json:"codec_type"`
 		CodecName   string            `json:"codec_name"`
 		PixFmt      string            `json:"pix_fmt"`
+		Duration    string            `json:"duration"`
 		Disposition map[string]int    `json:"disposition"`
 		Tags        map[string]string `json:"tags"`
 	} `json:"streams"`
 	Format struct {
 		FormatName string            `json:"format_name"`
+		Duration   string            `json:"duration"`
 		Tags       map[string]string `json:"tags"`
 	} `json:"format"`
 }
 
 // parseProbe reads ffprobe's JSON.
+//
+// The lecture's audio track (test-media I3): with several audio tracks it
+// is the first one marked default, else the first one. audio.wav (prep's
+// audioArgs) and stream.mp4 (streamArgs) both map exactly this stream with
+// -map 0:{index}; left to itself ffmpeg picked the track of audio.wav by
+// its own rule (default flag, then the channel count) while stream.mp4 took
+// the first, so transcription and playback could use different tracks.
 func parseProbe(raw []byte) (mediaInfo, error) {
 	var p probeJSON
 	if err := json.Unmarshal(raw, &p); err != nil {
@@ -278,18 +291,63 @@ func parseProbe(raw []byte) (mediaInfo, error) {
 	}
 	info := mediaInfo{Format: p.Format.FormatName}
 	info.CreationTime = creationTime(p.Format.Tags)
+	audioDefault := false // whether info.Audio is marked default
+	audioDuration := ""   // the duration of info.Audio's stream
 	for _, s := range p.Streams {
 		switch {
 		case s.CodecType == "video" && info.Video == nil && s.Disposition["attached_pic"] == 0:
 			info.Video = &mediaStream{Index: s.Index, Codec: s.CodecName, PixFmt: s.PixFmt}
-		case s.CodecType == "audio" && info.Audio == nil:
+		case s.CodecType == "audio" && (info.Audio == nil || !audioDefault && s.Disposition["default"] != 0):
 			info.Audio = &mediaStream{Index: s.Index, Codec: s.CodecName}
+			audioDefault = s.Disposition["default"] != 0
+			audioDuration = s.Duration
 		}
 		if info.CreationTime == nil {
 			info.CreationTime = creationTime(s.Tags)
 		}
 	}
+	info.Duration = declaredDuration(info.Format, audioDuration, p.Format.Duration)
 	return info, nil
+}
+
+// indexedFormats are the ffprobe format names whose declared duration comes
+// from the file's header or index (the MP4 moov, Matroska's segment info,
+// the AVI and ASF headers, FLV's onMetaData, WAV's data size, FLAC's
+// STREAMINFO): a file cut off after it was written still declares its full
+// length there, which is what the truncation check of prep looks for.
+// Raw bitstreams (aac/ADTS, mp3, ac3, …) are not in it: ffprobe estimates
+// their duration from the bitrate of the first frames ("Estimating
+// duration from bitrate, this may be inaccurate"), which for VBR audio is
+// off by any amount (review R5: a complete 2-minute VBR ADTS file declared
+// 54 min, a VBR MP3 without a Xing header 3:15). Neither is MPEG-TS or Ogg,
+// whose duration ffprobe reads from the timestamps at the end of the file:
+// a truncated one declares its truncated length anyway.
+var indexedFormats = map[string]bool{
+	"mov": true, "mp4": true, "matroska": true, "webm": true, "avi": true,
+	"asf": true, "flv": true, "wav": true, "w64": true, "flac": true,
+}
+
+// declaredDuration is mediaInfo.Duration: the duration the container
+// declares for the lecture's audio stream (streamDur), else for the whole
+// file (formatDur), in seconds — or 0 when the format is not one of the
+// indexedFormats, whose declared duration is not to be trusted. The audio
+// stream's own duration comes first because the file's is the longest of
+// its streams: a screen recording that went on after the microphone was
+// stopped is no truncated file.
+func declaredDuration(format, streamDur, formatDur string) float64 {
+	indexed := false
+	for _, f := range strings.Split(format, ",") {
+		indexed = indexed || indexedFormats[strings.TrimSpace(f)]
+	}
+	if !indexed {
+		return 0
+	}
+	for _, v := range []string{streamDur, formatDur} {
+		if d, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // creationTime reads the creation_time tag (any letter case). Values before
@@ -332,20 +390,29 @@ func probeMedia(ctx context.Context, tools mediaTools, media string) (mediaInfo,
 
 // ---------- generating stream.mp4 ----------
 
-// browserReady reports whether the media can be remuxed without re-encoding
-// (P8.1 "MP4 容器、H.264 视频、AAC 音频"): an MP4-family container, H.264
-// video in 8-bit 4:2:0 (what browsers decode; High 10 or 4:4:4 H.264 is not
-// playable) and AAC audio.
+// browserReady reports whether the media can be remuxed into stream.mp4
+// without re-encoding: H.264 video in 8-bit 4:2:0 (what browsers decode;
+// High 10 or 4:4:4 H.264 is not playable) and AAC audio, in any container.
+// test-media I5: an MKV from OBS, a TS or an FLV with these codecs used to
+// be transcoded in full only because of its container; -c copy -f mp4 gives
+// the MP4 with H.264 + AAC of P8.1 in seconds. A remux out of another
+// container that ffmpeg cannot finish falls back to the transcode, which
+// the stream task does (makeStream, errRemuxNeedsTranscode).
 func browserReady(info mediaInfo) bool {
-	mp4 := false
-	for _, f := range strings.Split(info.Format, ",") {
+	v, a := info.Video, info.Audio
+	return v != nil && a != nil && v.Codec == "h264" &&
+		(v.PixFmt == "" || v.PixFmt == "yuv420p" || v.PixFmt == "yuvj420p") && a.Codec == "aac"
+}
+
+// mp4Family reports whether ffprobe's format_name is the MP4 family
+// ("mov,mp4,m4a,3gp,3g2,mj2").
+func mp4Family(format string) bool {
+	for _, f := range strings.Split(format, ",") {
 		if strings.TrimSpace(f) == "mp4" {
-			mp4 = true
+			return true
 		}
 	}
-	v, a := info.Video, info.Audio
-	return mp4 && v != nil && a != nil && v.Codec == "h264" &&
-		(v.PixFmt == "" || v.PixFmt == "yuv420p" || v.PixFmt == "yuvj420p") && a.Codec == "aac"
+	return false
 }
 
 // streamArgs are the ffmpeg arguments that write out from media: a remux
@@ -402,7 +469,33 @@ func planOf(info mediaInfo) streamPlan {
 // place with replaceFile, so a partial file is never served; a stream.mp4
 // that another program has open (the player) is a prep.file_in_use error
 // and stays as it was.
+//
+// This is the stream task's call: a failed remux out of a container other
+// than MP4 falls back to the transcode right here. prep calls
+// makeStreamInPrep instead.
 func makeStream(ctx context.Context, tools mediaTools, dir, media string, info mediaInfo, progress func(float64)) (model.StreamState, error) {
+	return makeStreamWith(ctx, tools, dir, media, info, progress, true)
+}
+
+// errRemuxNeedsTranscode is the error of makeStreamInPrep when the remux out
+// of a container other than MP4 failed: the transcode it falls back to
+// takes minutes and is left to the stream task, like any other transcode
+// (stream-parallel), so that it never holds up prep and asr. It wraps the
+// remux's own error.
+var errRemuxNeedsTranscode = errors.New("remux failed, the playback file is to be transcoded by the stream task")
+
+// makeStreamInPrep is makeStream for prep: it never transcodes. A failed
+// remux out of a container other than MP4 returns errRemuxNeedsTranscode
+// (wrapping the remux error), and prep queues the stream task; out of an MP4
+// it stays the error it was.
+func makeStreamInPrep(ctx context.Context, tools mediaTools, dir, media string, info mediaInfo, progress func(float64)) (model.StreamState, error) {
+	return makeStreamWith(ctx, tools, dir, media, info, progress, false)
+}
+
+// makeStreamWith is makeStream; transcodeFallback tells whether a failed
+// remux out of a container other than MP4 falls back to the transcode here
+// (the stream task) or returns errRemuxNeedsTranscode (prep).
+func makeStreamWith(ctx context.Context, tools mediaTools, dir, media string, info mediaInfo, progress func(float64), transcodeFallback bool) (model.StreamState, error) {
 	out := filepath.Join(dir, model.StreamFile)
 	if info.Video == nil {
 		if err := os.Remove(out); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -439,6 +532,12 @@ func makeStream(ctx context.Context, tools mediaTools, dir, media string, info m
 			return noEncoderState(checks), nil
 		}
 	}
+	// A remux out of a container other than MP4 (test-media I5) depends on
+	// what ffmpeg makes of that container's timestamps and stream headers:
+	// when it fails, the transcode of before is tried rather than leaving
+	// the lecture without a playback file. The encoders are only checked
+	// then.
+	remuxFallback := remux && !mp4Family(info.Format)
 	// A transcode falls back to the next usable encoder when one fails for
 	// a reason that is not the file's (a hardware encoder can pass the test
 	// and still refuse a size, run out of sessions or glitch under load).
@@ -458,7 +557,8 @@ func makeStream(ctx context.Context, tools mediaTools, dir, media string, info m
 		used   = -1         // index of the encoder that made the file
 	)
 encoders:
-	for i, enc := range encoders {
+	for i := 0; i < len(encoders); i++ { // remuxFallback may append the encoders
+		enc := encoders[i]
 		for attempt := 1; attempt <= encoderAttempts(enc); attempt++ {
 			os.Remove(tmp)
 			stderr, err = tools.FFmpeg(ctx, dir, streamArgs(info, media, tmp, enc), mono)
@@ -472,7 +572,25 @@ encoders:
 			}
 			os.Remove(tmp)
 			if enc == "" {
-				return model.StreamState{}, mediaError(stderr, err)
+				merr := mediaError(stderr, err)
+				if !remuxFallback {
+					return model.StreamState{}, merr
+				}
+				if !transcodeFallback {
+					return model.StreamState{}, fmt.Errorf("%w: %w", errRemuxNeedsTranscode, merr)
+				}
+				checks, cerr := tools.H264Encoders(ctx)
+				if ctx.Err() != nil {
+					return model.StreamState{}, ctx.Err()
+				}
+				usable := usableEncoders(checks)
+				if cerr != nil || len(usable) == 0 {
+					slog.Warn("stream: remux failed and no H.264 encoder to transcode with", "dir", dir, "checks", checks, "err", cerr)
+					return model.StreamState{}, merr
+				}
+				slog.Warn("stream: remux failed, transcoding instead", "dir", dir, "format", info.Format, "err", merr)
+				encoders = append(encoders, usable...)
+				break
 			}
 			merr, fault := transcodeError(stderr, err, enc)
 			if sched.IsPermanent(merr) {
@@ -508,7 +626,7 @@ encoders:
 		return model.StreamState{}, streamFileError(err)
 	}
 	progress(1)
-	return model.StreamState{Status: StreamReady, Transcoded: !remux, SizeBytes: fi.Size()}, nil
+	return model.StreamState{Status: StreamReady, Transcoded: encoders[used] != "", SizeBytes: fi.Size()}, nil
 }
 
 // streamFileError is the error of a stream.mp4 that could not be written

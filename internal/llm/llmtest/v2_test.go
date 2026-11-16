@@ -97,8 +97,8 @@ func TestTruncatedAnswer(t *testing.T) {
 	if !errors.Is(err, llm.ErrTruncated) || !sched.IsPermanent(err) {
 		t.Fatalf("err %v, want a permanent llm.ErrTruncated", err)
 	}
-	if n := s.Count(llmtest.RoleGlossaryJanitor); n != 2 {
-		t.Errorf("%d requests, want 2 (one retry with a doubled limit)", n)
+	if n := s.Count(llmtest.RoleGlossaryJanitor); n != 3 {
+		t.Errorf("%d requests, want 3 (v3.2.x P1-c: two retries, each with a doubled limit)", n)
 	}
 	s.Handle(llmtest.RoleGlossaryJanitor, nil)
 	if res, err := c.Complete(context.Background(), model.RoleGlossaryJanitor, req.System, req.User, true); err != nil || strings.TrimSpace(res.Text) != `{"actions": []}` {

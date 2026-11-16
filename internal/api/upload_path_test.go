@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -20,8 +21,23 @@ import (
 
 // SPEC-v3 V1.4: desktop-mode uploads by local path (upload_path.go).
 
-// pathUpload posts a JSON path upload with the desktop token.
+// grant registers paths as the desktop main process does when the system
+// dialog or a drop hands them to the page (pathgrant.go, T-SEC-08).
+func (e *env) grant(paths ...string) { e.srv.grants.add(paths) }
+
+// pathUpload posts a JSON path upload with the desktop token. Like the
+// page, it sends a path the user picked: the main process's grant for it is
+// registered first (ungrantedUpload sends one without).
 func (e *env) pathUpload(path string, body map[string]any) (*http.Response, []byte) {
+	e.t.Helper()
+	if p, ok := body["path"].(string); ok && p != "" {
+		e.grant(p)
+	}
+	return e.ungrantedUpload(path, body)
+}
+
+// ungrantedUpload posts a JSON path upload with the desktop token and no grant.
+func (e *env) ungrantedUpload(path string, body map[string]any) (*http.Response, []byte) {
 	e.t.Helper()
 	b, err := json.Marshal(body)
 	if err != nil {
@@ -156,6 +172,7 @@ func TestPathUploadLectureMatchesHTTP(t *testing.T) {
 	// PUT /media of a draft by path.
 	src2 := writeSrc(t, t.TempDir(), "Week 1 Intro (fixed).m4a", []byte("audio"))
 	b, _ = json.Marshal(map[string]any{"path": src2})
+	e.grant(src2)
 	res, b = e.doWith("PUT", "/api/lectures/"+byPath.ID+"/media", b, testToken, "")
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("replace media by path: %d %s", res.StatusCode, b)
@@ -399,9 +416,14 @@ func TestPathUploadCancelRemovesTemp(t *testing.T) {
 	}
 
 	// A copy whose request went away stops and leaves nothing behind.
+	e.grant(src)
 	_, err := e.srv.copyFromPath(ctx, pathRequest{path: src, fields: map[string]string{}}, dir, "media", nil)
 	if err == nil || ctx.Err() == nil {
 		t.Fatalf("copy with a cancelled context: %v", err)
+	}
+	// the cancellation itself, not a refusal before the copy (SEC24 L4)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("copy with a cancelled context: %v, want context.Canceled", err)
 	}
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 0 {

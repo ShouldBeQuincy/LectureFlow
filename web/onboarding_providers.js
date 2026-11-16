@@ -42,7 +42,15 @@ function text(key, params) {
   return key && has(key) ? t(key, params) : '';
 }
 
-function extLink(href, label, fkey) {
+// A preset's link (signup_url, keys_url, pricing_url, terms_url) is a link
+// only when it is https (AUD5 info-1: the list may come from the network
+// one day; the other external links of the app check the same): anything
+// else is not drawn at all.
+const httpsURL = (u) => (typeof u === 'string' && /^https:\/\/\S+$/i.test(u) ? u : '');
+
+function extLink(url, label, fkey) {
+  const href = httpsURL(url);
+  if (!href) return null;
   return h(
     'a',
     {
@@ -96,7 +104,7 @@ export function providersStep(env) {
       S.envKeys = Array.isArray(envKeys) ? envKeys : [];
       S.providers = providers || [];
       S.region = sources && sources.suggest_mirror ? 'cn' : '';
-      if (!S.tier || !tierByID(S.tier)) S.tier = S.presets.default || (S.presets.tiers[0] && S.presets.tiers[0].id) || '';
+      if (!S.tier || !tierByID(S.tier)) S.tier = (tierByID(S.presets.default) && S.presets.default) || (tiers()[0] && tiers()[0].id) || '';
     } catch (e) {
       S.error = e.message;
     }
@@ -112,7 +120,11 @@ export function providersStep(env) {
     }
   }
 
-  const tierByID = (id) => ((S.presets && S.presets.tiers) || []).find((x) => x.id === id) || null;
+  // r7 (T22 S6): the settings page offers this step in a dialog ("add from
+  // a preset", env.inSettings): there "transcription only" is no choice (it
+  // would change nothing; a provider is removed in the list itself)
+  const tiers = () => ((S.presets && S.presets.tiers) || []).filter((x) => !(env.inSettings && x.transcribe_only));
+  const tierByID = (id) => tiers().find((x) => x.id === id) || null;
   const presetByID = (id) => ((S.presets && S.presets.providers) || []).find((p) => p.id === id) || null;
 
   function freeID() {
@@ -127,6 +139,23 @@ export function providersStep(env) {
     if (!tier || tier.transcribe_only) return [];
     const ids = new Set(Object.values(tier.roles || {}).map((r) => resolve(r.provider)));
     return ((S.presets && S.presets.providers) || []).filter((p) => ids.has(p.id));
+  }
+
+  // r7 (R75 M1): what the chosen plan would set, for the settings' dialog,
+  // which never runs apply(): it changes roles only after its own
+  // confirmation and keeps their parameters. Each role of the plan with its
+  // preset service, the configured provider when it has a key (else null)
+  // and the model; the free services the zero-cost plan sends at night
+  // only (configured, with a key). null for no plan or transcription only.
+  function planOf() {
+    const tier = tierByID(S.tier);
+    if (!tier || tier.transcribe_only) return null;
+    const roles = Object.entries(tier.roles || {}).map(([role, r]) => {
+      const pp = presetByID(resolve(r.provider));
+      return { role, preset: pp, provider: pp && ready(pp) ? existing(pp) : null, model: r.model || (pp && pp.default_model) || '' };
+    });
+    const night = tier.night_processing ? tierProviders(tier).filter((pp) => pp.free && ready(pp)).map(existing) : [];
+    return { tier, name: text(tier.name_key) || tier.id, roles, night, nightTariff: nightTariff(), nightFrom: NIGHT_TO, nightTo: NIGHT_FROM };
   }
 
   // The configured provider row of a preset service (same base URL).
@@ -274,7 +303,7 @@ export function providersStep(env) {
       h(
         'div',
         { class: 'ob-tiers', role: 'radiogroup' },
-        (S.presets.tiers || []).map((tier) =>
+        tiers().map((tier) =>
           h(
             'label',
             { class: 'ob-tier' + (tier.id === S.tier ? ' is-on' : '') },
@@ -369,6 +398,7 @@ export function providersStep(env) {
   }
 
   return {
+    plan: planOf,
     title: () => t('onboarding.providers.title'),
     desc: () => t('onboarding.providers.desc'),
     body() {

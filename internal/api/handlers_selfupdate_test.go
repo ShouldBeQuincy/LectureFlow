@@ -250,7 +250,14 @@ func TestSelfUpdateImportPaths(t *testing.T) {
 		os.WriteFile(p, b, 0o644)
 		return p
 	}
-	post := func(body any) (*http.Response, []byte) {
+	post := func(body map[string]any) (*http.Response, []byte) {
+		// the paths come from the dialog: the main process granted them (T-SEC-08)
+		if p, ok := body["path"].(string); ok {
+			e.grant(p)
+		}
+		if ps, ok := body["paths"].([]string); ok {
+			e.grant(ps...)
+		}
 		b, _ := json.Marshal(body)
 		return e.doWith("POST", "/api/selfupdate/import", b, testToken, "")
 	}

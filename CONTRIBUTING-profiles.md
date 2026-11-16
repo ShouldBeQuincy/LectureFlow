@@ -6,7 +6,7 @@
 
 The LectureFlow browser extension finds the audio and video tracks of a lecture recording on any site by itself (generic detection). A **platform profile** teaches it about one recording platform: which pages are lecture players, where the lecture's ID and title are, what each track is called and which ones to tick by default, and whether the stream may be restricted by the lecturer's or university's policy. Support for new platforms comes from profiles contributed by students, so no change to the extension's code is needed.
 
-A profile is a JSON file of declarations only. It cannot contain scripts. It filters, names and describes what the extension finds on the page; the one request a profile can add is `sessionInfo`: after you click to send from a folder list, the extension asks the platform, at the page's own address (same origin), for the details of each lecture being sent, as the platform's own player page does. At worst a wrong profile gives a track the wrong name or fails to read a lecture's details; it cannot make the extension request another site. Profiles and their fixtures are released under **CC0 1.0**, and a pull request that only contains them needs **no CLA** (see [Licence](#licence)).
+A profile is a JSON file of declarations only. It cannot contain scripts. It filters, names and describes what the extension finds on the page; the one request a profile can add is `sessionInfo`: after you click to send from a folder list, the extension asks the platform, at the page's own address (same origin), for the details of each lecture being sent, as the platform's own player page does. At worst a wrong profile gives a track the wrong name or fails to read a lecture's details; it cannot make the extension request another site. A profile you import locally (unreviewed) may only use `GET` for `sessionInfo`; `POST` is used only once the profile has been reviewed in a pull request and ships with the extension. Profiles and their fixtures are released under **CC0 1.0**, and a pull request that only contains them needs **no CLA** (see [Licence](#licence)).
 
 ### Using an AI coding agent
 
@@ -34,8 +34,9 @@ In the popup, click **Export detection report**. You get `lectureflow-report-<pl
 
 The report contains **only**:
 
-- the scheme, host and path of addresses. Long ID-like parts of a path (UUIDs, long numbers, long letter-and-digit runs, tickets) are replaced by fakes of the same shape, the same ID always by the same fake, so your profile's patterns still match;
-- the **names** of query parameters; every value becomes a placeholder such as `{uuid-1}` or `{tok120-3}`;
+- the scheme, host and path of addresses. ID-like or token-like parts of a path (UUIDs, long numbers, long letter-and-digit runs, tickets, and shorter runs that do not read as words and numbers) are replaced by fakes of the same shape, the same ID always by the same fake, so your profile's patterns still match; words with numbers such as `Week10Lecture2` or `1920x1080p30` stay;
+- the **names** of query parameters that have a value; every value becomes a placeholder such as `{uuid-1}` or `{tok120-3}`; a parameter without a value stays only when it is a common switch (such as `embed` or `download`) and becomes a placeholder otherwise;
+- language fields (DASH `lang`, HLS `LANGUAGE`) only when they are language tags in their usual case (`en`, `en-GB`, `zh-Hant-HK`); anything else is reduced to its shape;
 - playlists (m3u8, mpd) rebuilt from what the extension understands: addresses as above, numbers and enumerated attributes kept, free text reduced to its shape;
 - the structure of the page nodes your profile's selectors hit (tag, id, classes, attribute names), their text reduced to its shape (letters become x / X, digits 0).
 
@@ -61,7 +62,7 @@ The complete format is [`extension/schema/profile.schema.json`](extension/schema
 | `tracks[].supersedes` | — | Roles that lose their recommendation when this rule has a recommended track (Panopto: the full MP4 replaces the separate audio and pictures) |
 | `presets` | — | The roles behind the cards' three choices, “Main audio & video”, “Two cameras” and “Audio only”: `full` (a track that is picture and sound in one) and `audio` (the main audio). Without it, the first audio track and the video tracks in list order are used |
 | `inpage` | Elements panel on the player page and on the folder list | Where the extension's own “Send to LectureFlow” button goes, on sites you allowed: `player` (a stable anchor in the player page's header) and `list` (the row element, where each row's ID and title are, and where “Update this course in LectureFlow” goes). Check both the platform's own layout and the one inside the LMS iframe |
-| `sessionInfo` | Network panel on the player page: the request whose answer holds the lecture's tracks | Only with `inpage.list`, when the folder list itself carries no track information: method, path and form fields (`{sessionId}` is the only placeholder) of a request to the page's own origin. Sent only after the user clicks to send, only for the lectures being sent; its answer is read like the `observe` entry it names |
+| `sessionInfo` | Network panel on the player page: the request whose answer holds the lecture's tracks | Only with `inpage.list`, when the folder list itself carries no track information: method, path and form fields (`{sessionId}` is the only placeholder) of a request to the page's own origin. Sent only after the user clicks to send, only for the lectures being sent; its answer is read like the `observe` entry it names. A locally imported (unreviewed) profile may only use `GET`; `POST` needs review and ships with the extension |
 | `downloadPolicy.disabledWhen` | Compare a **restricted** lecture with one that is **not** (for example one where the lecturer turned off the platform's own download option) | Only with a reliable marker (a selector or an observed value). A match shows the restriction notice in the popup. If unsure, leave it out: the popup then says nothing |
 | `request.cookieUrls` | See below | `[]` or `["track"]` |
 | `request.maxConnectionsPerFile` | — | 4 by default; lower it if the platform throttles |
@@ -104,7 +105,7 @@ Open the pull request with the profile template: add `?template=profile.md` to t
 The **Extension** workflow ([`.github/workflows/extension.yml`](.github/workflows/extension.yml)) runs on every pull request:
 
 1. **Profiles and fixtures** ([`scripts/profilecheck/check.mjs`](scripts/profilecheck/check.mjs)), with one readable line per problem and a summary on the run's page:
-   - the JSON Schema and the rules a schema cannot express (every regular expression compiles, one capture group in `session.idFrom.pathPattern`, unique roles), with the same code the extension uses when you import a profile;
+   - the JSON Schema and the rules a schema cannot express (every regular expression compiles and cannot backtrack out of control: no backreferences or modifier groups, repeated groups of fixed width only, at most two `*` / `+` / `{n,}` never in a row, and few choices from `?`, `{n,m}` and `|` weighted by the width of what they apply to and of what must follow them, as set out in [docs/extension/adding-a-platform.md](docs/extension/adding-a-platform.md), which also describes the runtime guard that stops a profile whose regex is slow in use; one capture group in `session.idFrom.pathPattern`, unique roles), with the same code the extension uses when you import a profile;
    - the file is named after its `id`; a profile that is not a draft has fixtures; hosts are the platform's own;
    - nothing on the do-not-handle list ([`extension/src/lib/blocklist.js`](extension/src/lib/blocklist.js): YouTube, MOOCs and online or paid course platforms): no host or media host of those sites, and on a site where only some paths are refused (`linkedin.com/learning`, `bilibili.com/cheese`) a `match.pathPattern` that starts with `^/` and a fixed first path segment other than the refused one, so it can never reach those pages; the extension's "Import local profile" refuses the same;
    - only reports in `extension/fixtures/<id>/`, exported with this profile;
@@ -150,7 +151,7 @@ A merged profile ships with the next release of the extension. Each profile has 
 
 LectureFlow 浏览器扩展在任何网站上都能自己找出录播的音频、视频轨道（通用探测）。**对策文件**（platform profile）让它认识某一个录播平台：哪些页面是单节课的播放页，这节课的 ID 和标题在哪，每条轨道叫什么、默认勾选哪条，这条媒体流是否可能受讲师或大学政策限制。新平台的支持靠同学们提交对策文件完成，不需要改扩展代码。
 
-对策文件是只含声明的 JSON，不能写脚本。它只对扩展在页面上找到的东西做筛选、命名和说明；唯一能让扩展多发的请求是 `sessionInfo`：你在文件夹列表上点了发送之后，扩展为要发送的每节课，向该页同源的平台地址请求讲座信息，与平台自己的播放页发出的请求相同。写错了，最多是轨道名字不对或读不到讲座信息，不会让扩展去请求别的网站。对策文件和 fixtures 以 **CC0 1.0** 发布，只包含它们的 PR **不需要签 CLA**（见[许可](#许可)）。
+对策文件是只含声明的 JSON，不能写脚本。它只对扩展在页面上找到的东西做筛选、命名和说明；唯一能让扩展多发的请求是 `sessionInfo`：你在文件夹列表上点了发送之后，扩展为要发送的每节课，向该页同源的平台地址请求讲座信息，与平台自己的播放页发出的请求相同。写错了，最多是轨道名字不对或读不到讲座信息，不会让扩展去请求别的网站。本地导入的（未审核）对策文件，`sessionInfo` 只能用 `GET`；`POST` 要经过 PR 审核、随扩展打包后才会使用。对策文件和 fixtures 以 **CC0 1.0** 发布，只包含它们的 PR **不需要签 CLA**（见[许可](#许可)）。
 
 ### 用 AI agent 协助
 
@@ -178,8 +179,9 @@ LectureFlow 浏览器扩展在任何网站上都能自己找出录播的音频�
 
 报告**只**包含：
 
-- 地址的协议、域名和路径。路径里像 ID 的部分（UUID、长数字、长字母数字串、票据）换成形状相同的假值，同一个 ID 总是换成同一个假值，所以对策文件的正则照样能匹配；
-- 查询参数只留**名字**，值一律换成占位符，如 `{uuid-1}`、`{tok120-3}`；
+- 地址的协议、域名和路径。路径里像 ID 或令牌的部分（UUID、长数字、长字母数字串、票据，以及读起来不像单词加数字的较短的串）换成形状相同的假值，同一个 ID 总是换成同一个假值，所以对策文件的正则照样能匹配；`Week10Lecture2`、`1920x1080p30` 这类单词加数字的写法保留；
+- 有值的查询参数只留**名字**，值一律换成占位符，如 `{uuid-1}`、`{tok120-3}`；没有值的参数只有常见开关（如 `embed`、`download`）原样保留，其余也换成占位符；
+- 语言字段（DASH 的 `lang`、HLS 的 `LANGUAGE`）只保留规范写法的语言标签（如 `en`、`en-GB`、`zh-Hant-HK`），其他内容只留形状；
 - 播放清单（m3u8、mpd）按扩展能理解的内容重建：地址同上处理，数字和枚举属性保留，自由文本只留形状；
 - 对策文件选择器命中的页面节点的结构（标签、id、class、属性名），文字只留形状（字母变 x / X，数字变 0）。
 
@@ -205,7 +207,7 @@ LectureFlow 浏览器扩展在任何网站上都能自己找出录播的音频�
 | `tracks[].supersedes` | — | 这条规则有推荐的轨道时，这些角色不再推荐（Panopto：有完整 MP4 时，单独的音频和画面不再推荐） |
 | `presets` | — | 卡片上三个选项“主要音视频”“双机位”“仅音频”背后的角色：`full`（画面和声音在一起的轨道）与 `audio`（主讲音频）。不写时用第一条音频轨道，画面按列表顺序取 |
 | `inpage` | 在播放页和文件夹列表上用 Elements 面板看 | 扩展自己的“发送至 LectureFlow”按钮放在哪（只在你允许的站点上）：`player`（播放页页头里一个稳定的锚点）和 `list`（行元素、每行的 ID 和标题在哪、“更新这门课程到 LectureFlow”放在哪）。平台自己的版式和嵌在 LMS iframe 里的版式都要看 |
-| `sessionInfo` | 在播放页的 Network 面板里找响应中带轨道信息的那个请求 | 只在有 `inpage.list`、而文件夹列表本身没有轨道信息时才写：向该页同源地址发的请求的方法、路径与表单字段（只有 `{sessionId}` 一个占位符）。只在用户点了发送之后、只为要发送的那几节发出；响应按它指定的 `observe` 条目读取 |
+| `sessionInfo` | 在播放页的 Network 面板里找响应中带轨道信息的那个请求 | 只在有 `inpage.list`、而文件夹列表本身没有轨道信息时才写：向该页同源地址发的请求的方法、路径与表单字段（只有 `{sessionId}` 一个占位符）。只在用户点了发送之后、只为要发送的那几节发出；响应按它指定的 `observe` 条目读取。本地导入（未审核）的对策文件只能用 `GET`；`POST` 要经过审核、随扩展打包后才使用 |
 | `downloadPolicy.disabledWhen` | 比较一节**受限**和一节**不受限**的课（例如讲师关闭了平台自己的下载选项的那一节） | 只有可靠的标记（选择器或观察到的值）时才写；命中时弹窗显示受限提示。拿不准就不写，弹窗不会提示 |
 | `request.cookieUrls` | 见下 | `[]` 或 `["track"]` |
 | `request.maxConnectionsPerFile` | — | 默认 4；平台限流时调低 |
@@ -248,7 +250,7 @@ LectureFlow 浏览器扩展在任何网站上都能自己找出录播的音频�
 每个 PR 都会跑 **Extension** 工作流（[`.github/workflows/extension.yml`](.github/workflows/extension.yml)）：
 
 1. **对策文件与 fixtures**（[`scripts/profilecheck/check.mjs`](scripts/profilecheck/check.mjs)），每个问题一行可读的说明，运行页面上另有汇总：
-   - JSON Schema，以及 schema 表达不了的规则（每个正则都能编译、`session.idFrom.pathPattern` 恰好一个捕获组、role 不重复），用的是扩展导入对策文件时的同一段代码；
+   - JSON Schema，以及 schema 表达不了的规则（每个正则都能编译，而且不会回溯失控：不用反向引用和修饰符组，被重复的分组必须定宽，`*` / `+` / `{n,}` 最多两个且不能相邻，`?`、`{n,m}`、`|` 的选择连同它们作用对象及其后必需内容的宽度不能太多，确切规则见 [docs/extension/adding-a-platform.md](docs/extension/adding-a-platform.md)，那里也说明了使用中正则太慢时停用对策文件的运行时兜底；`session.idFrom.pathPattern` 恰好一个捕获组、role 不重复），用的是扩展导入对策文件时的同一段代码；
    - 文件名与 `id` 一致；不是草稿的对策文件必须有 fixtures；域名是平台自己的；
    - 不碰不处理名单（[`extension/src/lib/blocklist.js`](extension/src/lib/blocklist.js)：YouTube、MOOC 与在线 / 付费课程平台）：hosts 与 mediaHosts 不能是这些网站；只屏蔽部分路径的网站（`linkedin.com/learning`、`bilibili.com/cheese`）上，`match.pathPattern` 必须以 `^/` 加一个固定的、不是被屏蔽那一段的第一段路径开头，保证永远匹配不到那些页面；扩展的“导入本地对策文件”同样拒绝；
    - `extension/fixtures/<id>/` 里只有用这个对策文件导出的报告；

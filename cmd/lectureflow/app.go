@@ -81,6 +81,9 @@ type App struct {
 	// none was started).
 	manifestDone chan struct{}
 	closeOnce    sync.Once
+	// llm is the LLM client; its call log keeps a file open while requests
+	// run (T-PERF-08), closed on shutdown.
+	llm *llm.HTTPClient
 }
 
 // AppOptions lets tests adjust the scheduler (short intervals), the device
@@ -107,6 +110,10 @@ type AppOptions struct {
 	// Portable is the Windows portable build (-portable): the in-app update
 	// replaces the executable instead of running an installer.
 	Portable bool
+	// NoSelfUpdate (-no-self-update): this copy of the desktop app cannot
+	// replace itself; the in-app update installs nothing here
+	// (selfupdate.Options.NoInstall).
+	NoSelfUpdate bool
 	// SelfUpdate adjusts the in-app update's options (tests: fake sources).
 	SelfUpdate func(*selfupdate.Options)
 }
@@ -122,11 +129,11 @@ func buildApp(ctx context.Context, cfg *config.Config, o AppOptions) (*App, erro
 	}
 	st, err := db.Open(filepath.Join(cfg.DataDir, "lectureflow.db"))
 	if err != nil {
-		return nil, fmt.Errorf("open db: %w", err)
+		return nil, dbFailure(cfg.DataDir, "open db", err) // F5: coded when the cause is known
 	}
 	if err := state.Recover(ctx, st, cfg.DataDir); err != nil {
 		st.Close()
-		return nil, fmt.Errorf("startup recovery: %w", err)
+		return nil, dbFailure(cfg.DataDir, "startup recovery", err)
 	}
 	// After a data directory move: no Colab credential stays in the old
 	// directory's database (v3 Gate round 2).
@@ -304,7 +311,9 @@ func buildApp(ctx context.Context, cfg *config.Config, o AppOptions) (*App, erro
 		Invalidate: func(ctx context.Context, courseID string, cause state.StaleCause) error {
 			return s.InvalidateCourseWith(ctx, courseID, cause)
 		},
-		GPUTotalMB: func(ctx context.Context) int { return s.GPUStatus(ctx).TotalMB },
+		// perf-fix: the total VRAM does not change while the program runs;
+		// nvidia-smi runs only while no reading has succeeded yet
+		GPUTotalMB: s.GPUTotalMB,
 	}
 	for _, stg := range stages.All(d) {
 		s.Register(stg)
@@ -327,6 +336,8 @@ func buildApp(ctx context.Context, cfg *config.Config, o AppOptions) (*App, erro
 			return in, mx
 		},
 		NvidiaSMI: cfg.NvidiaSMI,
+		// T046: no nvidia-smi runs without an NVIDIA GPU
+		HasNVIDIA: hasNVIDIAFunc(st, reg.LastDetection),
 		Holidays:  set.HolidaySet, // v2 P12.2: the holiday data in effect
 		OnSample:  hub.Resources,
 		// SPEC-v2 I10 device cards
@@ -341,6 +352,7 @@ func buildApp(ctx context.Context, cfg *config.Config, o AppOptions) (*App, erro
 	if cb != nil {
 		resDeps.Remote = api.RemoteSnapshot(cb.Backend, s) // SPEC-v3 V14.5: the remote area
 	}
+	resDeps.RemoteCards = sshCards(s) // ssh-1b: the SSH servers' cards (ssh.go; nil while they are off)
 	res := resources.New(resDeps)
 	res.Start(ctx)
 	if cb != nil {
@@ -378,7 +390,10 @@ func buildApp(ctx context.Context, cfg *config.Config, o AppOptions) (*App, erro
 	// The in-app update (SPEC-ext 4): checks GitHub Releases at most once a
 	// day, only in desktop mode, and only once the public key is set.
 	suOpts := selfupdate.Options{DataDir: cfg.DataDir, Version: o.Version, KV: st,
-		Desktop: o.Desktop != nil, Portable: o.Portable, Log: slog.Default()}
+		Desktop: o.Desktop != nil, Portable: o.Portable, NoInstall: o.NoSelfUpdate, Log: slog.Default()}
+	if o.Desktop != nil {
+		suOpts.InstallDir = o.Desktop.InstallDir // security audit M-4
+	}
 	if dl != nil {
 		suOpts.Downloader = updateDownloader(dl)
 	}
@@ -404,11 +419,20 @@ func buildApp(ctx context.Context, cfg *config.Config, o AppOptions) (*App, erro
 		// absolute paths fixed (SetRelocateHooks replaces both at once).
 		srv.SetRelocateHooks(api.RelocateHooks{
 			FixComponents: func(oldRoot, newRoot string) error { return components.Relocated(oldRoot, newRoot) },
-			PauseDispatch: s.PauseDispatch,
+			PauseDispatch: func() func() {
+				resume := s.PauseDispatch()
+				// The call log's open file would keep the old folder busy
+				// on Windows (T-PERF-08); the next request opens it again.
+				if err := llmc.CloseLogs(); err != nil {
+					slog.Warn("llm logs not closed", "err", err)
+				}
+				return resume
+			},
 		})
 	}
 	return &App{Cfg: cfg, Store: st, Settings: set, Sched: s, Server: srv, Hub: hub, Resources: res, Devices: reg,
-		keepAwake: keepAwake, Components: comps, redetect: redetect, compsUnsub: compsUnsub, Colab: cb, Downloads: dl, SelfUpdate: upd}, nil
+		keepAwake: keepAwake, Components: comps, redetect: redetect, compsUnsub: compsUnsub, Colab: cb, Downloads: dl, SelfUpdate: upd,
+		llm: llmc}, nil
 }
 
 // openComponents opens the component manager of cfg.DataDir (both modes),
@@ -606,6 +630,10 @@ func (a *App) shutdown(deadline time.Time, srv *http.Server) {
 		slog.Warn("graceful stop: running jobs did not end in time; startup recovery handles them")
 	}
 	closeSSH(a.Sched) // ssh-mvp: after the runs ended (ssh.go)
+	// The call log's open file (T-PERF-08; CloseLogs is nil-safe).
+	if err := a.llm.CloseLogs(); err != nil {
+		slog.Warn("graceful stop: llm logs not closed", "err", err)
+	}
 	if a.SelfUpdate != nil {
 		a.SelfUpdate.Close() // a running update download stops where it is
 	}

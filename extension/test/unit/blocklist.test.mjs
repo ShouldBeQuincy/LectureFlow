@@ -17,7 +17,8 @@ import {
   hostCategory, originCategory, normalizeHost, normalizePath, wildcardCategory, wildcardTouchesBlocked, pathEntriesFor,
   pathPatternMayReach, schemaHostPattern, excludeMatchPatterns,
 } from '../../src/lib/blocklist.js';
-import { screenScan, contextCategory, documentCategory } from '../../src/lib/blockedframes.js';
+import { screenScan, contextCategory, documentCategory, titleOfFrame } from '../../src/lib/blockedframes.js';
+import { scanFrame, frameTitle } from '../../src/content/scan.js';
 import { checkProfile, blockedMatchErrors } from '../../src/lib/profile.js';
 import { detectTracks } from '../../src/lib/detect.js';
 import { sendBlockedCategory, sendable } from '../../src/lib/send.js';
@@ -44,7 +45,7 @@ test('the list: two categories, well-formed entries, each once; YouTube and the 
   // no entry is covered by another (a host under a host entry, a path under its host)
   for (const h of BLOCKED_HOSTS) assert.ok(!BLOCKED_HOSTS.some((b) => b !== h && h.endsWith(`.${b}`)), h);
   for (const e of BLOCKED_PATHS) assert.equal(hostCategory(e.host), '', `${e.host}${e.path}: the host is blocked whole`);
-  for (const h of ['youtube.com', 'youtu.be', 'youtube-nocookie.com', 'youtubekids.com', 'googlevideo.com']) assert.equal(hostCategory(h), CATEGORY_YOUTUBE, h);
+  for (const h of ['youtube.com', 'youtu.be', 'youtube-nocookie.com', 'youtubekids.com', 'youtube.googleapis.com', 'youtubeeducation.com', 'googlevideo.com']) assert.equal(hostCategory(h), CATEGORY_YOUTUBE, h);
   for (const e of ['udemy.com', 'coursera.org', 'edx.org', 'linkedin.com/learning', 'icourse163.org', 'xuetangx.com', 'study.163.com', 'ke.qq.com', 'bilibili.com/cheese', 'stepik.org', 'mooc.fi', 'mitxonline.mit.edu', 'openhpi.de', 'openlearning.com', 'smartedu.cn', 'edx-video.net', 'ximalaya.com', 'gumroad.com', 'skool.com', 'practicum.yandex.ru', 'swayam.gov.in', 'nptel.ac.in', 'byjus.com']) {
     assert.ok(BLOCKLIST.some(([c, x]) => c === CATEGORY_COURSES && x === e), e);
   }
@@ -67,6 +68,12 @@ test('hosts: subdomains, case, trailing dot, IDN, port and user info; look-alike
   for (const h of ['notyoutube.com', 'youtube.com.example.org', 'udemy.com.evil.example', 'evil-udemy.com', 'video.example.edu', 'tenant.cloud.panopto.eu', 'oreilly.com', 'www.oreilly.com', '163.com', 'qq.com', 'linkedin.com', 'www.linkedin.com', 'bilibili.com', 'xn--fiqs8s.example', '', '   ', 'http://']) {
     assert.equal(isBlockedHost(h), false, h);
   }
+  // YouTube's embed host for schools (AUD3 信-4): the host and its subdomains, not look-alikes
+  for (const h of ['youtubeeducation.com', 'www.youtubeeducation.com', 'WWW.YouTubeEducation.com.']) assert.equal(hostCategory(h), CATEGORY_YOUTUBE, h);
+  for (const h of ['notyoutubeeducation.com', 'youtubeeducation.com.example.org', 'youtubeeducation.co']) assert.equal(hostCategory(h), '', h);
+  assert.equal(blockedCategory('https://www.youtubeeducation.com/embed/abc?origin=https://lms.example.edu'), CATEGORY_YOUTUBE);
+  assert.ok(excludeMatchPatterns().includes('*://*.youtubeeducation.com/*'), 'no content script there');
+  assert.ok(new RegExp(schema.$defs.host.not.pattern, 'u').test('*.youtubeeducation.com'), 'a profile cannot match it');
   assert.equal(normalizeHost('WWW.YouTube.COM.:443'), 'www.youtube.com');
   assert.equal(normalizeHost('bücher.example'), 'xn--bcher-kva.example');
   assert.equal(hostCategory('www.udemy.com'), CATEGORY_COURSES);
@@ -320,4 +327,63 @@ test('the popup’s unsupported view carries the category', () => {
   assert.deepEqual(popupView({ detection: { status: 'unsupported', category: 'youtube' } }), { view: 'unsupported', reason: 'youtube' });
   assert.deepEqual(popupView({ detection: { status: 'unsupported', category: 'courses' } }), { view: 'unsupported', reason: 'courses' });
   assert.deepEqual(popupView({ detection: { status: 'unsupported' } }), { view: 'unsupported', reason: '' });
+});
+
+// ------------------------------------------------------ the page title
+
+test('the page title (generic detection, T048) is read only after the blocklist checks, never from a blocked site', () => {
+  const page = 'https://lectures.example.edu/watch/7';
+  const read = (o = {}) => ({ url: page, title: 'Week 7 | Example', history: [page], ancestors: [], ...o });
+  assert.equal(titleOfFrame(read(), { scannedUrl: page, topUrl: page }), 'Week 7 | Example');
+  assert.equal(titleOfFrame(read({ url: `${page}#t=60` }), { scannedUrl: page }), 'Week 7 | Example', 'a fragment is the same document');
+  // the frame itself, what its document showed, the tab's page, an origin it sits inside
+  for (const [o, topUrl] of [
+    [{ url: 'https://www.youtube.com/watch?v=x' }, ''],
+    [{ url: 'https://www.coursera.org/learn/x/lecture/1' }, ''],
+    [{ history: ['https://www.linkedin.com/learning/x', page] }, ''],
+    [{ ancestors: ['https://www.udemy.com'] }, ''],
+    [{}, 'https://www.edx.org/course/x'],
+  ]) {
+    const r = read(o);
+    assert.equal(titleOfFrame(r, { scannedUrl: r.url, topUrl }), '', JSON.stringify([o, topUrl]));
+  }
+  // not the document the screened scan saw (it navigated in between), or nothing usable
+  assert.equal(titleOfFrame(read({ url: 'https://lectures.example.edu/watch/8' }), { scannedUrl: page }), '');
+  for (const bad of [null, undefined, 'x', {}, { url: page }, { url: page, title: 1 }, read({ url: 'javascript:alert(1)' })]) {
+    assert.equal(titleOfFrame(bad, { scannedUrl: page }), '');
+  }
+});
+
+test('the scan reads no title; frameTitle reads it only while the frame still shows the screened address (SEC15 L3)', () => {
+  assert.ok(!scanFrame.toString().includes('document.title'), 'scanFrame reads no title');
+  const keys = ['location', 'document', 'performance', 'navigation'];
+  const saved = Object.fromEntries(keys.map((k) => [k, Object.getOwnPropertyDescriptor(globalThis, k)]));
+  const def = (k, v) => Object.defineProperty(globalThis, k, { value: v, configurable: true, writable: true });
+  let reads = 0;
+  try {
+    def('location', { href: 'https://lectures.example.edu/watch/7#t=5', ancestorOrigins: ['https://lms.example.edu'] });
+    def('document', {
+      get title() {
+        reads += 1;
+        return '  Week 7 \n | Example  ';
+      },
+    });
+    def('performance', { getEntriesByType: () => [{ name: 'https://lectures.example.edu/watch/7' }] });
+    def('navigation', undefined);
+    assert.deepEqual(frameTitle('https://lectures.example.edu/watch/7'), { url: 'https://lectures.example.edu/watch/7#t=5', title: 'Week 7 | Example', history: ['https://lectures.example.edu/watch/7'], ancestors: ['https://lms.example.edu'] });
+    assert.equal(reads, 1);
+    // The page moved on (to a blocked path of the same site, say) after the
+    // scan: the title is not read at all, not merely dropped later.
+    def('location', { href: 'https://www.linkedin.com/learning/x', ancestorOrigins: [] });
+    for (const expected of ['https://www.linkedin.com/feed/', undefined, '', 42]) {
+      const r = frameTitle(expected);
+      assert.equal(r.title, '', String(expected));
+    }
+    assert.equal(reads, 1, 'document.title was not touched');
+  } finally {
+    for (const k of keys) {
+      if (saved[k]) Object.defineProperty(globalThis, k, saved[k]);
+      else delete globalThis[k];
+    }
+  }
 });

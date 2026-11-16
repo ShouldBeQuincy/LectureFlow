@@ -99,8 +99,14 @@ func (m *Manager) buildVenv(ctx context.Context, t *task, it *item, pyExe, venv,
 			return uvError("venv", out, err)
 		}
 	}
+	// --no-build: wheels only. The lock file also lists the hashes of the
+	// source distributions; an index that offers only those would make uv
+	// build them with build dependencies (setuptools, ...) that are not in
+	// the lock file and not checked against any hash. Every lock is compiled
+	// with --only-binary :all: (refresh-locks.ps1), so each package has a
+	// wheel for its platform.
 	sync := []string{"pip", "sync", "--no-config", "--python", venvPython(venv), "--require-hashes",
-		"--link-mode", "copy", "--system-certs"}
+		"--no-build", "--link-mode", "copy", "--system-certs"}
 	if it.offline != nil {
 		wheels, err := it.offline.extractWheels(ctx, filepath.Join(filepath.Dir(venv), "wheels"))
 		if err != nil {
@@ -118,6 +124,9 @@ func (m *Manager) buildVenv(ctx context.Context, t *task, it *item, pyExe, venv,
 	}
 	urls, err := t.man.indexURLs(t.src)
 	if err != nil {
+		if CodeOf(err) != "" {
+			return err
+		}
 		return cerr(CodeManifestInvalid, nil, err)
 	}
 	for i, u := range urls {
@@ -139,15 +148,15 @@ func (m *Manager) buildVenv(ctx context.Context, t *task, it *item, pyExe, venv,
 				break
 			}
 			m.log.Warn("components: a package does not match its hash; clearing it from uv's cache and retrying",
-				"index", u.URL, "error", tail(out, 8))
+				"index", redactURL(u.URL), "error", tail(out, 8))
 			m.forgetCached(ctx, out)
 		}
 		if CodeOf(e) == CodeDiskFull || i == len(urls)-1 {
 			return e
 		}
-		m.log.Warn("components: package index failed; trying the next one", "index", u.URL, "error", ErrorInfoOf(e).Detail)
+		m.log.Warn("components: package index failed; trying the next one", "index", redactURL(u.URL), "error", ErrorInfoOf(e).Detail)
 		m.notice(t, model.ErrorInfo{Code: CodeMirrorFallback,
-			Params: map[string]any{"group": u.Group, "mirror": u.Mirror, "reason": CodeOf(e)}})
+			Params: map[string]any{"group": u.Group, "mirror": redactURL(u.Mirror), "reason": CodeOf(e)}})
 	}
 	return nil
 }
@@ -217,9 +226,10 @@ func sha256Hex(b []byte) string {
 	return hex.EncodeToString(s[:])
 }
 
-// httpGetLimited GETs a small document.
+// httpGetLimited GETs a small document (a lock file; with the redirect
+// chain's state, download.go).
 func httpGetLimited(ctx context.Context, c *http.Client, url string, limit int64) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(withRedirectChain(ctx), http.MethodGet, url, nil)
 	if err != nil {
 		return nil, cerr(CodeNetwork, nil, err)
 	}

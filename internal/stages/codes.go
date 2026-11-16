@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"lectureflow/internal/model"
+	"lectureflow/internal/qa"
 	"lectureflow/internal/remote"
 	"lectureflow/internal/state"
 )
@@ -114,15 +115,21 @@ const (
 
 // Notes and warnings (kinds note, warning).
 const (
-	NoteGlossarySeedNoText = "glossary.seed_no_text"       //
-	NoteGlossarySeedDone   = "glossary.seed_done"          // n, inserted, filled_zh; extra fallback_applied, seed_capped
-	NoteFallbackApplied    = "glossary.fallback_applied"   // reference, disabled
-	NoteGlossarySeedCapped = "glossary.seed_capped"        // returned, max
-	NoteMaterialNoText     = "material.no_text"            //
-	NoteMaterialTermsDone  = "material.terms_done"         // n, inserted, filled_zh; extra fallback_applied, terms_capped, chunks_skipped
-	NoteMaterialCapped     = "material.terms_capped"       // chunks, returned, max
-	NoteMaterialSkipped    = "material.chunks_skipped"     // total, chunks
-	WarnMaterialTermsLost  = "material.terms_lost"         // filename, total, chunks, attempts
+	NoteGlossarySeedNoText = "glossary.seed_no_text"     //
+	NoteGlossarySeedDone   = "glossary.seed_done"        // n, inserted, filled_zh; extra fallback_applied, seed_capped
+	NoteFallbackApplied    = "glossary.fallback_applied" // reference, disabled
+	NoteGlossarySeedCapped = "glossary.seed_capped"      // returned, max
+	NoteMaterialNoText     = "material.no_text"          //
+	NoteMaterialTermsDone  = "material.terms_done"       // n, inserted, filled_zh; extra fallback_applied, terms_capped, chunks_skipped, chunks_refused
+	NoteMaterialCapped     = "material.terms_capped"     // chunks, returned, max
+	NoteMaterialSkipped    = "material.chunks_skipped"   // total, chunks
+	WarnMaterialTermsLost  = "material.terms_lost"       // filename, total, chunks, attempts
+
+	// NoteMaterialRefused, WarnMaterialTermsRefused: chunks the provider
+	// declined (llm.refusal), skipped (review fix of v3.2.x P1).
+	NoteMaterialRefused      = "material.chunks_refused" // total, chunks
+	WarnMaterialTermsRefused = "material.terms_refused"  // filename, total, chunks
+
 	NoteJanitorDone        = "janitor.done"                // n, enforce, reference, disable, merge, fix_zh, rejected; extra noops, split, batches
 	NoteJanitorNoops       = "janitor.noops"               // n
 	NoteJanitorIgnored     = "janitor.ignored"             // n (the report's note; extra split)
@@ -132,8 +139,22 @@ const (
 	NoteJanitorUnavailable = "janitor.unavailable"         // n (terms changed by the G2 rule)
 	NoteRepairChunksFailed = "repair.chunks_failed"        // total, chunks, ranges, attempts
 	WarnRepairUnrepaired   = "repair.sentences_unrepaired" // ranges, attempts
+
+	// NoteRepairChunksRefused, WarnRepairRefused: chunks the provider
+	// declined (llm.refusal); their sentences keep the transcription (review
+	// fix of v3.2.x P1). Joined to the two above when both happen.
+	NoteRepairChunksRefused = "repair.chunks_refused"    // total, chunks, ranges
+	WarnRepairRefused       = "repair.sentences_refused" // ranges
+
+	// WarnTranslatePending (v3.2.x P1, Q2a): translate finished and n
+	// sentences have no translation ("待处理"); ids are their numbers. The
+	// reason of each sentence is its qa_error (qa.CodeSentenceUnusable,
+	// qa.CodeSentenceRefused; kind error, shown on the sentence).
+	WarnTranslatePending   = "translate.sentences_pending" // n, ids ("#3, #17…")
 	NotePrepKeptOriginal   = "prep.kept_original"          // stream_status
 	NotePrepEncoderRetried = "prep.stream_encoder_retried" // failed (encoders, "h264_qsv"), encoder (qsv-retry)
+	WarnPrepMediaTruncated = "prep.media_truncated"        // processed, declared ("m:ss" / "h:mm:ss"; test-media I9)
+	WarnPrepLowVolume      = "prep.low_volume"             // no params (round 2 N06: audio.wav below lowVolumeDBFS)
 )
 
 // Why the janitor's action was dropped (JanitorRejected.WhyCode, kind note).
@@ -148,6 +169,7 @@ const (
 	WhyTargetGone    = "janitor.rejected.target_gone"
 	WhyNoZh          = "janitor.rejected.no_zh"
 	WhyUserZh        = "janitor.rejected.user_zh"
+	WhyZhTooLong     = "janitor.rejected.zh_too_long" // over ctxbuild.TermZhMaxChars (AUD5 low-1)
 )
 
 // ErrorCodes lists the codes this package defines (errors, notes,
@@ -165,16 +187,17 @@ var ErrorCodes = func() []string {
 		CodePrepFileInUse, CodeExportFileInUse,
 		CodeSummaryNoSentences, CodeSummaryEmpty, CodeRepairNoSummary, CodeRepairAllFailed,
 		CodeTranslateNoSummary, CodeTranslateFailed, CodeTranslatePrefixChanged,
+		WarnTranslatePending, qa.CodeSentenceUnusable, qa.CodeSentenceRefused, // v3.2.x P1: pending sentences
 		CodeSnapshotMissing, CodeSentencesChanged, CodeOutputUnusable,
 		CodeGlossaryBadSource, CodeGlossaryNoSyllabus, CodeGlossarySyllabusMissing, CodeGlossarySyllabusNotUTF8,
 		CodeGlossaryReviewEnqueue, CodeMaterialFileMissing, CodeMaterialNotExtracted, CodeMaterialTermsUnparsable,
 		CodeJanitorFailedFallback, CodeJanitorFallbackFailed,
 		NoteGlossarySeedNoText, NoteGlossarySeedDone, NoteFallbackApplied, NoteGlossarySeedCapped,
-		NoteMaterialNoText, NoteMaterialTermsDone, NoteMaterialCapped, NoteMaterialSkipped, WarnMaterialTermsLost,
+		NoteMaterialNoText, NoteMaterialTermsDone, NoteMaterialCapped, NoteMaterialSkipped, WarnMaterialTermsLost, NoteMaterialRefused, WarnMaterialTermsRefused,
 		NoteJanitorDone, NoteJanitorNoops, NoteJanitorIgnored, NoteJanitorSplit, NoteJanitorBatches, NoteJanitorNothing, NoteJanitorUnavailable,
-		NoteRepairChunksFailed, WarnRepairUnrepaired, NotePrepKeptOriginal, NotePrepEncoderRetried,
+		NoteRepairChunksFailed, WarnRepairUnrepaired, NoteRepairChunksRefused, WarnRepairRefused, NotePrepKeptOriginal, NotePrepEncoderRetried, WarnPrepMediaTruncated, WarnPrepLowVolume,
 		WhyUnknownTerm, WhyLocked, WhyDuplicate, WhyUnknownAction, WhyNoTarget, WhySelf,
-		WhyTargetOff, WhyTargetGone, WhyNoZh, WhyUserZh,
+		WhyTargetOff, WhyTargetGone, WhyNoZh, WhyUserZh, WhyZhTooLong,
 		CodeRenumberedAuto, // kinds.go: a note on the course page (lecture kinds)
 		// asr_textrepair.go: "修复断句" (textrepair-int)
 		CodeTextRepairNoSentences, CodeTextRepairNoWords, CodeTextRepairUnparsable, CodeTextRepairLanguage,

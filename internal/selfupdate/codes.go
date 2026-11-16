@@ -51,7 +51,44 @@ const (
 	// computer may change it, so no update is downloaded, imported,
 	// installed or rolled back from it (CheckTrust).
 	CodeUntrustedDir = "selfupdate.untrusted_dir" // path, who
+
+	// The installation directory (HTTP 409; security audit M-4): another
+	// account of this computer may change LectureFlow's own program files
+	// there (or move the folder away), so no update is downloaded,
+	// imported, installed or rolled back in the app; the user installs the
+	// new version by hand (CheckInstallDir).
+	CodeUntrustedInstallDir = "selfupdate.untrusted_install_dir" // path, who
+
+	// Another copy of LectureFlow that shares the data directory (the
+	// installed and the portable one do by default) has an update waiting
+	// to be installed there (HTTP 409; othercopy.go): this copy downloads
+	// or imports none until that one is installed, since it would replace
+	// the other copy's pending.json and previous.json.
+	// kind is itself a coded text, {"code": CodeCopyInstaller | CodeCopyPortable}
+	// (copyParam): the page shows it inside the sentence, in its language.
+	CodeOtherCopyPending = "selfupdate.other_copy_pending" // version, kind: the waiting update and the copy it belongs to
+
+	// Names of the two Windows copies, used as the kind of
+	// CodeOtherCopyPending; never an answer of their own.
+	CodeCopyInstaller = "selfupdate.copy_installer" // the copy set up by the installer
+	CodeCopyPortable  = "selfupdate.copy_portable"  // the portable copy
 )
+
+// PartCodes are the codes of ErrorCodes that only occur inside another
+// code's text (they have a text and a catalogue entry, no HTTP status).
+var PartCodes = []string{CodeCopyInstaller, CodeCopyPortable}
+
+// copyParam names the copy a package of kind belongs to as a coded text
+// for a param: {"code": …}; a kind without a name stays as it is.
+func copyParam(kind string) any {
+	switch kind {
+	case KindInstaller:
+		return map[string]any{"code": CodeCopyInstaller}
+	case KindPortable:
+		return map[string]any{"code": CodeCopyPortable}
+	}
+	return kind
+}
 
 // ErrorCodes lists every code above (cmd's catalog test).
 var ErrorCodes = []string{
@@ -59,7 +96,8 @@ var ErrorCodes = []string{
 	CodeUnreachable, CodeNoManifest, CodeSignatureInvalid, CodeVersionMismatch, CodeManifestInvalid,
 	CodeDownloadFailed, CodeChecksum, CodeCancelled, CodeIO,
 	CodeNotNewer, CodeImportIncomplete, CodeImportInvalid,
-	CodeSourcesInvalid, CodeUntrustedDir,
+	CodeSourcesInvalid, CodeUntrustedDir, CodeUntrustedInstallDir, CodeOtherCopyPending,
+	CodeCopyInstaller, CodeCopyPortable,
 }
 
 // downloadCodes are the errors of a failed download; the others in

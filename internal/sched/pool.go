@@ -437,6 +437,12 @@ func (p *Pool) Acquire(ctx context.Context, provider string) (func(), error) {
 	if err := pp.acquire(ctx, p.priorityOf(ctx)); err != nil {
 		return nil, err
 	}
+	// The grant and the cancellation can be ready at the same moment (select
+	// picks either): a cancelled request never leaves with a slot.
+	if err := ctx.Err(); err != nil {
+		pp.release()
+		return nil, err
+	}
 	var once sync.Once
 	return func() { once.Do(pp.release) }, nil
 }
@@ -875,17 +881,33 @@ func (p *Pool) BudgetUnpriced(ctx context.Context) int64 {
 }
 
 // BudgetExceeded reports whether today's estimated cost reached the daily
-// budget. A database error is logged and treated as not exceeded.
+// budget. A database error is logged and treated as not exceeded (an error
+// caused by a cancelled ctx is not logged: nobody waits for the answer).
 func (p *Pool) BudgetExceeded(ctx context.Context) bool {
+	exceeded, _ := p.budgetState(ctx)
+	return exceeded
+}
+
+// budgetState is BudgetExceeded for waitBudget: it returns ctx's error when
+// ctx is done (before or during the lookup), so a cancelled request is never
+// mistaken for one under budget. A real database error keeps the documented
+// fail-open behaviour (not exceeded, nil error).
+func (p *Pool) budgetState(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if !p.budgetEnabled() {
-		return false
+		return false, nil
 	}
 	v, _, err := p.spentToday(ctx)
 	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return false, cerr
+		}
 		slog.Warn("budget check failed", "err", err)
-		return false
+		return false, nil
 	}
-	return v >= p.dailyBudget()
+	return v >= p.dailyBudget(), nil
 }
 
 // BudgetBlocked reports whether a running job is currently held in Acquire
@@ -900,8 +922,12 @@ func (p *Pool) BudgetBlocked(jobID string) bool {
 // local midnight (re-checked every BudgetPoll) or ctx is cancelled.
 // Requests already in flight are never interrupted.
 func (p *Pool) waitBudget(ctx context.Context) error {
-	if !p.budgetEnabled() || !p.BudgetExceeded(ctx) {
-		return nil
+	if !p.budgetEnabled() {
+		return ctx.Err()
+	}
+	exceeded, err := p.budgetState(ctx)
+	if err != nil || !exceeded {
+		return err
 	}
 	j, hasJob := JobFrom(ctx)
 	if hasJob {
@@ -917,7 +943,14 @@ func (p *Pool) waitBudget(ctx context.Context) error {
 		}()
 	}
 	slog.Info("daily LLM budget reached; holding API requests until tomorrow", "budget", p.dailyBudget())
-	for p.BudgetExceeded(ctx) {
+	for {
+		exceeded, err := p.budgetState(ctx)
+		if err != nil {
+			return err
+		}
+		if !exceeded {
+			return nil
+		}
 		wait := nextMidnight(p.o.Now()).Sub(p.o.Now())
 		if wait > p.o.BudgetPoll || wait <= 0 {
 			wait = p.o.BudgetPoll
@@ -930,7 +963,6 @@ func (p *Pool) waitBudget(ctx context.Context) error {
 		case <-t.C:
 		}
 	}
-	return nil
 }
 
 // ---------- v2 P12.6: dispatch only off-peak ----------

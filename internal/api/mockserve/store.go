@@ -65,6 +65,9 @@ type store struct {
 	// dev: the transcription devices, their self-tests and the power state
 	// (devices.go, SPEC-v2 I6-I10).
 	dev *devState
+	// history: per lecture, the usage of runs that are no longer current
+	// (Lecture.usage_total, r7.go).
+	history map[string]api.UsageStats
 }
 
 // shiftJSON parses b and moves every RFC3339 UTC timestamp by d.
@@ -174,6 +177,7 @@ func loadStore(dir string, now time.Time, empty bool) (*store, error) {
 	}
 	s.initKinds() // lecture kinds (kinds.go)
 	s.refreshAll()
+	seedHistory(s)      // Lecture.usage_total (r7.go)
 	initDevices(s, now) // devices.go (phase 3b)
 	return s, nil
 }
@@ -355,7 +359,7 @@ func (s *store) currentModel(stage string) *api.StageModel {
 	}
 	p, _ := s.providerByID(*rv.ProviderID)
 	temp := rv.Temperature
-	params := &model.RoleParams{Temperature: &temp, Window: rv.Window}
+	params := &model.RoleParams{Temperature: &temp, Window: rv.Window, MaxTokens: rv.MaxTokens, Batch: rv.Batch}
 	if th := rv.Thinking; th != "" && th != model.ThinkingOff {
 		params.Thinking = &th
 	}
@@ -495,6 +499,7 @@ func resetStage(st *api.StageView, status string) {
 	st.ASRTiming = nil  // the timing of the last run (the real asr stage clears it per attempt)
 	st.Checkpoint = nil // a new job: an older checkpoint is void
 	st.WaitingFor = nil
+	st.LLM, st.LastActivityAt = nil, nil // v3.2.x: the requests of the last run
 	if status == model.StatusQueued {
 		w := waitFor(st.Stage)
 		st.WaitingFor = &w
@@ -508,6 +513,9 @@ func (s *store) restartFrom(l *api.Lecture, i int, choice string) {
 		for j := i; j < len(l.Stages); j++ {
 			l.Stages[j].Model = s.currentModel(l.Stages[j].Stage)
 		}
+	}
+	for j := i; j < len(l.Stages); j++ {
+		s.retireUsage(l.ID, l.Stages[j].Stats) // usage_total keeps what the old jobs used (r7.go)
 	}
 	resetStage(&l.Stages[i], model.StatusQueued)
 	for j := i + 1; j < len(l.Stages); j++ {
@@ -597,6 +605,7 @@ func (s *store) cancel(id string, now time.Time) (*api.Lecture, error) {
 			}
 			st.Status = model.StatusCancelled
 			st.WaitingFor = nil
+			settleLLM(st)
 			delete(s.progress0, l.ID+"/"+st.Stage)
 			n++
 		}
@@ -609,6 +618,16 @@ func (s *store) cancel(id string, now time.Time) (*api.Lecture, error) {
 }
 
 func (s *store) stageAction(id, stage, action, choice string, now time.Time) (*api.Lecture, error) {
+	return s.stageActionWith(id, stage, action, api.ModelChoiceRequest{ModelChoice: choice}, now)
+}
+
+// stageActionWith is stageAction with the whole request body (v3.2.x: the
+// manual model of a retry, manual.go).
+func (s *store) stageActionWith(id, stage, action string, req api.ModelChoiceRequest, now time.Time) (*api.Lecture, error) {
+	choice := req.ModelChoice
+	if err := checkManual(stage, action, req); err != nil {
+		return nil, err
+	}
 	l, err := s.findLecture(id)
 	if err != nil {
 		return nil, err
@@ -638,14 +657,27 @@ func (s *store) stageAction(id, stage, action, choice string, now time.Time) (*a
 			st.FinishedAt = &t
 		}
 		st.Status, st.WaitingFor = model.StatusCancelled, nil
+		settleLLM(st)
 		delete(s.progress0, l.ID+"/"+st.Stage)
 	case model.ActionRetry:
-		if choice == "" {
-			if d := s.diffs(l, i, true); len(d) > 0 {
+		switch {
+		case choice == model.ModelChoiceManual:
+			m, err := s.manualModel(stage, *req.Manual, st.Model)
+			if err != nil {
+				return nil, err
+			}
+			st.Model = m // this stage only; downstream and the role untouched
+		case choice == "":
+			// v3.2.x P1-b (Q9a): the retry of an LLM stage also asks when
+			// the settings changed since the run; any other only when a
+			// snapshot cannot be used
+			if d := s.diffs(l, i, !manualStage(stage)); len(d) > 0 {
 				return nil, needsChoice(d)
 			}
-		} else if err := s.checkChoice(l, i, choice); err != nil {
-			return nil, err
+		default:
+			if err := s.checkChoice(l, i, choice); err != nil {
+				return nil, err
+			}
 		}
 		if choice == model.ModelChoiceCurrent {
 			for j := i; j < len(l.Stages); j++ {

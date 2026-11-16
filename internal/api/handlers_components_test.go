@@ -634,6 +634,7 @@ func TestComponentsImportDesktopPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := json.Marshal(map[string]string{"path": zipPath})
+	ce.grant(zipPath) // picked in the main process's dialog (T-SEC-08)
 	res, b := ce.doWith("POST", "/api/components/import", body, testToken, "")
 	if res.StatusCode != http.StatusAccepted {
 		t.Fatalf("import: %d %s", res.StatusCode, b)
@@ -720,6 +721,60 @@ func TestComponentsSources(t *testing.T) {
 	if tk.Items[0].Source != "default" || len(tk.Notes) != 1 || tk.Notes[0].Code != components.CodeMirrorFallback ||
 		tk.Notes[0].Params["group"] != "models" {
 		t.Errorf("install with a stored custom URL: %+v %+v", tk.Items[0], tk.Notes)
+	}
+}
+
+// Security audit M-1: a custom package index must be https, plain http
+// only for this computer; the models group keeps http.
+func TestComponentsSourcesInsecureIndex(t *testing.T) {
+	ce := newCompEnv(t, nil)
+	custom := func(u string) SourceChoice { return SourceChoice{Mode: "mirror", CustomURL: u} }
+	for _, u := range []string{"http://pypi.example.com/simple", "HTTP://pypi.example.com/simple",
+		"http://192.0.2.10:8080/simple", "http://127.0.0.1@pypi.example.com/simple", "http://localhost.example.com/simple"} {
+		info := ce.callErrInfo("PUT", "/api/components/sources", SourcesSetting{PyPI: custom(u)}, http.StatusBadRequest)
+		if info.Code != "components.sources_invalid" || info.Params["group"] != "pypi" || info.Params["field"] != "custom_url" {
+			t.Errorf("%s: %+v", u, info)
+		}
+	}
+	for _, u := range []string{"https://pypi.example.com/simple", "http://127.0.0.1/simple", "http://127.0.0.1:3141/simple",
+		"http://[::1]:3141/simple", "http://LocalHost/simple"} {
+		var v SourcesView
+		ce.call("PUT", "/api/components/sources", SourcesSetting{PyPI: custom(u)}, http.StatusOK, &v)
+		if v.PyPI.CustomURL != u {
+			t.Errorf("%s: %+v", u, v.PyPI)
+		}
+	}
+	var v SourcesView
+	ce.call("PUT", "/api/components/sources", SourcesSetting{Models: custom("http://hf.example.com")}, http.StatusOK, &v)
+	// a retry body may not switch to such an index either
+	tk := ce.install(tcOV)
+	ce.waitTask(tk.ID, "done", "failed")
+	info := ce.callErrInfo("POST", "/api/components/tasks/"+tk.ID+"/retry",
+		map[string]any{"pypi": custom("http://pypi.example.com/simple")}, http.StatusBadRequest)
+	if info.Code != "components.sources_invalid" || info.Params["field"] != "custom_url" {
+		t.Errorf("retry: %+v", info)
+	}
+
+	// an http index saved before the rule: read as it is (the page shows
+	// it, the setting is not rewritten), refused when an install uses it
+	legacy := `{"pypi":{"mode":"mirror","custom_url":"http://pypi.example.com/simple"},"models":{"mode":"default"}}`
+	if err := ce.st.SetKV(context.Background(), kvComponentsSources, legacy); err != nil {
+		t.Fatal(err)
+	}
+	ce.call("GET", "/api/components/sources", nil, http.StatusOK, &v)
+	if v.PyPI.Mode != "mirror" || v.PyPI.CustomURL != "http://pypi.example.com/simple" {
+		t.Errorf("stored legacy index: %+v", v.PyPI)
+	}
+	before := len(ce.tasks())
+	info = ce.callErrInfo("POST", "/api/components/install", map[string]any{"ids": []string{tcTiny}}, http.StatusBadRequest)
+	if info.Code != "components.sources_invalid" || info.Params["group"] != "pypi" || info.Params["field"] != "custom_url" {
+		t.Errorf("install with a stored http index: %+v", info)
+	}
+	if len(ce.tasks()) != before {
+		t.Error("a task started with an http package index")
+	}
+	if got, _, _ := ce.st.GetKV(context.Background(), kvComponentsSources); got != legacy {
+		t.Errorf("the stored setting changed: %s", got)
 	}
 }
 

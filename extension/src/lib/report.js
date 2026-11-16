@@ -24,18 +24,20 @@
 // data stops the export (findings), even where the redaction removed it.
 // Pure.
 
-import { createRedactor, shape, isIdentityField, tenantBasesOf } from './redact.js';
+import { createRedactor, shape, isIdentityField, tenantBasesOf, safeLanguage } from './redact.js';
 import { classifyUrl, C_OTHER, KIND_AUDIO, KIND_VIDEO } from './classify.js';
 import { summarize } from './detect.js';
 import { cleanObservedRecord } from './observe.js';
 import { parseHttpUrl, hostMatches } from './url.js';
+import { RETAIN_LIMITS } from './retain.js';
 
 export const REPORT_KIND = 'lectureflow-detection-report';
 export const REPORT_VERSION = 1;
-const MAX_TEXT = 512 * 1024;
+// a longer manifest text is left out (`truncated`); the background keeps no
+// longer one either (src/lib/retain.js reportTextLength)
+const MAX_TEXT = RETAIN_LIMITS.textChars;
 const MAX_NODES = 3;
-
-const LANG_RE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$/i;
+const REPORT_LIMIT_KEYS = ['frames', 'elements', 'sources', 'resources', 'webRequests', 'longUrls', 'scanChars', 'longValues', 'fileTracks', 'tracks'];
 
 /**
  * input: {
@@ -50,6 +52,9 @@ const LANG_RE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$/i;
  *   session: { sessionId, source },
  *   lecture: { title, recordedAt, durationSec },
  *   downloadPolicy: 'enabled' | 'disabled' | 'unknown',
+ *   limits: { frames, elements, sources, resources, webRequests, longUrls,
+ *     scanChars, longValues, fileTracks, tracks } | null: what was left out past a
+ *     limit (the report's `limits`, only the counts above 0),
  *   now: Date,
  * }
  * Returns { report, findings }. Export only when findings is empty.
@@ -129,8 +134,9 @@ export function buildReport(input) {
     if (f.purpose === 'file') out.size = f.size ?? -1;
     else {
       const text = String(f.text || '');
-      const body = text.replace(/^﻿/, '').trimStart();
-      if (body.length > MAX_TEXT) out.truncated = true;
+      const body = text.replace(/^\ufeff/, '').trimStart();
+      // f.truncated: the background did not keep this text (src/lib/retain.js)
+      if (f.truncated || body.length > MAX_TEXT) out.truncated = true;
       else if (body.startsWith('#EXTM3U')) out.text = r.hls(text);
       else if (body.startsWith('<')) out.text = r.mpd(text);
       else if (body) out.text = '';
@@ -214,6 +220,13 @@ export function buildReport(input) {
     dom,
     expected,
   };
+  // what the extension left out past its limits (docs/extension/limits.md), only when something was
+  const limits = {};
+  for (const k of REPORT_LIMIT_KEYS) {
+    const n = input.limits ? Number(input.limits[k]) : 0;
+    if (Number.isInteger(n) && n > 0) limits[k] = n;
+  }
+  if (Object.keys(limits).length) report.limits = limits;
 
   const findings = [...r.findings, ...scanReport(report)].map(({ kind, where, detail }) => ({ kind, where, detail }));
   return { report, findings: dedupeFindings(findings) };
@@ -258,7 +271,7 @@ export function redactTrack(r, t) {
   if (t.mime) out.mime = safeType(t.mime);
   if (t.variants) out.variants = t.variants.map((v) => ({ ...v, ...(v.url ? { url: r.url(v.url) } : {}), ...(v.id ? { id: r.segment(String(v.id)) } : {}) }));
   if (t.name) out.name = shape(t.name);
-  if (t.language) out.language = LANG_RE.test(t.language) ? t.language : shape(t.language);
+  if (t.language) out.language = safeLanguage(t.language);
   if (t.unreadable) out.unreadable = true;
   return out;
 }

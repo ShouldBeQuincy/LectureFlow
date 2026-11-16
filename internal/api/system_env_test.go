@@ -51,7 +51,7 @@ func (g *gpuQueries) opt(o *sched.Options) {
 // envCmd is fakeCmd whose self-tests answer for the device they were
 // given (--device …; the MLX worker has none: mlx:gpu).
 func envCmd(ctx context.Context, name string, args ...string) (string, string, error) {
-	if len(args) > 1 && args[1] == "--selftest" {
+	if isScriptRun(args, "--selftest") {
 		device := "mlx:gpu"
 		for i, a := range args {
 			if a == "--device" && i+1 < len(args) {
@@ -148,7 +148,8 @@ func TestExtDiagNVIDIA(t *testing.T) {
 		t.Errorf("cuda %+v", c)
 	}
 	runs := strings.Join(log.list(), "\n")
-	for _, w := range []string{"asr.py --check-cudnn", "asr.py --selftest --device cuda"} {
+	asr := " -s " + filepath.Join(de.cfg.WorkerDir, "asr.py")
+	for _, w := range []string{asr + " --check-cudnn", asr + " --selftest --device cuda"} {
 		if !strings.Contains(runs, w) {
 			t.Errorf("did not run %q; runs:\n%s", w, runs)
 		}
@@ -167,7 +168,7 @@ func TestExtDiagNVIDIA(t *testing.T) {
 	// cuDNN does not load: rated like CUDA (cuda:0 is enabled: error), with
 	// the worker's reason without the "ERROR: " prefix.
 	de.srv.runCmd = func(ctx context.Context, name string, args ...string) (string, string, error) {
-		if len(args) == 2 && args[1] == "--check-cudnn" {
+		if len(args) == 3 && isScriptRun(args, "--check-cudnn") {
 			return "", "Traceback ...\nERROR: cuDNN not found: cudnn64_9.dll", errUnknownCmd
 		}
 		return fakeCmd(ctx, name, args...)
@@ -212,7 +213,7 @@ func TestExtDiagAppleSilicon(t *testing.T) {
 	if c := by[checkMLXSelftest]; c.Status != statusOK || !strings.HasPrefix(c.Detail, "SELFTEST ok") {
 		t.Errorf("mlx self-test %+v", c)
 	}
-	if runs := strings.Join(log.list(), "\n"); !strings.Contains(runs, mlxPy+" "+filepath.Join(de.cfg.WorkerDir, "asr_mlx.py")+" --selftest --model "+modelDir) {
+	if runs := strings.Join(log.list(), "\n"); !strings.Contains(runs, mlxPy+" -s "+filepath.Join(de.cfg.WorkerDir, "asr_mlx.py")+" --selftest --model "+modelDir) {
 		t.Errorf("the MLX self-test did not run; runs:\n%s", runs)
 	}
 	noNVIDIARuns(t, log, gq)
@@ -243,7 +244,7 @@ func TestExtDiagAppleSilicon(t *testing.T) {
 	// The self-test fails: the worker's reason, the component hint.
 	loc.install(model.BackendMLX, "", "large-v3-turbo/fp16", modelDir)
 	de.srv.runCmd = func(ctx context.Context, name string, args ...string) (string, string, error) {
-		if len(args) > 1 && args[1] == "--selftest" {
+		if isScriptRun(args, "--selftest") {
 			return "ERROR_CODE device_unavailable\n", "ERROR: MLX reports no Metal GPU", errUnknownCmd
 		}
 		return fakeCmd(ctx, name, args...)
@@ -304,7 +305,7 @@ func TestExtDiagIntelCPU(t *testing.T) {
 		t.Errorf("cpu self-test %+v", c)
 	}
 	runs := strings.Join(log.list(), "\n")
-	if w := ovPy + " " + filepath.Join(de.cfg.WorkerDir, "asr_openvino.py") + " --selftest --device CPU --model " + ovModel; !strings.Contains(runs, w) {
+	if w := ovPy + " -s " + filepath.Join(de.cfg.WorkerDir, "asr_openvino.py") + " --selftest --device CPU --model " + ovModel; !strings.Contains(runs, w) {
 		t.Errorf("did not run %q; runs:\n%s", w, runs)
 	}
 	noNVIDIARuns(t, log, gq)
@@ -345,7 +346,7 @@ func TestExtDiagIntelCPU(t *testing.T) {
 	if c := checksByName(sys)[checkCPUSelftest]; c.Status != statusOK {
 		t.Errorf("fw:cpu self-test %+v", c)
 	}
-	if runs := strings.Join(log.list()[before:], "\n"); !strings.Contains(runs, compFWPython+" "+filepath.Join(de.cfg.WorkerDir, "asr.py")+" --selftest --device cpu --compute-type int8") {
+	if runs := strings.Join(log.list()[before:], "\n"); !strings.Contains(runs, compFWPython+" -s "+filepath.Join(de.cfg.WorkerDir, "asr.py")+" --selftest --device cpu --compute-type int8") {
 		t.Errorf("fw:cpu self-test did not run; runs:\n%s", runs)
 	}
 	if rows := pythonRows(t, sys.Config.(map[string]any)); len(rows) != 3 || rows[0].Backend != model.BackendFasterWhisper || rows[1].Source != config.PythonNotInstalled {

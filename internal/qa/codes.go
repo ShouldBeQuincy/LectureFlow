@@ -29,6 +29,54 @@ const (
 	CodeNumbersMissing = "qa.numbers_missing" // numbers ("3, 64": a language-neutral list)
 )
 
+// A sentence left without a translation (v3.2.x P1, Q2a: "待处理"): the
+// translate stage stores zh = "", zh_status = qa_failed and one of the
+// reasons below as qa_error. They are not failures of Check (they are not
+// in ErrorCodes and are never retry feedback); ErrorInfo codes them like
+// the others, with codes of the translate stage's catalog
+// (stages.ErrorCodes, error_codes_backend.json).
+const (
+	CodeSentenceUnusable = "translate.sentence_unusable" // attempts
+	CodeSentenceRefused  = "translate.sentence_refused"  // category ("" = none given)
+)
+
+// UnusableReason is the qa_error of a sentence whose answers could not be
+// used attempts times in a row; detail is what was wrong with the last one
+// (kept as the text after the colon, on one line).
+func UnusableReason(attempts int, detail string) string {
+	return fmt.Sprintf("no usable translation after %d attempts: %s", attempts, strings.Join(strings.Fields(detail), " "))
+}
+
+// RefusedReason is the qa_error of a sentence the provider declined to
+// translate; category is the provider's refusal category ("" = none).
+func RefusedReason(category string) string {
+	if category == "" {
+		return "the provider declined to translate this sentence"
+	}
+	return fmt.Sprintf("the provider declined to translate this sentence (category %s)", category)
+}
+
+var (
+	unusableRe = regexp.MustCompile(`^no usable translation after (\d+) attempts: `)
+	refusedRe  = regexp.MustCompile(`^the provider declined to translate this sentence(?: \(category ([^)]*)\))?$`)
+)
+
+// PendingInfo reads UnusableReason and RefusedReason back; nil for any
+// other reason.
+func PendingInfo(reason string) *model.ErrorInfo {
+	if m := unusableRe.FindStringSubmatch(reason); m != nil {
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			return nil
+		}
+		return &model.ErrorInfo{Code: CodeSentenceUnusable, Params: map[string]any{"attempts": n}, Detail: reason}
+	}
+	if m := refusedRe.FindStringSubmatch(reason); m != nil {
+		return &model.ErrorInfo{Code: CodeSentenceRefused, Params: map[string]any{"category": m[1]}, Detail: reason}
+	}
+	return nil
+}
+
 // ErrorCodes lists every failure code (the API's catalog has their texts).
 var ErrorCodes = []string{CodeEmpty, CodeTermMissing, CodeMostlyEnglish, CodeLengthRatio, CodeNumberMissing, CodeNumbersMissing}
 
@@ -136,7 +184,11 @@ func ParseReason(reason string) (fs []Failure, ok bool) {
 // ErrorInfo is a stored reason as one coded text (P14.3): the first
 // failure, the others in params.extra (the front end joins them as
 // clauses); the reason itself is the detail. nil when it cannot be read.
+// The reason of a sentence left without a translation: PendingInfo.
 func ErrorInfo(reason string) *model.ErrorInfo {
+	if info := PendingInfo(reason); info != nil {
+		return info
+	}
 	fs, ok := ParseReason(reason)
 	if !ok {
 		return nil

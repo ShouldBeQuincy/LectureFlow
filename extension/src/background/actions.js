@@ -11,9 +11,10 @@
 
 import { browser, message } from './env.js';
 import { nm } from './nm.js';
-import { readCookies } from './cookies.js';
-import { listedTracks, selectionError, buildEnqueue, buildRefresh, cookieTargets, pickTracks, platformOf, checkOutcome, sendBlockedCategory } from '../lib/send.js';
-import { cookieScope } from '../lib/partition.js';
+import { cookieApi } from './cookies.js';
+import { allProfiles } from './profiles.js';
+import { listedTracks, shownOf, selectionError, buildEnqueue, buildRefresh, cookiePlan, cookieAllowed, quietHostsOf, pickTracks, platformOf, checkOutcome, sendBlockedCategory, topSiteOf } from '../lib/send.js';
+import { cookieScope, readCookiesWith } from '../lib/partition.js';
 import { RESTRICTED_KEY, isRemembered, withRemembered } from '../lib/remember.js';
 import { PRESET_KEY, presetKey, presetOf, presetFor, withPreset } from '../lib/sentpreset.js';
 
@@ -110,14 +111,90 @@ async function rememberPreset(r, ids) {
 }
 
 /**
- * The cookies of the ticked tracks' URLs, read now. where: the tab the
- * user sent from — { tabId, topUrl } for the popup (the frames are the
- * tracks' own), { tabId, frameId, topUrl } for an in-page card — so that
- * the partition of an embedded player is read too (src/lib/partition.js).
+ * The browser's cookies API (src/background/cookies.js, looked up at each
+ * call) with the unpartitioned answers held to a send's cookiePlan
+ * (security audit AUD3 中-1); the partitioned reads pass as they are, and
+ * src/lib/partition.js keeps only the tab's own site's partition of them.
  */
-function cookiesFor(r, ids, where) {
+function plannedCookieApi(api, plan) {
+  const byUrl = new Map(plan.map((p) => [p.url, p]));
+  return {
+    async getAll(details) {
+      const list = await api.getAll(details);
+      if (details && Object.prototype.hasOwnProperty.call(details, 'partitionKey')) return list;
+      const entry = byUrl.get(details && details.url);
+      return (Array.isArray(list) ? list : []).filter((c) => cookieAllowed(c, entry));
+    },
+    get getPartitionKey() {
+      return api.getPartitionKey;
+    },
+  };
+}
+
+// How long a send waits for the browser's top-level site (topSiteFor)
+// before it goes by the cookie proof alone.
+let partitionKeyTimeoutMs = 3000;
+
+/** Tests only: how long a send waits for getPartitionKey, in milliseconds. */
+export function setPartitionKeyTimeout(ms) {
+  partitionKeyTimeoutMs = ms;
+}
+
+/**
+ * The tab's top-level site as the browser computed it: Chrome 132+'s
+ * cookies.getPartitionKey for the top frame (src/lib/send.js topSiteOf).
+ * Chrome answers only with host access to the top-level site's own origin
+ * ("https://<registrable domain>/*"; SEC51 低-1), which the per-page grants
+ * this extension asks for seldom include: on a page like lms.uni.example
+ * it throws, and where it answers the top host is its own site
+ * (evil.github.io, an address) or the user granted the bare site. No
+ * permission is asked for to make it answer. '' — and the send goes by the
+ * cookie proof alone, as before — without the API (Firefox, Chrome before
+ * 132), without a tab, when it throws or rejects (no access, the frame is
+ * gone), answers another shape, or does not answer within
+ * partitionKeyTimeoutMs. It goes into the cookie plan only, never into a
+ * message.
+ */
+async function topSiteFor(api, tabId) {
+  if (!Number.isInteger(tabId) || tabId < 0) return '';
+  let timer;
+  try {
+    if (typeof api.getPartitionKey !== 'function') return '';
+    const late = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), partitionKeyTimeoutMs);
+    });
+    return topSiteOf(await Promise.race([Promise.resolve(api.getPartitionKey({ tabId, frameId: 0 })), late]));
+  } catch {
+    return '';
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * The cookies of the ticked tracks' URLs, read now, as far as cookiePlan
+ * lets them be handed over. where: the tab the user sent from —
+ * { tabId, topUrl } for the popup (the frames are the tracks' own),
+ * { tabId, frameId, topUrl } for an in-page card — so that the partition of
+ * an embedded player is read too (src/lib/partition.js). The browser's
+ * top-level site (topSiteFor) only narrows the plan, and is asked only when
+ * the plan holds an entry it applies to: a send that reads no cookie
+ * touches no cookies API at all.
+ */
+async function cookiesFor(r, ids, where) {
   const tracks = pickTracks(r, ids);
-  return readCookies(cookieTargets(r.request, tracks), cookieScope({ ...where, tracks }));
+  let quietHosts = [];
+  try {
+    quietHosts = quietHostsOf(await allProfiles());
+  } catch {
+    // no profiles to say so: the rest of the plan still holds
+  }
+  let plan = cookiePlan(r, tracks, where.topUrl, { quietHosts });
+  if (plan.some((p) => !p.all)) {
+    const topSite = await topSiteFor(cookieApi, where.tabId);
+    if (topSite) plan = cookiePlan(r, tracks, where.topUrl, { quietHosts, topSite });
+  }
+  return readCookiesWith(plannedCookieApi(cookieApi, plan), plan.map((p) => p.url), cookieScope({ ...where, tracks }));
 }
 
 /**
@@ -135,7 +212,8 @@ export async function sendResult(result, { trackIds, courseId, overrideDisabled,
   const blocked = sendBlockedCategory(r, ids, where.topUrl);
   if (blocked) return fail('ext.site_blocked', { category: blocked });
   // One audio track and up to two pictures (双机位).
-  const why = selectionError(listedTracks(r), ids, { maxVideo: 2 });
+  // only tracks a card shows (shownOf): one past RETAIN_LIMITS.tracksShown is unknown here
+  const why = selectionError(shownOf(r), ids, { maxVideo: 2 });
   if (why) return fail(`ext.selection.${why}`);
   if (r.downloadPolicy === 'disabled' && !overrideDisabled) return fail('ext.download_disabled');
   if (!courseId) return fail('ext.no_course');
@@ -172,7 +250,8 @@ export async function refreshResult(result, { trackIds }, where = {}) {
   const ids = Array.isArray(trackIds) ? trackIds.map(String) : [];
   const blocked = sendBlockedCategory(r, ids, where.topUrl);
   if (blocked) return fail('ext.site_blocked', { category: blocked });
-  const why = selectionError(listedTracks(r), ids, { maxVideo: 2 });
+  // only tracks a card shows (shownOf): one past RETAIN_LIMITS.tracksShown is unknown here
+  const why = selectionError(shownOf(r), ids, { maxVideo: 2 });
   if (why) return fail(`ext.selection.${why}`);
   const cookies = await cookiesFor(r, ids, where);
   try {

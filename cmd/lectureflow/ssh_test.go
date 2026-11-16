@@ -72,6 +72,22 @@ func TestSSHOnWithTheSwitch(t *testing.T) {
 	if !slices.ContainsFunc(reg.List(), func(d model.ASRDevice) bool { return d.ID == "ssh:mac" }) {
 		t.Fatal("the ssh row is not in the device table")
 	}
+	// ssh-1b: the resource bar gets the servers' cards (none added yet)
+	cards := sshCards(s)
+	if cards == nil {
+		t.Fatal("no card source with the switch on")
+	}
+	if got := cards(context.Background()); len(got) != 0 {
+		t.Fatalf("cards %+v", got)
+	}
+}
+
+// ssh-1b: with the switch off the resource service has no card source.
+func TestSSHCardsOffByDefault(t *testing.T) {
+	s, _ := sshWiring(t, "")
+	if sshCards(s) != nil {
+		t.Fatal("a card source with the SSH servers off")
+	}
 }
 
 func TestAgentDirNeverFromTheWorkingDirectory(t *testing.T) {

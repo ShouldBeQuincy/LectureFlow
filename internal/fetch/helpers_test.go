@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -487,9 +488,26 @@ func (e *qenv) start() {
 	// unknown unless a test gives it an address (local.go)
 	e.q.local.lookup = func(context.Context, string) ([]netip.Addr, error) { return nil, errors.New("no such host (test)") }
 	e.q.local.proxy = noProxy
+	// (the guard proxy so connects to addresses written in a URL only: the
+	// tests' servers on 127.0.0.1; a test that gives a name another
+	// address sets loopbackWire)
 	if err := e.q.Start(context.Background()); err != nil {
 		e.t.Fatal(err)
 	}
+}
+
+// loopbackWire is the network of a test whose look-up gives names
+// addresses that are not this computer's (addrPolicy.dial): a connection
+// to any address goes to the same port of 127.0.0.1, so the test's
+// "public" and "private" addresses are servers of the test, and nothing
+// leaves the computer. The address was judged before, as the address it
+// claims to be.
+func loopbackWire(ctx context.Context, network, address string) (net.Conn, error) {
+	_, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	return (&net.Dialer{}).DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", port))
 }
 
 // restart closes the queue and starts a new one on the same data (a new

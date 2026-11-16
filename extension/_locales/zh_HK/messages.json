@@ -23,7 +23,7 @@
     "message": "已連線 LectureFlow"
   },
   "connConnectedVersion": {
-    "message": "LectureFlow $P1$",
+    "message": "已連線 · $P1$",
     "description": "Connected, with app version",
     "placeholders": {
       "p1": {
@@ -71,12 +71,25 @@
   "noAccess": {
     "message": "擴充功能讀唔到呢個頁面。"
   },
+  "pageLoading": {
+    "message": "頁面仲載入緊，請等一陣再試。",
+    "description": "Popup: the page did not finish loading before detection gave up waiting"
+  },
   "noTracks": {
     "message": "偵測唔到軌道"
   },
   "tracksDetected": {
     "message": "偵測到 $P1$ 條軌道",
     "description": "Header with the track count",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "tracksDetectedOne": {
+    "message": "偵測到 $P1$ 條軌道",
+    "description": "Header with the track count when exactly one track was found (singular where the language needs it)",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -96,7 +109,7 @@
     }
   },
   "sourceGeneric": {
-    "message": "通用偵測"
+    "message": "喺頁面上搵到"
   },
   "unreviewed": {
     "message": "未審核",
@@ -126,7 +139,7 @@
     "message": "推薦"
   },
   "unreadable": {
-    "message": "讀唔到播放清單"
+    "message": "讀唔到呢條軌道嘅資料，可能擷取唔到"
   },
   "kind_video": {
     "message": "影片"
@@ -180,7 +193,7 @@
     "message": "整唔到呢個頁面嘅報告。"
   },
   "reportSaved": {
-    "message": "報告已經儲存咗。分享之前請先睇一次。"
+    "message": "報告已經儲存喺瀏覽器儲存檔案嘅位置。佢係俾開發者用嚟支援呢個網站嘅，唔會自動傳送。檔案已經去識別化，但保留咗呢個網站嘅地址；分享之前請先睇一次。"
   },
   "finding_email": {
     "message": "有內容似電郵地址。"
@@ -219,7 +232,7 @@
     "message": "對策檔案"
   },
   "profilesHint": {
-    "message": "對策檔案幫平台嘅軌道改名。由本機匯入嘅會標住「未審核」，而且會優先用。"
+    "message": "對策檔案係一個細檔案，話俾擴充功能知某個錄影平台嘅軌道叫咩名、預設揀邊條；常見平台已經內置。由本機匯入嘅會標住「未審核」，而且會優先用。"
   },
   "importProfile": {
     "message": "匯入本機對策檔案"
@@ -327,7 +340,7 @@
   },
   "titleGenerated": {
     "message": "標題會由 LectureFlow 生成",
-    "description": "Generic detection reads no title"
+    "description": "No title to show: the page has none, or only a placeholder or the site name; LectureFlow names the lecture"
   },
   "durationMinutes": {
     "message": "$P1$ 分鐘",
@@ -367,7 +380,7 @@
     "description": "Course select label"
   },
   "courseNone": {
-    "message": "LectureFlow 入面仲未有課程。請先喺 LectureFlow 新增一個課程。",
+    "message": "LectureFlow 入面仲未有課程。",
     "description": "No courses"
   },
   "sendButton": {
@@ -393,6 +406,15 @@
   "selectTrack": {
     "message": "揀 $P1$",
     "description": "Checkbox label",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "trackOnHost": {
+    "message": "喺 $P1$",
+    "description": "Track list: in a track’s small line, after its kind and quality, when the track is on another site than the page (EU-03; AUD3 中-1). $P1$ is a host name such as media.example.net (never a path)",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -448,7 +470,7 @@
     "description": "Fetch task state"
   },
   "state_failed": {
-    "message": "擷取失敗",
+    "message": "失敗",
     "description": "Fetch task state"
   },
   "state_needs_refresh": {
@@ -497,7 +519,7 @@
     }
   },
   "closeHint": {
-    "message": "你可以閂咗呢個視窗，擷取會喺 LectureFlow 繼續。",
+    "message": "你可以關閉呢個視窗，擷取會喺 LectureFlow 繼續。",
     "description": "Queued note"
   },
   "doneHint": {
@@ -533,7 +555,7 @@
     "description": "Error"
   },
   "errStale": {
-    "message": "頁面已經變咗。請閂咗呢個視窗，再按一次擴充功能圖示。",
+    "message": "頁面已經變咗。請關閉呢個視窗，再按一次擴充功能圖示。",
     "description": "Error"
   },
   "errProtected": {
@@ -587,7 +609,7 @@
     "description": "Options section"
   },
   "reportsHint": {
-    "message": "匯出已經去除個人資料嘅偵測報告，用嚟寫或者改進對策檔案。喺錄影頁面按一次擴充功能圖示之後，嗰個頁面就會喺呢度列出。",
+    "message": "偵測報告係俾開發者嘅檔案，用嚟令 LectureFlow 支援新嘅錄影網站，或者改進現有嘅支援（編寫對策檔案）。報告已經去識別化：冇 Cookie；網址保留網站名同路徑（路徑入面較長嘅編號換成格式一樣嘅假值），參數值換成佔位符；講座標題等頁面文字只保留格式；發現疑似個人資料嘅時候唔會匯出。唔會自動傳送，分享之前請先睇一次。喺錄影頁面按一次擴充功能圖示之後，嗰個頁面就會喺呢度列出。",
     "description": "Options: reports"
   },
   "reportsEmpty": {
@@ -597,6 +619,18 @@
   "reportRow": {
     "message": "$P1$ · $P2$ 條軌道",
     "description": "Options: one page",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "reportRowOne": {
+    "message": "$P1$ · $P2$ 條軌道",
+    "description": "Options: one page with exactly one track (singular where the language needs it)",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -699,7 +733,7 @@
     }
   },
   "restrictedRememberedNote": {
-    "message": "你已經對 $P1$ 閂咗呢個提醒，可以喺擴充功能設定度開返。",
+    "message": "你已經對 $P1$ 關閉咗呢個提醒，可以喺擴充功能設定度開返。",
     "description": "Line under the restricted notice when the reminder is off for this platform; $1 is the platform name",
     "placeholders": {
       "p1": {
@@ -716,7 +750,7 @@
     "description": "Settings: section text"
   },
   "restrictedEmpty": {
-    "message": "冇閂咗提醒嘅平台：每次都會提你。",
+    "message": "冇關閉提醒嘅平台：每次都會提你。",
     "description": "Settings: no platform listed"
   },
   "restrictedSince": {
@@ -771,6 +805,15 @@
   "chooseTracks": {
     "message": "揀軌道…（$P1$ 條）",
     "description": "Opens the full track list",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "tracksHidden": {
+    "message": "仲有 $P1$ 條軌道冇顯示（軌道太多，列唔晒）",
+    "description": "Track list: how many tracks are left out because the page gave too many to list (they cannot be chosen); $1 is a number",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -881,7 +924,7 @@
     "description": "Bulk row"
   },
   "bulkQueued": {
-    "message": "已經排隊",
+    "message": "排緊隊",
     "description": "Bulk row"
   },
   "bulkFailed": {
@@ -1016,6 +1059,47 @@
     "message": "未啟用：同內置嘅對策檔案同名，要重新匯入再確認",
     "description": "Settings: chip on a local profile with a built-in profile’s id that was never confirmed"
   },
+  "profileInvalid": {
+    "message": "未啟用：呢個本機對策檔案已經通過唔到檢查（$P1$），請改好再重新匯入",
+    "description": "Settings: chip on a local profile that no longer passes the profile checks (for example a sessionInfo POST stored before local profiles were limited to GET); $1 is the first problem, as \"path message\" in English",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "profileTooSlow": {
+    "message": "未啟用：規則 $P1$ 配對得太慢（$P2$ 毫秒）。改好檔案再重新匯入就可以再用",
+    "description": "Settings: chip on a local profile stopped by the runtime regex guard (one match too slow, or too much time in all); $1 is the place of the rule in the file (\"/tracks/1/detect/urlPattern\"), $2 the milliseconds",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "profileTooSlowBuiltin": {
+    "message": "未啟用：內置對策檔案嘅規則 $P1$ 喺呢部電腦配對得太慢（$P2$ 毫秒）。呢個係 LectureFlow 嘅問題，請話俾我哋知；更新擴充功能之後會自動再試",
+    "description": "Settings: chip on a built-in profile stopped by the runtime regex guard (several slow matches, or one very slow); $1 is the place of the rule, $2 the milliseconds",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "profileReenable": {
+    "message": "重新啟用",
+    "description": "Settings: button on a built-in profile stopped as too slow: use it again"
+  },
+  "policyStopped": {
+    "message": "判斷唔到有冇受政策限制：對策檔案配對得太慢，已停用",
+    "description": "Popup and in-page card: chip when the runtime regex guard stopped the platform profile during this detection, so the restriction switch could not be read"
+  },
   "embedWhy": {
     "message": "呢個錄影頁面嵌喺 $P1$ 嘅網頁入面。為咗防止其他網站呃你按，請喺呢個視窗度確認。",
     "description": "Confirmation window: why it opened; $1 is the site the recording page is embedded in (an origin)",
@@ -1048,11 +1132,125 @@
     }
   },
   "confirmGone": {
-    "message": "呢個確認視窗已經用唔到：錄影頁面已經閂咗或者重新載入咗。請返去頁面再按一次個掣。",
+    "message": "呢個確認視窗已經用唔到：錄影頁面已經關閉咗或者重新載入咗。請返去頁面再按一次個掣。",
     "description": "Confirmation window: the page it belonged to is gone"
   },
   "errConfirmWindow": {
     "message": "請喺 LectureFlow 嘅確認視窗度傳送。",
     "description": "Error: this frame must confirm in the extension’s window"
+  },
+  "openApp": {
+    "message": "打開 LectureFlow",
+    "description": "Popup, not connected: LectureFlow is installed but not running; the button starts it (T26 G1)"
+  },
+  "discNotOpen": {
+    "message": "LectureFlow 已經安裝咗，但仲未打開。按「打開 LectureFlow」啟動佢；如果你已經自己打開咗，按「重新檢查」。",
+    "description": "Popup, not connected: LectureFlow is installed but not running; opening the popup does not start it (T26 G1). Quotes openApp (starts it) and connRecheck (only looks again; SEC42 低-2)"
+  },
+  "failNetwork": {
+    "message": "網絡連線出咗問題，擷取冇完成。網絡恢復之後，喺 LectureFlow 按「重試」就可以接住擷取。",
+    "description": "Queued view: the fetch failed for the network (retryable; T26 G3). “Retry” is LectureFlow’s button (downloads.action.retry)"
+  },
+  "failDisk": {
+    "message": "磁碟空間唔夠，或者擷取到嘅檔案寫唔到。請騰出啲空間、檢查資料目錄所在嘅磁碟，然後喺 LectureFlow 按「重試」。",
+    "description": "Queued view: the fetch failed for the disk (no space, or not writable; retryable; T26 G3)"
+  },
+  "failEngineMissing": {
+    "message": "搵唔到 LectureFlow 內置嘅擷取工具。請重新安裝 LectureFlow，然後喺 LectureFlow 按「重試」。",
+    "description": "Queued view: the fetch failed because LectureFlow’s aria2c is missing (retryable after a reinstall; T26 G3)"
+  },
+  "failUnsupported": {
+    "message": "呢條軌道係直播，或者係 LectureFlow 仲未支援嘅格式，擷取唔到，重試都唔會成功。如果呢頁仲有其他軌道，可以改為傳送另一條。",
+    "description": "Queued view: a live stream or an unsupported format (not retryable; T26 G3)"
+  },
+  "failUnsafeAddress": {
+    "message": "呢堂嘅軌道地址指向呢部電腦或者佢所在嘅區域網絡，或者冇辦法安全檢查，LectureFlow 為咗安全拒絕咗擷取，重試都唔會成功。",
+    "description": "Queued view: the tracks’ addresses lead to this computer, the local network, or cannot be checked (not retryable; T26 G3)"
+  },
+  "failAngle": {
+    "message": "第二個畫面入面冇影片，所以儲存唔到做第二視角。你可以揀「主要影音」再傳送一次。",
+    "description": "Queued view: the second picture has no video (not retryable; T26 G3). Quotes presetMain"
+  },
+  "failTooLarge": {
+    "message": "呢段錄影超過咗單一擷取工作嘅大小上限，所以擷取唔到。可能係直播，或者伺服器一直不停噉傳送資料。如果呢頁仲有其他軌道，可以改為傳送另一條。",
+    "description": "Queued view: the recording is over the size one fetch may hold (downloads.too_large; a live stream, or a server that keeps sending; not retryable, so no “Retry”; C165b)"
+  },
+  "failNotMedia": {
+    "message": "擷取到嘅唔係錄音或者錄影（可能係登入頁或者錯誤頁），重試都唔會成功。請確認呢堂喺頁面上可以正常播放，然後再傳送一次。",
+    "description": "Queued view: what was fetched is not a recording (an empty file, a web page, a playlist, a refused format; not retryable; T26 G3)"
+  },
+  "failedCode": {
+    "message": "擷取冇完成（代碼 $P1$）。你可以喺 LectureFlow 睇原因同重試。",
+    "description": "Queued view: the fetch failed with a code this version does not know (LectureFlow treats it as retryable; T26 G3)",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "failEmbeddedHint": {
+    "message": "如果錄影嵌喺其他網站入面，可以打開播放器自己嘅頁面再傳送一次。",
+    "description": "Added after the failed note or the needs_refresh text when the platform refused the fetch (401 / 403) and the lecture may have been sent from a page that embeds the player (EU-02; SEC46 低-3): the cookies it needs may only reach the player’s own page"
+  },
+  "errOpenGone": {
+    "message": "LectureFlow 入面已經冇呢堂或者呢個擷取工作，可能已經刪除或者移除咗。",
+    "description": "“Open in LectureFlow”: the lecture was deleted or the task removed (open.not_found; T26 G3)"
+  },
+  "presetUnavailable": {
+    "message": "「$P1$」揀唔到：$P2$。",
+    "description": "Send card, under the three choices: why one cannot be chosen (T26 G4). $P1$ is the choice (presetDual…), $P2$ its reason (presetDualNone…, no final full stop)",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "bulkRefreshNote": {
+    "message": "$P1$ 堂要重新載入，所以喺度剔唔到：請喺清單入面逐行按「傳送去 LectureFlow」繼續擷取。",
+    "description": "Bulk card: lectures whose fetch needs a refresh cannot be ticked; each is resumed from its own row’s button (T26 G5). Quotes sendButton; $P1$ is how many",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "bulkWaiting": {
+    "message": "等緊你確認…",
+    "description": "Bulk card button while the reminder before sending restricted recordings is open: nothing is sent yet (T26 G6)"
+  },
+  "connectingApp": {
+    "message": "連線緊 LectureFlow…",
+    "description": "Popup and cards: the tracks are found, waiting for LectureFlow to answer (T26 G7)"
+  },
+  "launchingApp": {
+    "message": "啟動緊 LectureFlow…",
+    "description": "Popup: the user clicked “Open LectureFlow”; it is being started (T26 G7)"
+  },
+  "discRegister": {
+    "message": "已經安裝咗又打開咗？喺 LectureFlow 嘅「診斷」頁搵「瀏覽器擴充功能連線」，按「重新登記」，然後返嚟呢度按「重新檢查」。",
+    "description": "Not connected, “not found”: the browser’s registration may be broken; LectureFlow’s Diagnostics page (nav.system) › Browser extension connection (common.check.browser_ext) › Register again (system.ext.register) fixes it (T26 G8). Quotes connRecheck"
+  },
+  "courseCreate": {
+    "message": "喺 LectureFlow 按「新增課程」開一個，然後按「重新檢查」。",
+    "description": "No course in LectureFlow yet: where to make one (nav.add_course), then the button beside it (T26 G9). Quotes connRecheck"
+  },
+  "doneTitle": {
+    "message": "擷取完成",
+    "description": "Queued view title once the fetch is done and the lecture made (T26 J2)"
+  },
+  "failedTitle": {
+    "message": "擷取冇完成",
+    "description": "Queued view title when the fetch failed (T26 J2)"
+  },
+  "closeHintCard": {
+    "message": "你可以關閉呢張卡，擷取會喺 LectureFlow 繼續。",
+    "description": "In-page card, queued: the card may be closed (closeHint says “window”, for the popup and the confirmation window; T26 J2)"
+  },
+  "exportReportHint": {
+    "message": "產生一份俾開發者嘅檔案，幫 LectureFlow 支援呢個錄影網站，唔會自動傳送。檔案已經去識別化：冇 Cookie；網址保留網站名同路徑（路徑入面較長嘅編號換成格式一樣嘅假值），編號、簽名等參數值換成佔位符；講座標題等頁面文字只保留格式。發現疑似個人資料嘅時候唔會匯出。分享之前請先睇一次。",
+    "description": "Tooltip of the popup’s “Export detection report”: what it is, for whom, what the redaction does (src/lib/redact.js, report.js; T26 G14, SEC42 低-5: no promise beyond what it does)"
   }
 }

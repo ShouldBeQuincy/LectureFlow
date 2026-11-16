@@ -45,6 +45,10 @@
 // datadir-ui (sec-update M2): a data_dir row that other accounts can reach
 // (hint check.hint_data_dir_restrict) gets "收紧权限" in its hint
 // (system_datadir.js).
+// ssh-1b: with the SSH servers on, a card "远程服务器" with one group of rows
+// per server — connection, agent version, Python environment, GPU / driver,
+// model, disk (settings_remote.js diagRows) — and "测试连接" per server.
+// The diagnostics zip leaves their host and user names out (the server).
 
 import { api } from './api.js';
 import { h, clear, btn, skeleton, errorBlock, preserveFocus, copyText, toast } from './dom.js';
@@ -55,6 +59,8 @@ import { obApi } from './onboarding_api.js';
 import { LOCAL_ENTRY } from './asr_ready.js';
 import { createBrowserExt } from './system_ext.js';
 import { createDataDirRestrict, restrictable } from './system_datadir.js';
+import { sshEnabled, sshServers, loadServers, onServersChange, noteServer, diagRows, requestError } from './settings_remote.js';
+import { appRequest, exportDiagnosticsFile } from './settings_app.js';
 
 // The detail code of a check that is still running (internal/api/system.go).
 const CHECK_PENDING = 'check.checking';
@@ -98,7 +104,7 @@ const checkName = (name) => (CHECK_NAMES[name] ? CHECK_NAMES[name]() : U.checkNa
 // The application's mode (GET /api/app), fetched once per page load.
 let appMode = null;
 const GROUPS = [
-  ['env', 'layers', (n) => ['data_dir', 'credentials', 'data_dir_location', 'ffmpeg', 'aria2c', 'python', 'faster-whisper', 'pypdf'].includes(n)],
+  ['env', 'layers', (n) => ['data_dir', 'credentials', 'data_dir_location', 'ffmpeg', 'aria2c', 'python', 'faster-whisper', 'pypdf', 'install_dir'].includes(n)],
   ['gpu', 'cpu', (n) => n === 'gpu' || n === 'cudnn' || n === 'cuda'],
   ['mlx', 'cpu', (n) => n === 'mlx_python' || n === 'mlx' || n === 'mlx_model' || n === 'mlx_selftest'],
   ['openvino', 'cpu', (n) => ['openvino_venv', 'openvino', 'openvino_devices', 'npu_driver'].includes(n)],
@@ -110,6 +116,90 @@ const GROUPS = [
 ];
 const STATUS_ICON = { ok: 'circle-check', warn: 'triangle-alert', error: 'circle-alert', pending: 'loader-circle' };
 const statusText = (st) => t(`system.status.${st}`);
+// r2 N15: the hints a device of GET /api/system may carry (vram_hint: the
+// NVIDIA card's VRAM against cuda:0's model; advice only). Another code
+// (a newer server) shows nothing. params.extra may add the sentence
+// system.devices.vram_queue / vram_queue_switch / vram_queue_estimate (the
+// per-task estimate plus the reserve exceed the card; the estimate alone
+// does, and the card's recommended model fits / nothing fits: r2
+// T-PERF-02); vram_queue_only is the hint that only carries that sentence.
+// r6 (T043): vram_low_missing / vram_low_missing_install stand in for
+// vram_low when the model the card is too small for is not installed
+// either (lectures wait with model_missing): the card's recommended model
+// is installed / still has to be installed.
+const VRAM_HINTS = new Set([
+  'system.devices.vram_low',
+  'system.devices.vram_model_missing',
+  'system.devices.vram_queue_only',
+  'system.devices.vram_low_missing',
+  'system.devices.vram_low_missing_install',
+]);
+// The hints whose first step is installing a model: they link to the
+// Components page as well.
+const VRAM_INSTALL_HINTS = new Set(['system.devices.vram_low_missing_install']);
+const VRAM_EXTRAS = new Set(['system.devices.vram_queue', 'system.devices.vram_queue_estimate', 'system.devices.vram_queue_switch']);
+// The devices card's title (the GPU group's name, without the count): it
+// names the table's sideways-scrolling region.
+const DEVICES_TITLE_ID = 'sys-devices-title';
+// The table's wrapper keeps the focus across a re-render (preserveFocus
+// finds it by this key): the page is drawn anew when the system info, the
+// resources (a GPU slot taken or freed) or the server list change.
+export const DEVICE_TABLE_FKEY = 'sys:dev:table';
+
+/**
+ * The device table's wrapper. It scrolls sideways on a narrow screen: a
+ * region in the Tab order, named by the card's title, so the keyboard can
+ * scroll it (T16 D5), with a stable focus key (R48 M1).
+ */
+export function deviceTableWrap(table) {
+  return h('div', { class: 'sys-dev-wrap', tabindex: '0', role: 'region', 'aria-labelledby': DEVICES_TITLE_ID, dataset: { fkey: DEVICE_TABLE_FKEY } }, table);
+}
+function vramText(info, known) {
+  if (!info || !known.has(info.code)) return '';
+  const p = {};
+  for (const [k, v] of Object.entries(info.params || {})) if (k !== 'extra') p[k] = typeof v === 'number' ? U.fmtInt(v) : v;
+  return t(info.code, p);
+}
+// The hint's parts: its own text, then each extra sentence (each a whole
+// piece of advice of its own); [] for a hint this page does not know.
+function vramHintParts(info) {
+  const main = vramText(info, VRAM_HINTS);
+  if (!main) return [];
+  const extra = Array.isArray(info.params && info.params.extra) ? info.params.extra.map((x) => vramText(x, VRAM_EXTRAS)).filter(Boolean) : [];
+  return [main, ...extra];
+}
+export function vramHintText(info) {
+  // sentences: no space after a full-width stop (zh), one otherwise
+  return U.joinSentences(vramHintParts(info));
+}
+/** The devices whose VRAM hint this page shows (each one counts as a warning in the summary). */
+export function vramHintCount(sys) {
+  return ((sys && sys.devices) || []).filter((d) => vramHintParts(d.vram_hint).length > 0).length;
+}
+/**
+ * The row of a device's VRAM hint (d.vram_hint) below the device table, in
+ * the checks' warning style, with the link to the transcription settings
+ * (and to Components when the hint says to install a model); null without
+ * a hint this page knows.
+ */
+export function vramHintRow(d) {
+  const parts = vramHintParts(d.vram_hint);
+  if (!parts.length) return null;
+  // r7 (T24 G9): the extra sentence is advice of its own (e.g. lower the
+  // reserve), on a line of its own rather than run on after the first
+  const lines = [];
+  parts.forEach((p, i) => lines.push(i ? h('br') : null, p));
+  return h(
+    'div',
+    { class: 'sys-hint is-warn' },
+    icon('triangle-alert', { size: 13 }),
+    h('span', null, lines),
+    h('a', { class: 'sys-hint-link', href: '#/settings/asr', dataset: { fkey: `sys:vram:${d.id}` } }, t('system.open_settings'), icon('chevron-right', { size: 13 })),
+    VRAM_INSTALL_HINTS.has(d.vram_hint.code)
+      ? h('a', { class: 'sys-hint-link', href: '#/settings/components', dataset: { fkey: `sys:vramcomp:${d.id}` } }, t('system.open_components'), icon('chevron-right', { size: 13 }))
+      : null,
+  );
+}
 // Options of config.toml and the settings sections described by
 // system.config.label.{key}.
 const CONFIG_KEYS = new Set([
@@ -173,8 +263,12 @@ function checkState(c) {
 
 // The text of a coded detail or hint; the untranslated string when there is
 // no code (or no translation). Free space comes in MB (free_mb).
+// The browser extension's rows name browsers as one string the server
+// joined with ", " ("Chrome, Edge"; internal/api system_ext.go
+// browserNames): listed in the language's own way here (T26 J9: "Chrome、Edge").
 function checkText(info, text) {
   if (info && info.params && typeof info.params.free_mb === 'number') info = { ...info, params: { ...info.params, free_mb: U.fmtMB(info.params.free_mb) } };
+  if (info && info.params && typeof info.params.browsers === 'string' && info.params.browsers.includes(', ')) info = { ...info, params: { ...info.params, browsers: U.listJoin(info.params.browsers.split(', ')) } };
   return U.errorInfoText(info, text);
 }
 
@@ -220,6 +314,17 @@ export function mountSystem(root, ctx) {
     if (alive) preserveFocus(render);
   }
 
+  let exporting = false;
+  let noteOpen = false; // the folded privacy note under the title
+  async function exportDiag() {
+    if (exporting) return;
+    exporting = true;
+    preserveFocus(render);
+    await exportDiagnosticsFile(() => alive);
+    exporting = false;
+    if (alive) preserveFocus(render);
+  }
+
   async function recheck() {
     if (checking) return;
     checking = true;
@@ -246,6 +351,13 @@ export function mountSystem(root, ctx) {
         h(
           'div',
           { class: 'page-actions' },
+          // r7 (T24 G10, T25 G8): where a user in trouble looks first, as in Settings → App
+          btn(exporting ? t('settings.app.diag_exporting') : t('settings.app.diag_export'), {
+            icon: exporting ? 'loader-circle' : 'download',
+            disabled: exporting,
+            onclick: exportDiag,
+            fkey: 'sys:diag',
+          }),
           h(
             'button',
             { type: 'button', class: 'btn btn-primary', disabled: checking, dataset: { fkey: 'sys:recheck' }, onclick: recheck },
@@ -253,6 +365,17 @@ export function mountSystem(root, ctx) {
             h('span', { class: 'btn-label' }, checking ? recheckingText(sys) : t('system.recheck')),
           ),
         ),
+      ),
+      // what the export holds and leaves out (the same words as in Settings
+      // → App), folded into one line: the summary below stays the first
+      // thing on the page (R75 L8)
+      h(
+        'details',
+        // opened stays open across the page's redraws
+        { class: 'sys-ext-details sys-diag-note', open: noteOpen, ontoggle: (e) => (noteOpen = !!e.target.open) },
+        // the focus key on the line that takes the focus (R81 L4)
+        h('summary', { dataset: { fkey: 'sys:diag:note' } }, t('system.diag_note')),
+        h('p', { class: 'dim small' }, icon('shield-check', { size: 13 }), ' ', t('settings.app.diag_privacy')),
       ),
     );
     if (!sys) {
@@ -266,7 +389,7 @@ export function mountSystem(root, ctx) {
     }
     // ext-step1: only Colab has no device card (el.append would print a null)
     el.append(
-      ...[summary(sys), checksCard(sys), sys.devices || sys.openvino ? devicesCard(sys) : null, h('div', { class: 'sys-grid' }, nvidiaShown(sys) ? gpuCard(sys) : null, apiCard(sys), usageCard(sys), diskCard(sys)), configCard(sys.config || {}, nvidiaShown(sys))].filter(Boolean),
+      ...[summary(sys), checksCard(sys), sys.devices || sys.openvino ? devicesCard(sys) : null, remoteCard(), h('div', { class: 'sys-grid' }, nvidiaShown(sys) ? gpuCard(sys) : null, apiCard(sys), usageCard(sys), diskCard(sys)), configCard(sys.config || {}, nvidiaShown(sys))].filter(Boolean),
     );
     gpuKey = gpuSig();
   }
@@ -286,7 +409,8 @@ export function mountSystem(root, ctx) {
     const states = sys.checks.map(checkState);
     const n = (s) => states.filter((x) => x === s).length;
     const errors = n('error');
-    const warns = n('warn');
+    // r7 (T24 G9): a device's VRAM hint (the devices card) is a warning too
+    const warns = n('warn') + vramHintCount(sys);
     const pending = n('pending');
     let tone = 'ok';
     let title = t('system.summary.ok_title');
@@ -402,6 +526,82 @@ export function mountSystem(root, ctx) {
     );
   }
 
+  // ---- ssh-1b: the SSH servers ----
+
+  const testing = new Set(); // server ids whose "测试连接" runs
+  const testErrors = {};
+  async function testServer(v) {
+    if (testing.has(v.id)) return;
+    testing.add(v.id);
+    delete testErrors[v.id];
+    preserveFocus(render);
+    try {
+      noteServer(await appRequest('POST', `/api/remote/servers/${encodeURIComponent(v.id)}/test`));
+    } catch (e) {
+      testErrors[v.id] = requestError(e, v.name);
+      loadServers();
+    }
+    testing.delete(v.id);
+    if (alive) preserveFocus(render);
+  }
+
+  function remoteRow(v, r) {
+    const st = r.status;
+    return h(
+      'li',
+      { class: `sys-check is-${st}`, dataset: { row: r.key } },
+      h('span', { class: 'sys-check-icon', title: statusText(st) }, icon(STATUS_ICON[st], { size: 16, label: statusText(st) })),
+      h(
+        'div',
+        { class: 'sys-check-main' },
+        h('div', { class: 'sys-check-name' }, r.label, st !== 'ok' ? h('span', { class: `sys-check-state is-${st}` }, statusText(st)) : null),
+        h('div', { class: 'sys-check-detail' }, r.value),
+        r.hint ? h('div', { class: `sys-hint is-${st}` }, icon('info', { size: 13 }), h('span', null, r.hint)) : null,
+      ),
+    );
+  }
+
+  function remoteCard() {
+    const list = sshServers();
+    if (!sshEnabled() || !list.length) return null;
+    return h(
+      'section',
+      { class: 'card card-flush sys-checks sys-remote', 'aria-label': t('settings.remote.title') },
+      h(
+        'header',
+        { class: 'card-hd' },
+        h('h2', { class: 'card-title' }, icon('plug', { size: 16 }), h('span', null, t('settings.remote.title')), h('span', { class: 'card-count' }, String(list.length))),
+        h('a', { class: 'sys-hint-link', href: '#/settings/remote', dataset: { fkey: 'sys:goremote' } }, t('system.open_settings'), icon('chevron-right', { size: 13 })),
+      ),
+      list.map((v) => {
+        const rows = diagRows(v);
+        if (testErrors[v.id]) rows[0] = { ...rows[0], status: 'error', hint: testErrors[v.id] };
+        const bad = rows.filter((r) => r.status === 'error').length;
+        const warn = rows.filter((r) => r.status === 'warn').length;
+        return h(
+          'div',
+          { class: 'sys-group', dataset: { server: v.id } },
+          h(
+            'h3',
+            { class: 'sys-group-title' },
+            icon('server', { size: 14 }),
+            h('span', null, v.name),
+            bad ? h('span', { class: 'sys-group-flag is-error' }, t('system.group.flag_error', { n: bad })) : warn ? h('span', { class: 'sys-group-flag is-warn' }, t('system.group.flag_warn', { n: warn })) : null,
+            v.trusted
+              ? h(
+                  'button',
+                  { type: 'button', class: 'btn btn-sm btn-ghost sys-remote-test', disabled: testing.has(v.id), dataset: { fkey: `sys:remote:${v.id}:test` }, onclick: () => testServer(v) },
+                  icon(testing.has(v.id) ? 'loader-circle' : 'plug', { size: 14, class: testing.has(v.id) ? 'spin' : '' }),
+                  h('span', { class: 'btn-label' }, t('settings.provider.test')),
+                )
+              : null,
+          ),
+          h('ul', { class: 'sys-check-list' }, rows.map((r) => remoteRow(v, r))),
+        );
+      }),
+    );
+  }
+
   // ext web3: the same element in every render (its state survives them)
   function extBlock(c) {
     if (!ext) ext = createBrowserExt({ recheck });
@@ -465,6 +665,8 @@ export function mountSystem(root, ctx) {
           [t('system.gpu.per_job'), U.fmtMB(g.estimated_job_mb), 'is-num'],
           [t('system.gpu.gpu_jobs'), g.paused ? h('span', { class: 'tone-warn' }, t('system.gpu.paused')) : t('system.gpu.running')],
         ]),
+        // R37 recheck E1: why the estimate is above the table's value
+        g.estimate_raised ? h('p', { class: 'sys-gpu-note' }, icon('info', { size: 13 }), t('system.gpu.per_job_raised')) : null,
       ],
     );
   }
@@ -502,6 +704,8 @@ export function mountSystem(root, ctx) {
         h('td', { title: d.detected_at ? t('system.devices.detected_at', { when: U.relTime(d.detected_at) }) : undefined }, h('span', { class: 'sys-dev-state' }, deviceState(d))),
       );
     });
+    // r2 N15: below the table, in the checks' warning style
+    const vramHints = devs.map(vramHintRow).filter(Boolean);
     const ovBlock = ov
       ? h(
           'div',
@@ -540,7 +744,7 @@ export function mountSystem(root, ctx) {
       h(
         'header',
         { class: 'card-hd' },
-        h('h2', { class: 'card-title' }, icon('mic', { size: 16 }), h('span', null, t('system.group.gpu')), devs.length ? h('span', { class: 'card-count' }, String(devs.length)) : null),
+        h('h2', { class: 'card-title' }, icon('mic', { size: 16 }), h('span', { id: DEVICES_TITLE_ID }, t('system.group.gpu')), devs.length ? h('span', { class: 'card-count' }, String(devs.length)) : null),
         h('a', { class: 'card-link', href: '#/settings/asr', dataset: { fkey: 'sys:dev:settings' } }, t('system.open_settings'), icon('chevron-right', { size: 13 })),
       ),
       h(
@@ -550,9 +754,7 @@ export function mountSystem(root, ctx) {
           'div',
           { class: 'sys-devices-main' },
           devs.length
-            ? h(
-                'div',
-                { class: 'sys-dev-wrap' },
+            ? deviceTableWrap(
                 h(
                   'table',
                   { class: 'sys-dev-table' },
@@ -561,6 +763,7 @@ export function mountSystem(root, ctx) {
                 ),
               )
             : h('p', { class: 'sys-empty' }, t('devices.empty_title')),
+          ...vramHints,
           kvList([[t('system.power.label'), h('span', { class: sys.power && sys.power.on_battery ? 'tone-warn' : '' }, powerText(sys.power))]]),
         ),
         ovBlock,
@@ -761,6 +964,8 @@ export function mountSystem(root, ctx) {
 
   render();
   refresh();
+  loadServers();
+  const serversUnsub = onServersChange(() => alive && ctx.system() && preserveFocus(render));
 
   return {
     refresh,
@@ -776,6 +981,7 @@ export function mountSystem(root, ctx) {
       alive = false;
       if (ext) ext.destroy();
       dataDir.destroy();
+      serversUnsub();
     },
   };
 }

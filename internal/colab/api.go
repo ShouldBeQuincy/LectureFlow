@@ -76,7 +76,11 @@ func transient(err error) bool {
 		return true
 	}
 	var ne netError
-	return errors.As(err, &ne)
+	if errors.As(err, &ne) {
+		return true
+	}
+	var pe *netError // the WebSocket handshake's (ws.go)
+	return errors.As(err, &pe)
 }
 
 // netError marks a transport failure (no HTTP answer).
@@ -218,6 +222,10 @@ func (t *tunnel) once(ctx context.Context, method, path, endpoint string, q url.
 	if err != nil {
 		if pctx := context.Cause(ctx); errors.Is(pctx, context.Canceled) {
 			return obj{}, false, pctx
+		}
+		var rr *redirectRefused
+		if errors.As(err, &rr) {
+			return obj{}, false, apiChanged(endpoint, rr.Error())
 		}
 		return obj{}, false, netError{text: fmt.Sprintf("%s %s: %s", method, endpoint, netErrText(err))}
 	}

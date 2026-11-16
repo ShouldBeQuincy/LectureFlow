@@ -34,6 +34,8 @@ const tierName = (tier) => U.TIER_NAMES[tier] || U.TIER_NAMES.enforce;
 
 const DRAG_TYPE = 'application/x-lectureflow-term';
 const COLLAPSE_KEY = 'lectureflow.glossary.collapsed';
+// Typing in the filter applies it once the keys pause this long (R7-PF1).
+const FILTER_DELAY_MS = 150;
 
 // t() text whose {name} placeholders (not params) become the given nodes,
 // e.g. keyboard keys inside a sentence.
@@ -88,14 +90,28 @@ function stateParts(s) {
 }
 
 let mkSeq = 0;
+let mkHovered = null; // the marker under the pointer (Esc closes its card)
+let mkEscapeWatched = false;
 
 // A small marker with a hover / focus card (position: fixed, so the
-// scrolling table never clips it). body: nodes; action: {label, icon, onclick, fkey}.
-function markCard({ ic, cls, label, body, action, fkey }) {
+// scrolling table never clips it). body: nodes; action: {label, icon,
+// onclick, fkey}; title: the card's name when body has no .mk-title line.
+// The card may hold a button, so it is no tooltip (C2, R19 §5; as the
+// stage cards, L16): the marker controls it and says whether it is open,
+// the card is a named group. The marker's label already says all the
+// card's text, so the marker is not described by the card (it would be
+// heard twice, the button's label included). Esc closes the card (under
+// the pointer too, WCAG 1.4.13) and leaves the focus on the marker; Enter
+// or Space on the marker opens it again.
+export function markCard({ ic, cls, label, title, body, action, fkey }) {
   const id = `mk-${++mkSeq}`;
   const inner = h('div', { class: 'mk-card-body' }, body, action ? h('div', { class: 'mk-card-actions' }, btn(action.label, { size: 'sm', icon: action.icon, onclick: action.onclick, fkey: action.fkey })) : null);
-  const card = h('div', { class: 'mk-card', id, role: 'tooltip' }, inner);
-  const b = h('button', { type: 'button', class: `mk ${cls}`, 'aria-label': label, 'aria-describedby': id, dataset: { fkey } }, icon(ic, { size: 12, stroke: 2.2 }));
+  // named by its title line (R58: an aria-label of the same words was
+  // heard twice in browse mode); by title when the body has no such line
+  const head = inner.querySelector('.mk-title');
+  if (head) head.setAttribute('id', `${id}-t`);
+  const card = h('div', { class: 'mk-card', id, role: 'group', 'aria-labelledby': head ? `${id}-t` : null, 'aria-label': head ? null : title }, inner);
+  const b = h('button', { type: 'button', class: `mk ${cls}`, 'aria-label': label, 'aria-controls': id, 'aria-expanded': 'false', dataset: { fkey } }, icon(ic, { size: 12, stroke: 2.2 }));
   const wrap = h('span', { class: 'mk-wrap' }, b, card);
   const place = () => {
     const r = b.getBoundingClientRect();
@@ -106,16 +122,82 @@ function markCard({ ic, cls, label, body, action, fkey }) {
     card.style.top = below ? `${r.bottom}px` : '';
     card.style.bottom = below ? '' : `${window.innerHeight - r.top}px`;
   };
-  wrap.addEventListener('pointerenter', place);
-  wrap.addEventListener('focusin', place);
-  wrap._place = place;
-  wrap.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && wrap.contains(document.activeElement)) {
-      e.stopPropagation();
-      b.blur();
-    }
+  let hovered = false;
+  let focused = false;
+  const isOpen = () => (hovered || focused) && !wrap.classList.contains('is-dismissed');
+  const sync = () => b.setAttribute('aria-expanded', String(isOpen()));
+  const closed = () => {
+    if (!hovered && !focused) wrap.classList.remove('is-dismissed'); // the next hover or focus opens it again
+    sync();
+  };
+  wrap.dismiss = () => {
+    if (!isOpen()) return false;
+    const a = document.activeElement;
+    if (a && a !== b && wrap.contains(a)) b.focus({ preventScroll: true });
+    wrap.classList.add('is-dismissed');
+    sync();
+    return true;
+  };
+  wrap.addEventListener('pointerenter', () => {
+    hovered = true;
+    mkHovered = wrap;
+    watchMkEscape();
+    wrap.classList.remove('is-dismissed');
+    place();
+    sync();
   });
+  wrap.addEventListener('pointerleave', () => {
+    hovered = false;
+    if (mkHovered === wrap) mkHovered = null;
+    closed();
+  });
+  wrap.addEventListener('focusin', () => {
+    if (!focused) wrap.classList.remove('is-dismissed'); // the focus came from outside
+    focused = true;
+    place();
+    sync();
+  });
+  wrap.addEventListener('focusout', (e) => {
+    focused = !!(e.relatedTarget && wrap.contains(e.relatedTarget));
+    closed();
+  });
+  wrap.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && wrap.dismiss()) e.stopPropagation();
+  });
+  b.addEventListener('click', () => {
+    if (!wrap.classList.contains('is-dismissed')) return;
+    wrap.classList.remove('is-dismissed');
+    place();
+    sync();
+  });
+  wrap._place = place;
+  // Its row taken off the page and put back (renderTable reuses rows): no
+  // pointerleave came, nothing is under the pointer or focused any more
+  // (R71 L1).
+  wrap._reset = () => {
+    hovered = false;
+    focused = false;
+    if (mkHovered === wrap) mkHovered = null;
+    wrap.classList.remove('is-dismissed');
+    sync();
+  };
   return wrap;
+}
+
+// Esc while the pointer rests on a marker (the focus elsewhere) closes its
+// card; one listener, added with the first hover.
+function watchMkEscape() {
+  if (mkEscapeWatched) return;
+  mkEscapeWatched = true;
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || e.defaultPrevented || !mkHovered) return;
+    if (!mkHovered.isConnected) {
+      mkHovered = null;
+      return;
+    }
+    if (mkHovered.contains(document.activeElement)) return; // the marker's own keydown has it
+    if (mkHovered.dismiss()) e.stopPropagation();
+  });
 }
 
 // createGlossary({courseId, ctx, onCourse(course)}) → {el, setCourse, reload, onJob, destroy}.
@@ -129,7 +211,9 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
   let termDraft = '';
   let termFocusPending = false;
   let termFocusAfter = null; // fkey to focus once a deleted term's row is gone
-  let termFilter = '';
+  let termAdded = null; // WV-05: the id of a term just added, scrolled to and highlighted once drawn
+  let termFilter = ''; // the filter applied (the input's text once typing pauses)
+  let filterTimer = 0;
   let termSource = '';
   let dragId = null;
   let reviewing = false; // POST glossary/review in flight
@@ -137,6 +221,15 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
   const collapsed = readCollapsed();
   let reviewBar = null;
   let reviewChip = null; // the "tidying 42%" chip while the janitor runs
+  // the table as drawn (renderTable, R7-PF1)
+  const rowCache = new Map(); // term id → {key, row}
+  let shell = null; // the table on the page: {table, groups: {key → {body, head, toggle, count, empty}}}; null while flat
+  let flatKey = null; // what the card shows in place of the table (flatState); null while the table is shown
+  let footKey = null; // what the foot says ('' = nothing)
+  // renderTable is changing the page: a blur it causes is not the user
+  // leaving an editor (Chromium sends a focused element its blur while
+  // taking it off the page, still connected; R71 M1)
+  let drawing = 0;
 
   // ---- skeleton (inputs are built once and never re-rendered) ----
   const termsHead = h('h2', { class: 'card-title' });
@@ -153,8 +246,13 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
     placeholder: t('glossary.filter.placeholder'),
     'aria-label': t('glossary.filter.label'),
     oninput: () => {
-      termFilter = filterInput.value;
-      renderTable();
+      clearTimeout(filterTimer);
+      filterTimer = setTimeout(() => {
+        filterTimer = 0;
+        if (!alive) return;
+        termFilter = filterInput.value;
+        renderTable();
+      }, FILTER_DELAY_MS);
     },
   });
   const sourceSel = h(
@@ -235,17 +333,33 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
 
   // Until the glossary has loaded once, a failure is shown in its card (with
   // a retry button) instead of a toast; later failures keep the list shown
-  // and are toasted by the API layer.
+  // and are toasted by the API layer. The same list as shown (the server's
+  // "changed terms" after the user's own change, already in place) draws
+  // nothing (R7-PF1).
   async function reload() {
+    // the term just added when this read began: a read begun before the
+    // adding may not list it yet, and leaves it to the adding's own read
+    const added = termAdded;
+    let next;
     try {
       const ts = await api.terms(courseId, { quiet: !terms });
       if (!alive) return;
-      terms = ts || [];
-      termsError = '';
+      next = ts || [];
     } catch (e) {
+      // not drawn now: not highlighted by a later draw either; a read begun
+      // before the adding leaves it to the adding's own read (R93)
+      if (termAdded === added) termAdded = null;
       if (!alive || terms) return;
       termsError = e.message || t('common.load_failed');
+      renderTable();
+      return;
     }
+    // R91 low-4: not in a read begun after its adding (not there, or gone
+    // again): not highlighted by a much later draw that has it either
+    if (added && termAdded === added && !next.some((x) => x.id === added)) termAdded = null;
+    if (terms && !termFocusAfter && !termAdded && JSON.stringify(next) === JSON.stringify(terms)) return;
+    terms = next;
+    termsError = '';
     renderTable();
   }
 
@@ -259,7 +373,8 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
     course = c;
     renderHead();
     renderJanitor();
-    if (terms || termsError) renderTable();
+    // the table depends on the course only while it is empty ("extracting…")
+    if (terms && !terms.length) renderTable();
   }
 
   function replaceTerm(updated) {
@@ -417,7 +532,7 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
     let focusAfter = null;
     openDialog(
       t('glossary.report.title'),
-      (close) => {
+      (close, busy) => {
         const body = h('div', { class: 'jr' });
         const load = async () => {
           error = '';
@@ -439,7 +554,8 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
           undoing.add(it.term_id);
           render();
           try {
-            const r = await api.undoJanitorItem(courseId, report.version, it.term_id);
+            // busy: a route change while it runs lets it finish (R62 N4)
+            const r = await busy(api.undoJanitorItem(courseId, report.version, it.term_id));
             if (r) report = r;
             toast(t('glossary.report.undone_toast', { en: it.en }), 'success');
             const rest = report.items.filter((x) => !x.undone && x.term_id !== it.term_id);
@@ -626,9 +742,14 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
   // ---- table ----
 
   function shownTerms() {
+    return terms.filter(filterOf());
+  }
+
+  // Whether a term passes the search and the source filter applied.
+  function filterOf() {
     const q = termFilter.trim().toLowerCase();
     const zq = zhQuery(q, renderTable); // P14.6: a Traditional term finds the stored Simplified rendering
-    return terms.filter((term) => (!termSource || term.source === termSource) && (!q || term.en.toLowerCase().includes(q) || zq.test(term.zh)));
+    return (term) => (!termSource || term.source === termSource) && (!q || term.en.toLowerCase().includes(q) || zq.test(term.zh));
   }
 
   function filtersActive() {
@@ -636,6 +757,8 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
   }
 
   function clearFilters() {
+    clearTimeout(filterTimer);
+    filterTimer = 0;
     termFilter = '';
     termSource = '';
     filterInput.value = '';
@@ -644,75 +767,41 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
     filterInput.focus();
   }
 
+  // The table is kept up to date rather than built anew (R7-PF1: with 500
+  // terms each build took 60–90 ms, 0.4–0.8 s on a slow machine, and editing
+  // one term built it four times). A term's row is built once and reused
+  // while its term, its editor and its busy state stay the same (rowCache);
+  // renderTable() puts in each group the rows it shows, in order, taking out
+  // the rows the filter hides and putting the same rows back, and changes a
+  // count, a placeholder or the foot only when its text changes. So a change
+  // of one term draws its row, and a list or a course that changes nothing
+  // draws nothing. The focus stays where it is; a row drawn anew under the
+  // focus gets it back through preserveFocus (data-fkey), its editor with the
+  // text typed and the caret where they were (rowCache, shell, flatKey,
+  // footKey above).
   function renderTable() {
-    preserveFocus(() => {
-      clear(tableWrap);
-      clear(termsFoot);
-      tableWrap.classList.remove('is-flat');
-      if (!terms) {
-        tableWrap.classList.add('is-flat');
-        tableWrap.append(termsError ? errorBlock(termsError, retryTerms) : skeleton(5));
-        return;
-      }
-      if (terms.length === 0) {
-        const busy = U.extractionBusy(course);
-        tableWrap.classList.add('is-flat');
-        tableWrap.append(
-          h(
-            'div',
-            { class: 'terms-empty' },
-            icon('hash', { size: 20 }),
-            h('strong', null, busy ? t('glossary.empty.extracting') : t('glossary.empty.title')),
-            h('span', null, busy ? t('glossary.empty.extracting_hint') : t('glossary.empty.hint')),
-          ),
-        );
-        return;
-      }
-      const shown = shownTerms();
-      if (shown.length === 0) {
-        tableWrap.classList.add('is-flat');
-        tableWrap.append(h('div', { class: 'terms-empty' }, icon('search', { size: 20 }), h('strong', null, t('glossary.filter.none')), btn(t('glossary.filter.clear'), { size: 'sm', onclick: clearFilters })));
-        return;
-      }
-      const all = { enforce: 0, reference: 0, off: 0 };
-      for (const term of terms) all[groupOf(term)]++;
-      tableWrap.append(
-        h(
-          'table',
-          { class: 'terms terms-grouped' + (dragId ? ' is-dragging' : '') },
-          h(
-            'colgroup',
-            null,
-            h('col', { class: 'col-grip' }),
-            h('col', { class: 'col-en' }),
-            h('col', { class: 'col-zh' }),
-            h('col', { class: 'col-src' }),
-            h('col', { class: 'col-freq' }),
-            h('col', { class: 'col-menu' }),
-          ),
-          h(
-            'thead',
-            null,
-            h(
-              'tr',
-              null,
-              h('th', null, h('span', { class: 'visually-hidden' }, t('glossary.col.drag'))),
-              h('th', null, t('glossary.col.en')),
-              h('th', null, t('glossary.col.zh')),
-              h('th', null, t('glossary.col.source')),
-              h('th', { class: 'num' }, t('glossary.col.freq')),
-              h('th', null, h('span', { class: 'visually-hidden' }, t('glossary.col.actions'))),
-            ),
-          ),
-          GROUPS.map((g) => groupBody(g, shown.filter((term) => groupOf(term) === g.key), all[g.key])),
-        ),
-      );
-      append(termsFoot, [
-        h('span', null, filtersActive() ? t('glossary.foot.shown', { shown: shown.length, n: terms.length }) : t('glossary.foot.total', { n: terms.length })),
-        filtersActive() ? btn(t('glossary.filter.clear'), { size: 'sm', kind: 'ghost', onclick: clearFilters }) : null,
-        h('span', { class: 'terms-keys' }, tNodes('glossary.foot.keys', { f2: h('kbd', null, 'F2'), del: h('kbd', null, 'Del'), more: h('kbd', null, 'Shift+F10') })),
-      ]);
-    });
+    const a = document.activeElement;
+    const caret = a && a.classList && a.classList.contains('input-term') && tableWrap.contains(a) ? { el: a, start: a.selectionStart, end: a.selectionEnd } : null;
+    drawing++;
+    try {
+      preserveFocus(() => {
+        const shown = terms ? shownTerms() : [];
+        // the term being edited is no longer shown (filtered out, its group
+        // folded, deleted): the edit ends with its row, and nothing typed in
+        // it is saved
+        if (editingTerm && !shown.some((x) => x.id === editingTerm && !collapsed.has(groupOf(x)))) editingTerm = null;
+        const flat = flatState(shown);
+        if (flat) drawFlat(flat);
+        else syncTable(shown);
+      });
+    } finally {
+      drawing--;
+    }
+    // the editor drawn anew under the focus: the caret back where it was
+    if (caret && caret.start != null) {
+      const b = document.activeElement;
+      if (b && b !== caret.el && b.classList && b.classList.contains('input-term') && typeof b.setSelectionRange === 'function') b.setSelectionRange(caret.start, caret.end);
+    }
     if (termFocusAfter) {
       const want = termFocusAfter;
       termFocusAfter = null;
@@ -727,17 +816,286 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
         input.select();
       }
     }
+    // WV-05: a term just added, once the list drawn has it
+    if (termAdded && terms && terms.some((x) => x.id === termAdded)) {
+      const id = termAdded;
+      termAdded = null;
+      showAdded(id);
+    }
   }
 
-  function groupBody(g, list, total) {
+  // Round 9 WV-05 (needs-human 1.15 b, T23 general 8): the row of a term
+  // just added is scrolled to within the table (.terms-table-wrap scrolls
+  // by itself), into the part of it the window shows when that part can
+  // hold it (R91b low-7: no page scroll then); else the page by as little
+  // as it takes (R91 medium-1). "The window" ends above the toasts where
+  // they are over the table (narrow windows: the success toast would cover
+  // the row). The field that has the focus (the add form, for the next
+  // term) stays in the window: where both cannot be had (a narrow window,
+  // a tall table) it wins, the row shows as far as it can, and the toast
+  // ("已添加术语：…") says the term was added. The row is briefly
+  // highlighted (.term-row.flash; nothing where it is not styled).
+  const FLASH_MS = 2000;
+  const REVEAL_GAP = 8; // px kept between the row or the field and an edge
+  function showAdded(id) {
+    const row = tableWrap.querySelector(`tr[data-term="${CSS.escape(id)}"]`);
+    if (!row || !row.isConnected) return; // hidden: onAddTerm said so
+    revealRow(row);
+    revealInPage(row);
+    row.classList.remove('flash');
+    row.classList.add('flash');
+    clearTimeout(row._flashTimer);
+    row._flashTimer = setTimeout(() => row.classList.remove('flash'), FLASH_MS);
+  }
+
+  // The bottom of the window for the row: above the toasts (#toasts) where
+  // they cover the table's columns, else the window's bottom.
+  function usableBottom(box) {
+    const vh = window.innerHeight || 0;
+    const ts = document.getElementById('toasts');
+    if (!ts || typeof ts.getBoundingClientRect !== 'function') return vh;
+    const t = ts.getBoundingClientRect();
+    if (!(t.bottom > t.top) || t.top >= vh || t.right <= box.left || t.left >= box.right) return vh;
+    return Math.max(0, Math.min(vh, t.top - REVEAL_GAP));
+  }
+
+  // Scrolls the table so that row is in view below its sticky column
+  // header, by as little as it takes (as scrollIntoView block "nearest"
+  // does for the table alone; that one would scroll the page too, and put
+  // a row above the view under the header): within the part of the table
+  // the window shows when that part can hold the row; else as near that
+  // part as the table can (its top when the table lies below what the
+  // window shows, its bottom when above), for the page to follow.
+  function revealRow(row) {
+    if (typeof tableWrap.getBoundingClientRect !== 'function' || typeof row.getBoundingClientRect !== 'function') return;
+    const box = tableWrap.getBoundingClientRect();
+    const r = row.getBoundingClientRect();
+    const h = r.bottom - r.top;
+    const head = shell && shell.table.querySelector('thead');
+    const hr = head ? head.getBoundingClientRect() : null;
+    const inner = box.top + (tableWrap.clientTop || 0);
+    let top = inner + (hr ? hr.bottom - hr.top : 0);
+    let bottom = inner + (tableWrap.clientHeight || box.bottom - box.top);
+    if (window.innerHeight) {
+      const seenTop = Math.max(top, 0);
+      const seenBottom = Math.min(bottom, usableBottom(box));
+      if (seenBottom - seenTop >= h) {
+        top = seenTop;
+        bottom = seenBottom;
+      } else if (seenBottom < top + h) {
+        bottom = top + h; // the table below what the window shows: the row to its top
+      } else {
+        top = bottom - h; // above: to its bottom
+      }
+    }
+    const at = tableWrap.scrollTop || 0;
+    if (r.top < top) tableWrap.scrollTop = at - (top - r.top);
+    else if (r.bottom > bottom) tableWrap.scrollTop = at + Math.min(r.bottom - bottom, r.top - top);
+  }
+
+  // Then the page (the window scrolls it), vertically and by as little as
+  // it takes, when the row placed in the table is not wholly in the window
+  // (above the toasts); a row in the window leaves the page where it is.
+  // The field with the focus in the card stays in the window (it wins).
+  // Done by hand rather than with row.scrollIntoView: that one would also
+  // move the table's own box, sideways too where the table is wider than
+  // it (narrow windows). Whole pixels, so the row's edge is not cut off.
+  function revealInPage(row) {
+    const vh = window.innerHeight || 0;
+    if (!vh || typeof row.getBoundingClientRect !== 'function' || typeof window.scrollBy !== 'function') return;
+    const r = row.getBoundingClientRect();
+    const bottom = usableBottom(tableWrap.getBoundingClientRect());
+    let dy = 0;
+    if (r.top < 0) dy = Math.floor(r.top);
+    else if (r.bottom > bottom) dy = Math.ceil(Math.min(r.bottom - bottom, r.top));
+    if (!dy) return;
+    const a = document.activeElement;
+    if (a && a !== document.body && el.contains(a) && typeof a.getBoundingClientRect === 'function') {
+      const f = a.getBoundingClientRect();
+      // only a field the window shows now is kept there
+      if (f.bottom > f.top && f.top >= 0 && f.bottom <= vh) {
+        const down = Math.max(0, Math.floor(f.top - REVEAL_GAP)); // how far the page may go down
+        const up = Math.min(0, Math.ceil(f.bottom + REVEAL_GAP - vh)); // and up (negative)
+        dy = Math.max(up, Math.min(down, dy));
+      }
+    }
+    if (dy) window.scrollBy({ top: dy, left: 0, behavior: 'auto' });
+  }
+
+  // What the card shows in place of the table, as a key that changes with
+  // its text; null: the table.
+  function flatState(shown) {
+    if (!terms) return termsError ? `error:${termsError}` : 'loading';
+    if (!terms.length) return U.extractionBusy(course) ? 'empty:busy' : 'empty';
+    if (!shown.length) return 'none';
+    return null;
+  }
+
+  function drawFlat(key) {
+    shell = null;
+    if (footKey !== '') {
+      clear(termsFoot);
+      footKey = '';
+    }
+    if (key === flatKey) return;
+    flatKey = key;
+    clear(tableWrap);
+    tableWrap.classList.add('is-flat');
+    if (key === 'loading') {
+      tableWrap.append(skeleton(5));
+    } else if (key.startsWith('error:')) {
+      tableWrap.append(errorBlock(termsError, retryTerms));
+    } else if (key === 'none') {
+      tableWrap.append(h('div', { class: 'terms-empty' }, icon('search', { size: 20 }), h('strong', null, t('glossary.filter.none')), btn(t('glossary.filter.clear'), { size: 'sm', onclick: clearFilters })));
+    } else {
+      const busy = key === 'empty:busy';
+      tableWrap.append(
+        h(
+          'div',
+          { class: 'terms-empty' },
+          icon('hash', { size: 20 }),
+          h('strong', null, busy ? t('glossary.empty.extracting') : t('glossary.empty.title')),
+          h('span', null, busy ? t('glossary.empty.extracting_hint') : t('glossary.empty.hint')),
+        ),
+      );
+    }
+  }
+
+  function syncTable(shown) {
+    flatKey = null;
+    if (!shell) buildShell();
+    shell.table.classList.toggle('is-dragging', !!dragId);
+    const all = { enforce: 0, reference: 0, off: 0 };
+    const lists = { enforce: [], reference: [], off: [] };
+    const live = new Set();
+    for (const term of terms) {
+      all[groupOf(term)]++;
+      live.add(term.id);
+    }
+    for (const term of shown) lists[groupOf(term)].push(term);
+    for (const tid of rowCache.keys()) if (!live.has(tid)) rowCache.delete(tid);
+    for (const g of GROUPS) syncGroup(g, lists[g.key], all[g.key]);
+    syncFoot(shown.length);
+  }
+
+  function buildShell() {
+    clear(tableWrap);
+    tableWrap.classList.remove('is-flat');
+    const groups = {};
+    for (const g of GROUPS) groups[g.key] = groupShell(g);
+    const table = h(
+      'table',
+      { class: 'terms terms-grouped' },
+      h(
+        'colgroup',
+        null,
+        h('col', { class: 'col-grip' }),
+        h('col', { class: 'col-en' }),
+        h('col', { class: 'col-zh' }),
+        h('col', { class: 'col-src' }),
+        h('col', { class: 'col-freq' }),
+        h('col', { class: 'col-menu' }),
+      ),
+      h(
+        'thead',
+        null,
+        h(
+          'tr',
+          null,
+          h('th', null, h('span', { class: 'visually-hidden' }, t('glossary.col.drag'))),
+          h('th', null, t('glossary.col.en')),
+          h('th', null, t('glossary.col.zh')),
+          h('th', null, t('glossary.col.source')),
+          h('th', { class: 'num' }, t('glossary.col.freq')),
+          h('th', null, h('span', { class: 'visually-hidden' }, t('glossary.col.actions'))),
+        ),
+      ),
+      GROUPS.map((g) => groups[g.key].body),
+    );
+    shell = { table, groups };
+    tableWrap.append(table);
+  }
+
+  // A group's rows: its header (the fold toggle and the count), the rows of
+  // the terms shown, or a placeholder when it shows none.
+  function syncGroup(g, list, total) {
+    const v = shell.groups[g.key];
     const isCollapsed = collapsed.has(g.key);
     const count = filtersActive() ? `${list.length} / ${total}` : String(total);
+    if (v.count.textContent !== count) v.count.textContent = count;
+    if (v.toggle.getAttribute('aria-expanded') !== String(!isCollapsed)) v.toggle.setAttribute('aria-expanded', String(!isCollapsed));
+    v.body.classList.toggle('is-collapsed', isCollapsed);
+    const want = [v.head];
+    if (!isCollapsed) {
+      for (const term of list) want.push(rowFor(term));
+      if (!list.length) {
+        const text = filtersActive() && total ? t('glossary.group.no_match') : t(`glossary.group.${g.key}_drop`);
+        if (!v.empty || v.empty.textContent !== text) v.empty = h('tr', { class: 'tg-empty' }, h('td', { colspan: '6' }, text));
+        want.push(v.empty);
+      }
+    }
+    placeRows(v.body, want);
+  }
+
+  // The row of a term: the one on the page while its term, editor and busy
+  // state are the same, else a new one.
+  function rowFor(term) {
+    const key = JSON.stringify(term) + (editingTerm === term.id ? '\n(editing)' : '') + (moving.has(term.id) ? '\n(busy)' : '');
+    const c = rowCache.get(term.id);
+    if (c && c.key === key) {
+      // put back after a time off the page: its markers closed (R71 L1)
+      if (!c.row.isConnected) for (const w of c.row.querySelectorAll('.mk-wrap')) if (w._reset) w._reset();
+      return c.row;
+    }
+    const row = termRow(term);
+    rowCache.set(term.id, { key, row });
+    return row;
+  }
+
+  // Makes the children of body the rows of want, in order, moving only what
+  // is out of place: a row that stays is not touched (nor its focus).
+  function placeRows(body, want) {
+    const keep = new Set(want);
+    let cur = body.firstChild;
+    for (const row of want) {
+      while (cur && !keep.has(cur)) {
+        const next = cur.nextSibling;
+        cur.remove();
+        cur = next;
+      }
+      if (cur === row) cur = cur.nextSibling;
+      else body.insertBefore(row, cur);
+    }
+    while (cur) {
+      const next = cur.nextSibling;
+      cur.remove();
+      cur = next;
+    }
+  }
+
+  function syncFoot(n) {
+    const active = filtersActive();
+    const key = `${active}:${n}:${terms.length}`;
+    if (key === footKey) return;
+    footKey = key;
+    clear(termsFoot);
+    append(termsFoot, [
+      h('span', null, active ? t('glossary.foot.shown', { shown: n, n: terms.length }) : t('glossary.foot.total', { n: terms.length })),
+      active ? btn(t('glossary.filter.clear'), { size: 'sm', kind: 'ghost', onclick: clearFilters }) : null,
+      h('span', { class: 'terms-keys' }, tNodes('glossary.foot.keys', { f2: h('kbd', null, 'F2'), del: h('kbd', null, 'Del'), more: h('kbd', null, 'Shift+F10') })),
+    ]);
+  }
+
+  // A group's header and its body (the drop target), built with the table;
+  // syncGroup fills in the count, the fold state and the rows.
+  function groupShell(g) {
+    const count = h('span', { class: 'tg-count' });
     const toggle = h(
       'button',
       {
         type: 'button',
         class: 'tg-toggle',
-        'aria-expanded': String(!isCollapsed),
+        'aria-expanded': 'true',
         dataset: { fkey: `tg:${g.key}` },
         onclick: () => {
           if (collapsed.has(g.key)) collapsed.delete(g.key);
@@ -749,14 +1107,10 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
       icon('chevron-right', { size: 14, class: 'tg-chev' }),
       icon(g.icon, { size: 14, class: 'tg-icon' }),
       h('span', { class: 'tg-name' }, groupName(g.key)),
-      h('span', { class: 'tg-count' }, count),
+      count,
     );
-    const rows = [h('tr', { class: 'tg-hd' }, h('th', { colspan: '6', scope: 'rowgroup' }, h('div', { class: 'tg-hd-in' }, toggle, h('span', { class: 'tg-desc' }, t(`glossary.group.${g.key}_desc`)))))];
-    if (!isCollapsed) {
-      for (const term of list) rows.push(termRow(term));
-      if (!list.length) rows.push(h('tr', { class: 'tg-empty' }, h('td', { colspan: '6' }, filtersActive() && total ? t('glossary.group.no_match') : t(`glossary.group.${g.key}_drop`))));
-    }
-    const body = h('tbody', { class: `tg tg-${g.key}` + (isCollapsed ? ' is-collapsed' : ''), dataset: { group: g.key } }, rows);
+    const head = h('tr', { class: 'tg-hd' }, h('th', { colspan: '6', scope: 'rowgroup' }, h('div', { class: 'tg-hd-in' }, toggle, h('span', { class: 'tg-desc' }, t(`glossary.group.${g.key}_desc`)))));
+    const body = h('tbody', { class: `tg tg-${g.key}`, dataset: { group: g.key } }, head);
     // drop target: the whole group, its header included (also when collapsed)
     body.addEventListener('dragover', (e) => {
       const term = dragId && terms && terms.find((x) => x.id === dragId);
@@ -776,7 +1130,7 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
       dragId = null;
       moveTerm(term, g.key);
     });
-    return body;
+    return { body, head, toggle, count, empty: null };
   }
 
   function termRow(term) {
@@ -790,6 +1144,7 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
           ic: 'lock',
           cls: 'mk-lock',
           label: t('glossary.term.locked_label'),
+          title: t('glossary.term.locked'),
           fkey: `term:${term.id}:lock`,
           body: [h('div', { class: 'mk-title' }, icon('lock', { size: 12 }), t('glossary.term.locked')), h('p', { class: 'mk-text' }, t('glossary.term.locked_text'))],
           action: { label: t('glossary.term.unlock'), icon: 'lock-open', fkey: `term:${term.id}:unlock`, onclick: () => unlockTerm(term) },
@@ -802,6 +1157,7 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
           ic: 'wand-sparkles',
           cls: 'mk-janitor',
           label: t('glossary.term.janitor_label', { note: term.janitor_note }),
+          title: t('glossary.term.janitor_title'),
           fkey: `term:${term.id}:jnote`,
           body: [h('div', { class: 'mk-title' }, icon('wand-sparkles', { size: 12 }), t('glossary.term.janitor_title')), h('p', { class: 'mk-text', lang: 'en' }, term.janitor_note)],
         }),
@@ -886,9 +1242,13 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
       const zh = termDraft.trim();
       if (save && zh !== (term.zh || '')) await patchTerm(term, { zh }, false);
       if (!alive) return;
-      editingTerm = null;
+      // another term's editor opened while the change was sent stays open
+      if (editingTerm === term.id) editingTerm = null;
       renderTable();
-      if (refocus) {
+      // the editor gone, the focus is on the page: back to the rendering
+      // (not when the user went on elsewhere while the change was sent)
+      const a = document.activeElement;
+      if (refocus && (!a || a === document.body)) {
         const b = tableWrap.querySelector(`[data-fkey="${CSS.escape(`term:${term.id}:zh`)}"]`);
         if (b) b.focus();
       }
@@ -904,8 +1264,10 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
         finish(false, true);
       }
     });
+    // leaving the editor saves it; not the blur of the editor being taken
+    // off the page by a redraw (moved, drawn anew, or gone with its row)
     input.addEventListener('blur', () => {
-      if (input.isConnected) finish(true, false);
+      if (input.isConnected && !drawing) finish(true, false);
     });
     return note ? h('div', { class: 'zh-edit' }, input, note) : input;
   }
@@ -1018,13 +1380,18 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
       enInput.focus();
       return;
     }
+    let term;
     try {
-      const term = await api.addTerm(courseId, en, zh);
+      term = await api.addTerm(courseId, en, zh);
       if (!term) return;
     } catch {
       return;
     }
-    toast(t('glossary.add.done', { en }), 'success');
+    // WV-05: scrolled to and highlighted once drawn; one the search, the
+    // source filter or a collapsed group hides is not, and the toast says so
+    const hidden = !filterOf()(term) || collapsed.has(groupOf(term));
+    toast(t(hidden ? 'glossary.add.done_hidden' : 'glossary.add.done', { en }), 'success');
+    if (!hidden && term.id) termAdded = term.id;
     enInput.value = '';
     zhInput.value = '';
     enInput.focus();
@@ -1049,6 +1416,7 @@ export function createGlossary({ courseId, ctx, onCourse, reloadCourse }) {
     },
     destroy() {
       alive = false;
+      clearTimeout(filterTimer);
     },
   };
 }

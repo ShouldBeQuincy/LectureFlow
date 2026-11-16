@@ -7,6 +7,17 @@
 //   bin/lectureflow(.exe)   go build -trimpath -ldflags "-s -w -X main.version=V"
 //   bin/lectureflow-nmhost(.exe)  the browser extension's Native Messaging host
 //                           (./cmd/lectureflow-nmhost, built like the server)
+//   agent/<target>/lf-agent only with LECTUREFLOW_BUNDLE_LF_AGENT=1 (off by default
+//                           while the SSH servers are experimental, behind
+//                           LECTUREFLOW_EXPERIMENTAL_SSH; see bundleAgent):
+//                           the SSH inference servers' agent (ssh-1b; ./cmd/lf-agent,
+//                           CGO_ENABLED=0) for every remote target: linux-x64,
+//                           darwin-arm64, windows-x64 (cmd/lectureflow/ssh.go reads
+//                           resources/agent); agent/kit.json has the version and the
+//                           SHA-256 of each as built (electron-builder signs the macOS
+//                           app's Mach-O files again, the darwin-arm64 one included,
+//                           so there the shipped bytes differ: the service always
+//                           hashes the file it uploads)
 //   bin/ffmpeg, ffprobe     LGPL build from pinned sources (packaging/third-party.json;
 //                           Windows: scripts/build-ffmpeg-windows.sh, macOS:
 //                           scripts/build-ffmpeg-macos.sh), configure line and ffmpeg -L checked
@@ -121,6 +132,68 @@ const GO_PROGRAMS = [
   { name: 'lectureflow-nmhost', pkg: './cmd/lectureflow-nmhost' },
 ];
 
+// ssh-1b: the agent of the SSH inference servers, one static build per
+// remote target (resources/agent/<target>/lf-agent; internal/remote
+// Platforms), whatever platform the installer is for: a Windows or macOS
+// app may drive a Linux, Mac or Windows server. About 7 MB each.
+const AGENT_PKG = './cmd/lf-agent';
+const AGENT_TARGETS = [
+  { target: 'linux-x64', goos: 'linux', goarch: 'amd64' },
+  { target: 'darwin-arm64', goos: 'darwin', goarch: 'arm64' },
+  { target: 'windows-x64', goos: 'windows', goarch: 'amd64' },
+];
+
+// The installers leave lf-agent out while the SSH servers are experimental
+// (LECTUREFLOW_EXPERIMENTAL_SSH; user decision 2026-11-11): three cross
+// builds of about 7 MB each and their build time for a feature that is off.
+// Without them a switched-on service says so (remote.agent_missing);
+// development builds use make.ps1 agent (tools/lf-agent). When the feature
+// becomes public, set BUNDLE_AGENT_DEFAULT to true (the one place); the
+// environment variable LECTUREFLOW_BUNDLE_LF_AGENT=1 / 0 overrides it for
+// one build.
+const BUNDLE_AGENT_ENV = 'LECTUREFLOW_BUNDLE_LF_AGENT';
+const BUNDLE_AGENT_DEFAULT = false;
+
+/** bundleAgent(env) → whether stage builds resources/agent. */
+function bundleAgent(env = process.env) {
+  const v = env[BUNDLE_AGENT_ENV];
+  if (v === '1') return true;
+  if (v === '0') return false;
+  if (v !== undefined && v !== '') throw new Error(`${BUNDLE_AGENT_ENV} must be 1 or 0, not ${JSON.stringify(v)}`);
+  return BUNDLE_AGENT_DEFAULT;
+}
+
+/** agentBuildArgs(version, out) → the go build arguments of one agent (as make.ps1 agent). */
+function agentBuildArgs(version, out) {
+  return ['build', '-trimpath', '-ldflags', `-s -w -X lectureflow/internal/agent.Version=${version}`, '-o', out, AGENT_PKG];
+}
+
+/**
+ * stageAgent(version, {out, build}) builds every agent target into
+ * out/agent/<target>/lf-agent and writes out/agent/kit.json {version,
+ * builds: {target: sha256}}; returns that object. build(target, file) is
+ * replaced in tests (default: go build, CGO_ENABLED=0, cross-compiled).
+ */
+function stageAgent(version, { out = OUT, build } = {}) {
+  const dir = path.join(out, 'agent');
+  const kit = { version, builds: {} };
+  for (const t of AGENT_TARGETS) {
+    const file = path.join(dir, t.target, 'lf-agent');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (build) build(t, file);
+    else {
+      const env = { ...process.env, CGO_ENABLED: '0', GOOS: t.goos, GOARCH: t.goarch };
+      console.log(`go build ${AGENT_PKG} ${t.goos}/${t.goarch} version ${version}`);
+      execFileSync('go', agentBuildArgs(version, file), { cwd: REPO, env, stdio: 'inherit' });
+    }
+    if (!fs.existsSync(file)) throw new Error(`lf-agent for ${t.target} was not built`);
+    if (t.goos !== 'windows') fs.chmodSync(file, 0o755);
+    kit.builds[t.target] = sha256File(file);
+  }
+  fs.writeFileSync(path.join(dir, 'kit.json'), `${JSON.stringify(kit, null, 2)}\n`);
+  return kit;
+}
+
 function goBuild(platform, version, { name, pkg } = GO_PROGRAMS[0]) {
   const exe = platform === 'win32' ? `${name}.exe` : name;
   const out = path.join(OUT, 'bin', exe);
@@ -177,6 +250,62 @@ function ffmpegSourceText(key, version = APP_VERSION, repo = releaseRepo()) {
   return out.join('\n');
 }
 
+/**
+ * cachedBuildProblems(root, program, key, manifest) → why a build in
+ * desktop/.cache (ffmpeg-windows-*, ffmpeg-macos-*, aria2c-macos-*; in CI
+ * restored from the Actions cache or the ffmpeg-windows artifact) does not
+ * belong to the pins in third-party.json. The build scripts write
+ * BUILDINFO.txt: its first line names program, version and platform, and
+ * the macOS scripts record the SHA-256 of the source tarball (and of
+ * ffmpeg's dependencies) they built from; each must be the pinned one.
+ *
+ * This is a consistency check, not a tamper check: the repository pins the
+ * sources, not the built binaries (no expected SHA-256 of them exists), and
+ * BUILDINFO.txt lives in the same cache as the binaries. stage logs the
+ * SHA-256 of every cached binary it ships (stage-info.json) so a release
+ * can be compared with another build.
+ */
+function cachedBuildProblems(root, program, key, manifest = MANIFEST) {
+  const file = path.join(root, 'BUILDINFO.txt');
+  if (!fs.existsSync(file)) return [`${file} is missing`];
+  const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
+  const m = manifest[program];
+  const spec = m[key];
+  const platform = key === 'windows-x64' ? 'Windows x64' : 'macOS arm64';
+  const header = `${program === 'ffmpeg' ? 'FFmpeg' : 'aria2'} ${m.version} for ${platform},`;
+  const problems = [];
+  if (!lines[0].startsWith(header)) problems.push(`BUILDINFO.txt starts "${lines[0]}", expected "${header} …"`);
+  if (key === 'darwin-arm64') {
+    if (!lines.includes(`source sha256: ${spec.sha256}`)) problems.push(`BUILDINFO.txt does not name the pinned source (sha256 ${spec.sha256})`);
+    for (const d of spec.deps || []) {
+      if (program === 'ffmpeg' && !lines.some((l) => l.startsWith(`dependency: ${d.name} ${d.version} `) && l.includes(` sha256 ${d.sha256} `))) {
+        problems.push(`BUILDINFO.txt does not name the pinned ${d.name} ${d.version} (sha256 ${d.sha256})`);
+      }
+    }
+  }
+  return problems;
+}
+
+/**
+ * reuseCachedBuild(root, bin, program, key) → true when root holds a build
+ * (root/bin exists) that cachedBuildProblems accepts. A build it refuses is
+ * deleted, so the caller builds it again from the pinned sources.
+ */
+function reuseCachedBuild(root, bin, program, key, manifest = MANIFEST) {
+  if (!fs.existsSync(path.join(root, bin))) return false;
+  const problems = cachedBuildProblems(root, program, key, manifest);
+  if (!problems.length) return true;
+  console.log(`discarding the cached ${program} build ${root}: ${problems.join('; ')}`);
+  fs.rmSync(root, { recursive: true, force: true });
+  return false;
+}
+
+/** checkFreshBuild(root, program, key): a build just made must pass cachedBuildProblems too. */
+function checkFreshBuild(root, program, key) {
+  const problems = cachedBuildProblems(root, program, key);
+  if (problems.length) throw new Error(`${program} build in ${root}: ${problems.join('; ')}`);
+}
+
 async function stageFfmpeg(platform, key, version = APP_VERSION) {
   const spec = MANIFEST.ffmpeg[key];
   let root;
@@ -184,23 +313,30 @@ async function stageFfmpeg(platform, key, version = APP_VERSION) {
     // Built from the pinned sources by scripts/build-ffmpeg-windows.sh
     // (Linux + mingw-w64; on Windows through Docker, CI: an ubuntu job).
     root = path.join(CACHE, `ffmpeg-windows-${MANIFEST.ffmpeg.version}`);
-    if (!fs.existsSync(path.join(root, 'bin', 'ffmpeg.exe'))) buildWindowsFfmpeg(spec);
+    if (!reuseCachedBuild(root, path.join('bin', 'ffmpeg.exe'), 'ffmpeg', key)) {
+      buildWindowsFfmpeg(spec);
+      checkFreshBuild(root, 'ffmpeg', key);
+    }
   } else {
     // Built from the pinned source by scripts/build-ffmpeg-macos.sh (CI).
     root = path.join(CACHE, `ffmpeg-macos-${MANIFEST.ffmpeg.version}`);
-    if (!fs.existsSync(path.join(root, 'bin', 'ffmpeg'))) {
+    if (!reuseCachedBuild(root, path.join('bin', 'ffmpeg'), 'ffmpeg', key)) {
       if (process.platform !== 'darwin') throw new Error('the macOS ffmpeg is built on macOS (scripts/build-ffmpeg-macos.sh)');
       execFileSync('bash', [path.join(__dirname, 'build-ffmpeg-macos.sh')], { cwd: DESKTOP, stdio: 'inherit' });
+      checkFreshBuild(root, 'ffmpeg', key);
     }
   }
   let n = 0;
+  const binaries = {};
   for (const pattern of spec.bin) {
     for (const f of globFiles(root, pattern)) {
       copy(f, path.join(OUT, 'bin', path.basename(f)));
+      binaries[path.basename(f)] = sha256File(f);
       n++;
     }
   }
   if (n < 2) throw new Error(`ffmpeg: expected ffmpeg and ffprobe in ${root}`);
+  console.log(`ffmpeg ${MANIFEST.ffmpeg.version} from ${root}: ${Object.entries(binaries).map(([b, s]) => `${b} ${s}`).join(', ')}`);
   for (const lic of spec.licenses) {
     for (const f of globFiles(root, lic)) copy(f, path.join(OUT, 'licenses', 'ffmpeg', path.basename(f)));
   }
@@ -229,7 +365,7 @@ async function stageFfmpeg(platform, key, version = APP_VERSION) {
   fs.writeFileSync(path.join(OUT, 'licenses', 'ffmpeg', 'CONFIGURE.txt'),
     `FFmpeg ${MANIFEST.ffmpeg.version} (${spec.build || spec.url}), LGPL build. Configure flags:\n${configure.split(' ').join('\n')}\n`);
   fs.writeFileSync(path.join(OUT, 'licenses', 'ffmpeg', 'SOURCE.txt'), ffmpegSourceText(key, version));
-  return { configure, licenseChecks: checks };
+  return { configure, licenseChecks: checks, binaries };
 }
 
 async function stageUv(platform, key) {
@@ -330,9 +466,10 @@ async function stageAria2c(platform, key, version = APP_VERSION) {
   } else {
     // No upstream macOS binary: built from the pinned source (CI: macos-14, cached).
     root = path.join(CACHE, `aria2c-macos-${a.version}`);
-    if (!fs.existsSync(path.join(root, spec.bin))) {
+    if (!reuseCachedBuild(root, spec.bin, 'aria2c', key)) {
       if (process.platform !== 'darwin') throw new Error('the macOS aria2c is built on macOS (packaging/aria2c/build-aria2c-macos.sh)');
       execFileSync('bash', [path.join(REPO, 'packaging', 'aria2c', 'build-aria2c-macos.sh')], { cwd: REPO, stdio: 'inherit' });
+      checkFreshBuild(root, 'aria2c', key);
     }
   }
   const src = path.join(root, spec.bin);
@@ -543,12 +680,17 @@ function stageFiles() {
   copy(path.join(REPO, 'LICENSE-EXCEPTION.md'), path.join(OUT, 'LICENSE-EXCEPTION.md'));
 }
 
-async function stage({ platform = process.platform, version } = {}) {
+async function stage({ platform = process.platform, version, env = process.env } = {}) {
   const key = targetKey(platform);
   version = version || JSON.parse(fs.readFileSync(path.join(DESKTOP, 'package.json'), 'utf8')).version;
+  const withAgent = bundleAgent(env); // before anything is built: a bad value fails at once
   fs.rmSync(OUT, { recursive: true, force: true });
   fs.mkdirSync(OUT, { recursive: true });
   const [server, nmhost] = GO_PROGRAMS.map((p) => goBuild(platform, version, p));
+  // null = not bundled (stage-info.json says so); OUT was emptied above, so
+  // no agent of an earlier build is left in resources/.
+  const agent = withAgent ? stageAgent(version) : null;
+  if (!agent) console.log(`lf-agent: not bundled (${BUNDLE_AGENT_ENV}=1 to include it)`);
   const ff = await stageFfmpeg(platform, key, version);
   await stageUv(platform, key);
   const aria2c = await stageAria2c(platform, key, version);
@@ -570,11 +712,12 @@ async function stage({ platform = process.platform, version } = {}) {
     version,
     platform: key,
     macos: { minimum_system_version: minimum, macho: mac.files },
-    ffmpeg: { version: MANIFEST.ffmpeg.version, url: MANIFEST.ffmpeg[key].url, sha256: MANIFEST.ffmpeg[key].sha256, configure: ff.configure, license_checks: ff.licenseChecks },
+    ffmpeg: { version: MANIFEST.ffmpeg.version, url: MANIFEST.ffmpeg[key].url, sha256: MANIFEST.ffmpeg[key].sha256, configure: ff.configure, license_checks: ff.licenseChecks, binaries_sha256: ff.binaries },
     uv: { version: MANIFEST.uv.version, url: MANIFEST.uv[key].url, sha256: MANIFEST.uv[key].sha256 },
     aria2c: { version: aria2c.version, url: MANIFEST.aria2c[key].url, url_sha256: MANIFEST.aria2c[key].sha256, sha256: aria2c.sha256, size: aria2c.size, checks: aria2c.checks },
     server_sha256: sha256File(server),
     nmhost_sha256: sha256File(nmhost),
+    agent,
   };
   fs.writeFileSync(path.join(DESKTOP, 'build', 'stage-info.json'), `${JSON.stringify(info, null, 2)}\n`);
   console.log(`staged ${OUT}`);
@@ -582,7 +725,7 @@ async function stage({ platform = process.platform, version } = {}) {
 }
 
 module.exports = {
-  stage, stageAria2c, checkConfigure, checkLicenseText, gplFree, gplComponents, targetKey, checkAria2cVersion, aria2cSourceText, ffmpegSourceText, bundledFileProblems,
+  stage, stageAria2c, stageAgent, bundleAgent, BUNDLE_AGENT_ENV, BUNDLE_AGENT_DEFAULT, cachedBuildProblems, reuseCachedBuild, agentBuildArgs, AGENT_TARGETS, checkConfigure, checkLicenseText, gplFree, gplComponents, targetKey, checkAria2cVersion, aria2cSourceText, ffmpegSourceText, bundledFileProblems,
   machoSlices, machoVersion, compareVersions, macMinimumCheck,
   WORKER_FILES, GO_PROGRAMS, OUT,
 };

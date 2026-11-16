@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"lectureflow/internal/config"
 	"lectureflow/internal/ctxbuild"
@@ -168,6 +169,46 @@ func (d Deps) concurrency(role, providerID string) int {
 	return 1
 }
 
+// deepSeek reports whether providerID is DeepSeek's API (settings.IsDeepSeek:
+// its base_url host or its balance API).
+func (d Deps) deepSeek(providerID string) bool {
+	if d.Settings != nil {
+		p, ok := d.Settings.Provider(providerID)
+		return ok && settings.IsDeepSeek(p.BaseURL, p.BalanceAPI)
+	}
+	if d.Cfg == nil {
+		return false
+	}
+	p, ok := d.Cfg.LLM.Providers[providerID]
+	return ok && settings.IsDeepSeek(p.BaseURL, "")
+}
+
+// anthropic reports whether providerID is an Anthropic provider: of type
+// anthropic and not DeepSeek's Anthropic-compatible endpoint (deepSeek), the
+// rule settings uses for the glossary_janitor default. config.toml
+// providers are OpenAI-compatible (llm resolveLegacy).
+func (d Deps) anthropic(providerID string) bool {
+	if d.Settings == nil {
+		return false
+	}
+	p, ok := d.Settings.Provider(providerID)
+	return ok && p.Type == model.ProviderAnthropic && !d.deepSeek(providerID)
+}
+
+// repairWarmupFor is the warm-up of a repair run on target:
+// repairAnthropicWarmup when its provider is Anthropic and its requests are
+// streamed (llm.Streams: a current Claude model), the only case in which
+// chunk 0 reports the start of its answer; repairWarmup otherwise —
+// DeepSeek whatever its endpoint, other providers, and models an Anthropic
+// provider does not stream (older Claude models, other models behind an
+// Anthropic-compatible gateway), which keep their timing.
+func (d Deps) repairWarmupFor(target model.LLMSnapshot) warmup {
+	if d.anthropic(target.ProviderID) && llm.Streams(model.ProviderAnthropic, target.Model) {
+		return repairAnthropicWarmup
+	}
+	return repairWarmup
+}
+
 // ---------- model configuration snapshots (v1.1 A4) ----------
 
 // MissingSnapshot is the error of a lecture stage whose job has no usable
@@ -208,6 +249,17 @@ func recordGlossaryVersion(ctx context.Context, v int) {
 
 func (d Deps) lectureDir(l model.Lecture) string {
 	return model.LectureDir(d.DataDir, l.CourseID, l.ID)
+}
+
+// mediaDisplayName is the name a message gives a lecture's media file: the
+// name the user imported it under (original_filename), else the stored
+// file's own name ("media.mp4"; lectures created before v2 have no
+// original name). test-media I6.
+func mediaDisplayName(l model.Lecture) string {
+	if n := strings.TrimSpace(l.OriginalFilename); n != "" {
+		return n
+	}
+	return filepath.Base(l.MediaPath)
 }
 
 // resolvePath resolves a stored path: absolute, relative to the working
@@ -302,7 +354,7 @@ const businessRetries = 2
 type errUnusable struct{ last error }
 
 func (e *errUnusable) Error() string {
-	return fmt.Sprintf("模型输出连续 %d 次无法使用：%v", businessRetries+1, e.last)
+	return fmt.Sprintf("模型输出连续 %d 次无法使用：%v", businessRetries+1, withoutAnswerText(e.last))
 }
 func (e *errUnusable) Unwrap() error { return e.last }
 
@@ -322,31 +374,139 @@ func isUnusable(err error) bool {
 	return errors.As(err, &u)
 }
 
+// unusableKind names what was wrong with the last answer of an unusable
+// request, for the service log: the error text itself quotes the model's
+// answer (lecture content), which the log must not hold.
+func unusableKind(err error) string {
+	switch {
+	case errors.Is(err, llm.ErrSecondJSON):
+		return "second_json"
+	case errors.Is(err, llm.ErrBadJSON):
+		return "not_json"
+	}
+	return "check"
+}
+
+// refusalCategory is the provider's refusal category of an llm.refusal
+// error ("" when none came).
+func refusalCategory(err error) string {
+	var ce *model.CodedError
+	if errors.As(err, &ce) {
+		c, _ := ce.Info.Params["category"].(string)
+		return c
+	}
+	return ""
+}
+
 // askJSON sends one JSON-mode request and decodes the answer into a fresh T,
-// retrying up to businessRetries times when the answer cannot be parsed or
-// check rejects it. Transport and context errors are returned at once.
+// asking again up to businessRetries times when the answer cannot be parsed
+// or check rejects it. From the second request on the model is told why its
+// answer was rejected (askJSONTries; v3.2.x P1 amends SPEC §12, which sent
+// the same request again). Transport and context errors — and a request the
+// provider declined, llm.ErrRefusal — are returned at once.
 func askJSON[T any](ctx context.Context, c llm.Client, role, system, user string, check func(*T) error) (T, error) {
-	var last error
-	for range businessRetries + 1 {
-		var v T
-		res, err := c.Complete(ctx, role, system, user, true)
+	v, last, err := askJSONTries(ctx, c, role, system, user, businessRetries+1, check)
+	if err != nil {
+		return v, err
+	}
+	if last != nil {
+		var zero T
+		return zero, &errUnusable{last: last}
+	}
+	return v, nil
+}
+
+// retryProblems is a check error that lists its problems for the retry.
+type retryProblems interface{ Problems() []string }
+
+// unparsedAnswer is askJSONTries' reason for an answer that did not parse
+// (llm.ParseAnswer's error, kept as is: its text is what the retry feedback
+// and a pending sentence's qa_error say). That text may quote the start of
+// the answer — lecture content — so where it becomes a job error's detail
+// or a log line (the scheduler's "job failed"), withoutAnswerText replaces
+// it (review R51, as r4 D1 did for checked answers).
+type unparsedAnswer struct {
+	err   error
+	chars int // length of the answer, in runes
+}
+
+func (e *unparsedAnswer) Error() string { return e.err.Error() }
+func (e *unparsedAnswer) Unwrap() error { return e.err }
+
+// withoutAnswerText is err for a job error's detail and the service log: an
+// unparsedAnswer becomes a fixed text with the answer's length (the one of
+// two different JSON values, llm.ErrSecondJSON, quotes nothing and stays);
+// any other error is returned as it is. The rejected answer itself is in
+// the call log's rejected-*.jsonl, as before.
+func withoutAnswerText(err error) error {
+	ua, ok := err.(*unparsedAnswer)
+	if !ok || errors.Is(ua.err, llm.ErrSecondJSON) {
+		return err
+	}
+	return &answerNotQuoted{
+		text: fmt.Sprintf("%s (an answer of %d characters, not quoted here)", llm.ErrBadJSON.Error(), ua.chars),
+		err:  err,
+	}
+}
+
+// answerNotQuoted is an unparsedAnswer under its quote-free text.
+type answerNotQuoted struct {
+	text string
+	err  error
+}
+
+func (e *answerNotQuoted) Error() string { return e.text }
+func (e *answerNotQuoted) Unwrap() error { return e.err }
+
+// askJSONTries sends a JSON-mode request up to tries times until an answer
+// parses (llm.ParseAnswer) and passes check. A retry is the same system
+// prompt (the cached prefix is untouched) and the same user message,
+// followed by ctxbuild.WithRetryFeedback with what was wrong with the last
+// answer: the error's Problems() when it has them (a retryProblems), else
+// its text; ctxbuild.SecondJSONProblem for an answer of two different JSON
+// values; ctxbuild.NotJSONProblem for any other unparsable answer. Every
+// rejected answer is reported (llm.ReportRejected).
+//
+// last is nil when v is usable, else the reason the last answer was
+// rejected (every try was used). err is a transport or context error,
+// returned at once.
+func askJSONTries[T any](ctx context.Context, c llm.Client, role, system, user string, tries int, check func(*T) error) (v T, last, err error) {
+	u := user
+	reject := func(problems []string) { u = ctxbuild.WithRetryFeedback(user, problems) }
+	ctx = llm.WithCallTrace(ctx) // the call log numbers the tries and names the refused answers
+	for range tries {
+		var a T
+		res, err := c.Complete(ctx, role, system, u, true)
 		if err != nil {
-			return v, err
+			return a, nil, err
 		}
-		if err := llm.ParseJSON(res.Text, &v); err != nil {
-			last = err
+		if err := llm.ParseAnswer(ctx, role, res.Text, &a); err != nil {
+			llm.ReportRejected(ctx, role, res.Text, err)
+			last = &unparsedAnswer{err: err, chars: utf8.RuneCountInString(res.Text)}
+			if errors.Is(err, llm.ErrSecondJSON) {
+				reject([]string{ctxbuild.SecondJSONProblem})
+			} else {
+				reject([]string{ctxbuild.NotJSONProblem(err.Error())})
+			}
 			continue
 		}
 		if check != nil {
-			if err := check(&v); err != nil {
+			if err := check(&a); err != nil {
+				llm.ReportRejected(ctx, role, res.Text, err)
 				last = err
+				var rp retryProblems
+				if errors.As(err, &rp) {
+					reject(rp.Problems())
+				} else {
+					reject([]string{err.Error()})
+				}
 				continue
 			}
 		}
-		return v, nil
+		return a, nil, nil
 	}
 	var zero T
-	return zero, &errUnusable{last: last}
+	return zero, last, nil
 }
 
 // parallel runs fn(i) for i in [0, n) with at most workers goroutines. When
@@ -402,9 +562,12 @@ type progressCounter struct {
 	report      func(float64)
 }
 
-func (p *progressCounter) inc() {
+func (p *progressCounter) inc() { p.add(1) }
+
+// add counts n more items done (a batch of translated sentences).
+func (p *progressCounter) add(n int) {
 	p.mu.Lock()
-	p.done++
+	p.done += n
 	v := float64(p.done) / float64(max(p.total, 1))
 	p.mu.Unlock()
 	p.report(v)

@@ -44,7 +44,7 @@ func (s *asrStage) sshRun(ctx context.Context, job model.Job, run model.ASRSnaps
 	ms, ok := wav.DurationMS(audio)
 	if !ok || ms <= 0 {
 		return nil, sched.Permanent(model.Errorf(CodeASRAudioMissing, map[string]any{"file": model.AudioFile},
-			fmt.Errorf("%s 无法读取（prep 的产物），请重跑 prep 阶段", audio)))
+			fmt.Errorf("%s 无法读取（预处理的产物），请重新运行预处理阶段", audio)))
 	}
 	sum, err := s.wavSHA256(audio)
 	if err != nil {

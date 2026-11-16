@@ -37,6 +37,8 @@ func TestDataDirRestrictUI(t *testing.T) {
 		"confirmDialog(",
 		"await api.restrictDataDir()",
 		"toast(t('system.data_dir_restricted'), 'success')",
+		"if (res && res.rollback_reset) toast(t('system.data_dir_rollback_reset'), 'info')",       // the rollback state that went with it
+		"if (e.body && e.body.rollback_reset) toast(t('system.data_dir_rollback_reset'), 'info')", // ... also when the request then failed (409)
 		"toast(e.message",              // the coded error's text (data_dir.restrict_failed)
 		"await opts.refresh()",         // the row is the server's
 		"c.detail_info.params.path",    // the confirmation names the folder
@@ -70,7 +72,7 @@ func TestDataDirRestrictUI(t *testing.T) {
 	zh := loadCatalog(t, filepath.Join(catalogDir, "zh-CN.json"))
 	en := loadCatalog(t, filepath.Join(catalogDir, "en.json"))
 	ctx := loadCatalog(t, filepath.Join(catalogDir, "context.json"))
-	for _, k := range []string{"system.data_dir_restrict", "system.data_dir_restricting", "system.data_dir_restricted", "system.data_dir_restrict_title", "system.data_dir_restrict_confirm"} {
+	for _, k := range []string{"system.data_dir_restrict", "system.data_dir_restricting", "system.data_dir_restricted", "system.data_dir_rollback_reset", "system.data_dir_restrict_title", "system.data_dir_restrict_confirm"} {
 		if !strings.Contains(src, "'"+k+"'") {
 			t.Errorf("system_datadir.js does not use %s", k)
 		}

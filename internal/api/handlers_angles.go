@@ -120,6 +120,9 @@ func (s *Server) getAngle(w http.ResponseWriter, r *http.Request) {
 func (s *Server) postAngle(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	l, err := s.getLectureRow(ctx, r.PathValue("id"))
+	if err == nil {
+		err = checkRecordIDs(l.CourseID, l.ID) // record_dir.go
+	}
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -176,7 +179,7 @@ func (s *Server) angleSource(w http.ResponseWriter, r *http.Request, dir string)
 	if err != nil {
 		return "", "", none, err
 	}
-	resolved, info, err := s.checkSourcePath(pr.path)
+	resolved, info, err := s.checkSourcePath(r.Context(), pr.path)
 	if err != nil {
 		return "", "", none, err
 	}
@@ -270,7 +273,9 @@ func (s *Server) deleteAngle(w http.ResponseWriter, r *http.Request) {
 	}
 	name := r.PathValue("name")
 	p := angleFile(s.lectureDir(l), name)
-	if !validAngleName(name) || !fileExists(p) {
+	// record_dir.go: the file of this lecture's own directory only (not a
+	// sibling's that differs only in case)
+	if !validAngleName(name) || !s.removableRecordDir(s.lectureDir(l), l.CourseID, l.ID) || !fileExists(p) {
 		writeError(w, http.StatusNotFound, codeAngleNotFound, map[string]any{"name": name})
 		return
 	}

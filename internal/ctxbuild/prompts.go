@@ -117,6 +117,32 @@ GLOSSARY:
 SUMMARY:
 {summary}`
 
+// TranslateBatchSystemTemplate is the system prompt of a batch translate
+// request (v3.2.x P2, Q14a: several consecutive TARGET sentences per
+// request, translate prompt version 3). It is a variant of
+// TranslateSystemTemplate, not in the SPEC: its authoritative text is this
+// constant and translate_batch_system.golden. It differs from
+// TranslateSystemTemplate in exactly four lines (pinned by a test): the
+// first line (the fake LLM tells the two apart by it), rule 1, the ASR
+// rule and the "Respond with JSON only" line. Rules 2–4 and the glossary
+// and summary sections are the same bytes.
+const TranslateBatchSystemTemplate = `You translate a university lecture from English into Simplified Chinese, several consecutive sentences at a time. You are given the course glossary and a summary of the lecture.
+
+Rules:
+- Translate every TARGET sentence, each on its own: never merge, split, reorder, skip, or add sentences. The BEFORE and AFTER sentences are context to help you understand them; do not translate them. The TARGET sentences are also context for each other.
+- Terms under MANDATORY TERMS must be translated exactly as given; those with no Chinese translation stay in English. Terms under PREFERRED TERMS use the given translation only when the word is used in its technical sense; otherwise translate naturally.
+- Keep numbers, formulas, code, variable names, and file names exactly as written.
+- Write natural spoken academic Chinese, as a Chinese lecturer would say it. Do not add explanations.
+- An ASR line, if present, is the raw speech-recognition output for the TARGET sentence just above it. It may contain errors; use it only if that target sentence seems incomplete.
+
+Respond with JSON only, with exactly one item per TARGET sentence: {"items": [{"idx": <target idx>, "zh": "..."}]}
+
+GLOSSARY:
+{glossary_lines}
+
+SUMMARY:
+{summary}`
+
 // translateSystemTemplateV1 is SPEC.md §13.5 verbatim, FROZEN: it is never
 // edited again. The translate hashes (TranslateHash, TranslateStageHash)
 // fill it with GlossaryHashText and the summary instead of using the live

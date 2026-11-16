@@ -55,6 +55,8 @@
 // Pure.
 
 import { parseHttpUrl } from './url.js';
+import { regexComplexity } from './regexcost.js';
+import { guardedRegex, regexTrip } from './regexguard.js';
 
 export const CATEGORY_YOUTUBE = 'youtube';
 export const CATEGORY_COURSES = 'courses';
@@ -70,6 +72,7 @@ export const BLOCKLIST = Object.freeze([
   ['youtube', 'youtube-nocookie.com'], // YouTube's privacy-enhanced embeds
   ['youtube', 'youtubekids.com'], // YouTube Kids
   ['youtube', 'youtube.googleapis.com'], // YouTube's API and legacy embed host
+  ['youtube', 'youtubeeducation.com'], // YouTube's embed host for schools (YouTube Player for Education)
   ['youtube', 'googlevideo.com'], // YouTube's media servers
   // --- Course platforms: international MOOCs and paid / online course sites
   ['courses', 'udemy.com'], // Udemy: paid course marketplace (and Udemy Business tenants)
@@ -379,18 +382,24 @@ function topLevelAlternation(src) {
  * segment that is not the blocked one (nor the start of it), has no "|"
  * outside a group, and matches none of a set of sample paths under the
  * prefix. Everything else counts as "could" (a profile on such a host
- * must say plainly which pages it is for).
+ * must say plainly which pages it is for). An expression too costly to
+ * run (src/lib/regexcost.js) is never run here: it counts as "could"
+ * (SEC18 中-2).
  */
 export function pathPatternMayReach(source, prefix) {
   const src = String(source ?? '');
+  // checked before anything is compiled or run (SEC22b M-2)
+  if (regexComplexity(src)) return true;
   let re;
   try {
-    re = new RegExp(src, 'i');
+    re = guardedRegex(src);
   } catch {
     return true;
   }
   const samples = ['', '/', '/x', '/1', '/a/b', '/embed/1', '/play/ep1', '/course/1/lesson/2', '/x/y/z/', '?x=1'].map((s) => prefix + s);
   if (samples.some((p) => re.test(p))) return true;
+  // stopped by the runtime guard: "no match" means nothing, so it may reach
+  if (regexTrip('', src)) return true;
   if (topLevelAlternation(src)) return true;
   const m = /^\^\/((?:[A-Za-z0-9_~-]|\\[./_~-])*)/.exec(src);
   if (!m || !m[1]) return true;

@@ -167,7 +167,13 @@ func (q *Queue) joinTrack(ctx context.Context, dir string, i int, kind string) (
 			continue
 		}
 		if joined[k], err = concatParts(filepath.Join(dir, filepath.FromSlash(p.Dir)), p); err != nil {
-			os.Remove(filepath.Join(sub, "ready.json")) // the next run fetches what is missing
+			if f, ok := err.(*failure); ok && f.code == CodeMergeFailed {
+				// a part is missing: the next run fetches it. Not after a
+				// write the disk refused (no space, write_failed): the
+				// parts are all there, the retry joins them (SEC43
+				// medium-2)
+				os.Remove(filepath.Join(sub, "ready.json"))
+			}
 			return "", err
 		}
 	}
@@ -303,6 +309,10 @@ func fmp4Continuous(pl string) bool {
 	return fmp4
 }
 
+// joinCopy copies a part into the joined file (a variable for the tests: a
+// disk that fills up during the join).
+var joinCopy = io.Copy
+
 // concatParts joins a DASH part's init section and segments, in order,
 // into joined{ext} in its directory and removes them; a joined file from
 // an earlier run is used as it is.
@@ -330,7 +340,7 @@ func concatParts(pdir string, p trackPart) (string, error) {
 			}
 			return "", writeFailure(err)
 		}
-		_, err = io.Copy(out, in)
+		_, err = joinCopy(out, in)
 		in.Close()
 		if err != nil {
 			out.Close()
@@ -415,6 +425,11 @@ func (q *Queue) importMedia(ctx context.Context, t *task, s runSnapshot, media s
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		// the file itself was refused: its own reason, not "import failed"
+		var rf *ImportRefused
+		if errors.As(err, &rf) && RefusedFile(rf.Code) {
+			return &failure{code: rf.Code, params: rf.Params}
 		}
 		return &failure{code: CodeImportFailed, detail: err.Error()}
 	}

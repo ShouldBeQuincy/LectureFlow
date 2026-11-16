@@ -482,4 +482,38 @@ const running = (stage, extra) => ({
   reads.length = 0;
 }
 
+{
+  // v3.2.x: the Colab runtime does not answer and the lecture tries again in
+  // place: stats.remote.reconnect (or, while the resources list the
+  // lecture, its card job's reconnect) is a line of the remote steps; it
+  // goes away once the runtime answers.
+  const text = (bar) => {
+    const p = bar.querySelector('.card-reconnect');
+    return p ? p.textContent : null;
+  };
+  const want = I.t('common.pipe.remote_reconnecting', { attempt: 2, of: 4 });
+  assert.notEqual(want, 'common.pipe.remote_reconnecting', 'the catalog has the key');
+  assert.ok(want.includes('2') && want.includes('4'));
+  const st = asrStage();
+  st.stats.remote.reconnect = { attempt: 2, of: 4, next_at: '2026-11-11T09:00:05Z' };
+  const o = { key: 'lec:L12', lecture: 'L12', sys: () => null, res: () => res };
+  res = null;
+  assert.equal(text(P.pipelineBar([st], o)), want, 'from stats.remote');
+  assert.equal(text(P.pipelineBar([asrStage()], o)), null, 'none without a reconnect');
+
+  // The card lists the lecture: its value is the live one.
+  res = card([{ lecture_id: 'L12', stage: 'transcribe', reconnect: { attempt: 3, of: 4, next_at: '2026-11-11T09:00:20Z' } }]);
+  const bar = P.pipelineBar([asrStage()], o);
+  assert.equal(text(bar), I.t('common.pipe.remote_reconnecting', { attempt: 3, of: 4 }));
+  res = card([{ lecture_id: 'L12', stage: 'transcribe' }]); // it answers again
+  bar.setProgress('asr', 0.5);
+  assert.equal(text(bar), null, 'cleared with the next event');
+  assert.equal(P.remoteNow(st, o).reconnect, undefined, "the card's (none) over stale stats");
+
+  // An SSH server is not Colab: no such line.
+  const ssh = { ...st, model: { label: 'lab', asr: { device_id: 'ssh:lab' } } };
+  assert.equal(text(P.pipelineBar([ssh], { key: 'x', sys: () => null, res: () => null })), null);
+  res = null;
+}
+
 console.log('pipeline remote checks: ok');

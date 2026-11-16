@@ -13,7 +13,10 @@
 //	summary.json    {"summary": "..."}  → returned as plain text
 //	translate.json  {"default": "...", "by_idx": {"0": "..."}, "by_text": {"target text": "..."}}
 //	                → {"idx": <target idx>, "zh": ...}; lookup order:
-//	                  SetTranslation override, by_text (target text), by_idx, default
+//	                  SetTranslation override, by_text (target text), by_idx, default;
+//	                → a batch request (v3.2.x P2, ctxbuild.TranslateBatchSystemTemplate,
+//	                  role translate, Request.Batch) gets {"items": [{"idx", "zh"}, …]},
+//	                  one item per [TARGET #idx] in order, each looked up the same way
 //	syllabus_format.md  (optional) the Markdown of the A8.3 syllabus_format
 //	                    role; a built-in document when the file is absent
 //	glossary_janitor.json  (optional) the JSON object of the SPEC-v2 G3
@@ -55,6 +58,36 @@
 // (perf-llm): a system prompt is a cache hit only for requests that arrive
 // after a request with it was answered.
 //
+// Structured output and thinking of the Anthropic endpoint (v3.2.x P1): a
+// request's output_config.format is checked like the API checks it
+// (CheckSchema) and recorded (Request.Schema); RejectFormat makes the server
+// refuse the field with HTTP 400, like a model that does not know it;
+// thinking {"type": "between_tools"} is refused for every model but
+// claude-sonnet-5-5 and with any other field; {"type": "disabled"} by the
+// models whose thinking cannot be switched off (claude-opus-5-5,
+// claude-sonnet-5-5, Fable, Mythos), with any other field and with effort
+// xhigh or max (C91). FailRefusal answers with
+// stop_reason "refusal" (OpenAI endpoint: finish_reason "content_filter"). FailSecondJSON and FailTrailingText append to the
+// normal answer what a model's second thoughts look like. FailTruncated
+// sends the first half of the normal answer as cut off at the output limit.
+//
+// Batch translate answers (v3.2.x P2): FailBatchMissing, FailBatchExtra,
+// FailBatchDuplicate, FailBatchWrongIds, FailBatchShuffled and
+// FailBatchBareArray change the items of a batch answer (no effect on a
+// single-sentence request; FailWrongIdx on a batch is FailBatchWrongIds).
+// FailNextBatch queues failures that only batch requests take, ahead of the
+// translate role's FailNext queue. FailHang sends nothing until the client
+// hangs up (its attempt timeout).
+//
+// Streaming (v3.2.x P1-c, stream.go of this package): a request with
+// "stream": true is answered with the server-sent events of the Messages
+// API, made from the same message the server would send whole
+// (MessageSSE), so every canned answer, Handle, FailNext and Truncated work
+// for streamed requests too. With "display": "summarized" the thinking block
+// streams ThinkingSummary. StreamNext scripts other streams (pings, a hang,
+// an error event, a dropped connection, max_tokens without text);
+// SetStreamHook watches (and may pause) the events as they are sent.
+//
 // Programmable answers: Handle(role, fn) answers every request of role with
 // fn(system, user) (e.g. janitor actions naming term ids created at run time);
 // injected failures still apply. An answer wrapped with Truncated is sent as
@@ -62,6 +95,7 @@
 package llmtest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -157,6 +191,46 @@ const (
 	FailFenced                  // HTTP 200 with the normal content wrapped in ```json fences
 	FailHTTP529                 // HTTP 529 overloaded_error (Anthropic, A6)
 	FailHTTP403                 // HTTP 403
+	// FailSecondJSON: HTTP 200 with the normal content, then text, then a
+	// second JSON object that differs from it ("Wait, …" and a corrected
+	// answer: SecondJSONTail).
+	FailSecondJSON
+	// FailTrailingText: HTTP 200 with the normal content followed by text
+	// without any JSON (TrailingText).
+	FailTrailingText
+	// FailRefusal: Anthropic: HTTP 200 with stop_reason "refusal" and
+	// stop_details.category RefusalCategory, no text. OpenAI: HTTP 200
+	// with the first half of the normal answer and finish_reason
+	// "content_filter" (no category).
+	FailRefusal
+	// FailTruncated: HTTP 200 with the first half of the normal answer, cut
+	// off at the output limit (finish_reason "length" / stop_reason
+	// "max_tokens"), like Truncated.
+	FailTruncated
+	// Batch translate answers (v3.2.x P2); no effect on a single-sentence
+	// translate request or another role.
+	FailBatchMissing   // the last item is left out
+	FailBatchExtra     // an item for idx = last target + 1000 is appended
+	FailBatchDuplicate // the first item is appended again
+	FailBatchWrongIds  // every idx is target + 1000
+	FailBatchShuffled  // the items in reverse order (every idx present once)
+	FailBatchBareArray // the items array alone, without {"items": …}
+	// FailHang: no response (not even its headers) until the client hangs
+	// up, e.g. when its attempt timeout runs out (any request, streamed or
+	// not; review R14).
+	FailHang
+)
+
+// WrongIdxOffset is what FailWrongIdx, FailBatchExtra and FailBatchWrongIds
+// add to a target idx.
+const WrongIdxOffset = 1000
+
+// What FailSecondJSON and FailTrailingText append, and the category of
+// FailRefusal.
+const (
+	SecondJSONTail  = "\n\nWait, that is not right. Let me correct it:\n" + `{"llmtest": "corrected answer"}`
+	TrailingText    = "\n\nNote: I kept the technical terms as they are."
+	RefusalCategory = "cyber"
 )
 
 // Request is one chat request received by the server.
@@ -169,7 +243,9 @@ type Request struct {
 	Temperature float64
 	HasTemp     bool   // the request carried a temperature
 	JSONMode    bool   // OpenAI: response_format json_object; Anthropic: JSON instruction appended
-	TargetIdx   int    // translate: the [TARGET #idx] (v1: [目标 #idx]); -1 otherwise
+	TargetIdx   int    // translate: the [TARGET #idx] (v1: [目标 #idx]), the first one of a batch; -1 otherwise
+	Batch       bool   // translate: a batch request (ctxbuild.TranslateBatchSystemTemplate)
+	TargetIdxs  []int  // translate: every [TARGET #idx] in order (one for a single-sentence request)
 	Auth        string // Authorization header
 	Key         string // the key sent (Bearer token or x-api-key)
 
@@ -178,6 +254,20 @@ type Request struct {
 	Version      string // anthropic-version header
 	CacheControl bool   // the system block carried cache_control {"type":"ephemeral"}
 	RawUser      string // the user content as received
+	Thinking     string // thinking.type ("" = no thinking field)
+	Display      string // thinking.display ("" = not sent)
+	Effort       string // output_config.effort ("" = not sent)
+	Schema       string // output_config.format.schema, compact ("" = no format)
+	Stream       bool   // "stream": true (answered with server-sent events)
+}
+
+// Hit is one chat request as it arrived (Hits), whatever it was answered
+// with: unlike Requests it includes the ones SetError, RejectFormat,
+// RequireKey and SetConcurrencyLimit refused.
+type Hit struct {
+	Path   string // URL path
+	Format bool   // the body holds output_config.format
+	Status int    // HTTP status of the answer
 }
 
 // Server is the fake LLM. Its URL is the provider base_url.
@@ -194,6 +284,7 @@ type Server struct {
 	responses  map[string]string                           // SetResponse
 	handlers   map[string]func(system, user string) string // Handle
 	fails      map[string][]Failure
+	batchFails []Failure // FailNextBatch
 	requests   []Request
 	seen       map[string]bool // system prompts seen (cache-hit simulation)
 	models     []string
@@ -202,6 +293,15 @@ type Server struct {
 	errMsg     string
 	delay      time.Duration
 	requireKey string
+	// respHeaders: added to every answer (SetResponseHeaders).
+	respHeaders http.Header
+	// rejectFormat: output_config.format is answered with HTTP 400 (RejectFormat).
+	rejectFormat bool
+	// hits: every chat request that arrived, answered with an error or not (Hits).
+	hits []Hit
+	// streams: scripted streams per role (StreamNext); streamHook: SetStreamHook.
+	streams    map[string][]StreamMode
+	streamHook func(role, event string)
 
 	// perf-llm: concurrency limit and cache timing
 	concLimit   int
@@ -238,6 +338,7 @@ func NewFromDir(tb testing.TB, dir string) *Server {
 		responses: map[string]string{},
 		handlers:  map[string]func(system, user string) string{},
 		fails:     map[string][]Failure{},
+		streams:   map[string][]StreamMode{},
 		seen:      map[string]bool{},
 		built:     map[string]bool{},
 		models:    append([]string(nil), DefaultModels...),
@@ -274,8 +375,14 @@ func NewFromDir(tb testing.TB, dir string) *Server {
 	return s
 }
 
-// Close stops the server (idempotent).
-func (s *Server) Close() { s.srv.Close() }
+// Close stops the server (idempotent). The clients' connections are closed
+// first (review R18 suggestion 5): a handler hanging on a request (FailHang,
+// a hanging stream) returns at once, instead of when the client's attempt
+// timeout (two minutes or more) ends it.
+func (s *Server) Close() {
+	s.srv.CloseClientConnections()
+	s.srv.Close()
+}
 
 // Configure points every provider of cfg at the server with TestKey.
 func (s *Server) Configure(cfg *config.Config) {
@@ -329,6 +436,19 @@ func (s *Server) FailNext(role string, n int, mode Failure) {
 	}
 }
 
+// FailNextBatch makes the next n batch translate requests fail with mode
+// (queued after batch failures injected earlier). A batch request takes a
+// failure from this queue first and from the translate role's FailNext
+// queue only when this one is empty; single-sentence requests never take
+// from it.
+func (s *Server) FailNextBatch(n int, mode Failure) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for range n {
+		s.batchFails = append(s.batchFails, mode)
+	}
+}
+
 // SetError makes every request (chat and model lists) answer HTTP status
 // with message until SetError(0, "").
 func (s *Server) SetError(status int, message string) {
@@ -344,12 +464,86 @@ func (s *Server) SetDelay(d time.Duration) {
 	s.mu.Unlock()
 }
 
+// SetResponseHeaders adds h to every answer from now on, errors included
+// (e.g. Anthropic's anthropic-ratelimit-* headers); nil = none.
+func (s *Server) SetResponseHeaders(h http.Header) {
+	s.mu.Lock()
+	s.respHeaders = h.Clone()
+	s.mu.Unlock()
+}
+
 // RequireKey makes requests that do not send key fail with 401; the error
 // message quotes the key that was sent, like real servers do ("" = off).
 func (s *Server) RequireKey(key string) {
 	s.mu.Lock()
 	s.requireKey = key
 	s.mu.Unlock()
+}
+
+// RejectFormat makes the Anthropic endpoint answer HTTP 400 to every request
+// with output_config.format, like a model without structured output.
+func (s *Server) RejectFormat(on bool) {
+	s.mu.Lock()
+	s.rejectFormat = on
+	s.mu.Unlock()
+}
+
+// CheckSchema applies the rules of Claude's structured output to a JSON
+// Schema: every object has "additionalProperties": false and lists all its
+// properties as required; no length, range or array-size constraints. It
+// returns what is wrong ("" = nothing).
+func CheckSchema(raw []byte) string {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return "schema is not JSON: " + err.Error()
+	}
+	return checkSchemaNode(v, "schema")
+}
+
+func checkSchemaNode(v any, path string) string {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return path + ": not an object"
+	}
+	for _, k := range []string{"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "minLength", "maxLength", "minItems", "maxItems", "pattern"} {
+		if _, has := m[k]; has {
+			return path + ": " + k + " is not supported"
+		}
+	}
+	switch m["type"] {
+	case "object":
+		if ap, has := m["additionalProperties"]; !has || ap != false {
+			return path + ": additionalProperties must be false"
+		}
+		props, _ := m["properties"].(map[string]any)
+		req := map[string]bool{}
+		if list, ok := m["required"].([]any); ok {
+			for _, r := range list {
+				if name, ok := r.(string); ok {
+					req[name] = true
+				}
+			}
+		}
+		for name, p := range props {
+			if !req[name] {
+				return path + ": property " + name + " is not required"
+			}
+			if msg := checkSchemaNode(p, path+"."+name); msg != "" {
+				return msg
+			}
+		}
+		if len(req) != len(props) {
+			return path + ": required lists a name that is not a property"
+		}
+	case "array":
+		if msg := checkSchemaNode(m["items"], path+".items"); msg != "" {
+			return msg
+		}
+	case "string", "integer", "number", "boolean", "null":
+	default:
+		return path + ": type missing or unknown"
+	}
+	return ""
 }
 
 // SetModels sets the list returned by GET /models and /v1/models.
@@ -421,11 +615,23 @@ func (s *Server) Requests(role string) []Request {
 }
 
 // TranslateIdxs returns the target idx of every translate request, in
-// arrival order (duplicates kept: a QA retry appears twice).
+// arrival order (duplicates kept: a QA retry appears twice). A batch request
+// contributes its first target; BatchRequests lists them with all targets.
 func (s *Server) TranslateIdxs() []int {
 	var out []int
 	for _, r := range s.Requests(RoleTranslate) {
 		out = append(out, r.TargetIdx)
+	}
+	return out
+}
+
+// BatchRequests returns the batch translate requests, in arrival order.
+func (s *Server) BatchRequests() []Request {
+	var out []Request
+	for _, r := range s.Requests(RoleTranslate) {
+		if r.Batch {
+			out = append(out, r)
+		}
 	}
 	return out
 }
@@ -435,7 +641,10 @@ func (s *Server) TranslateIdxs() []int {
 func (s *Server) Reset() {
 	s.mu.Lock()
 	s.requests = nil
+	s.hits = nil
 	s.fails = map[string][]Failure{}
+	s.streams = map[string][]StreamMode{}
+	s.batchFails = nil
 	s.modelCalls = 0
 	s.mu.Unlock()
 }
@@ -452,7 +661,7 @@ func RoleOf(system string) string {
 		return RoleSummary
 	case ctxbuild.FirstLine(ctxbuild.RepairSystemTemplate):
 		return RoleRepair
-	case ctxbuild.FirstLine(ctxbuild.TranslateSystemTemplate):
+	case ctxbuild.FirstLine(ctxbuild.TranslateSystemTemplate), ctxbuild.FirstLine(ctxbuild.TranslateBatchSystemTemplate):
 		return RoleTranslate
 	case ctxbuild.FirstLine(ctxbuild.SyllabusFormatSystem):
 		return RoleSyllabusFormat
@@ -466,6 +675,12 @@ func RoleOf(system string) string {
 		return RoleFilenameRule
 	}
 	return ""
+}
+
+// IsBatchSystem reports whether a system prompt is the one of a batch
+// translate request (ctxbuild.TranslateBatchSystemTemplate).
+func IsBatchSystem(system string) bool {
+	return ctxbuild.FirstLine(system) == ctxbuild.FirstLine(ctxbuild.TranslateBatchSystemTemplate)
 }
 
 // targetRE accepts the SPEC-v2 G5.3 label and the v1 one.
@@ -492,6 +707,31 @@ func TargetText(user string) string {
 		rest = rest[:i]
 	}
 	return rest
+}
+
+// TargetIdxs returns the idx of every "[TARGET #idx]" line of a translate
+// user message, in order (nil when there is none).
+func TargetIdxs(user string) []int {
+	var out []int
+	for _, m := range targetRE.FindAllStringSubmatch(user, -1) {
+		n, _ := strconv.Atoi(m[1])
+		out = append(out, n)
+	}
+	return out
+}
+
+// TargetTexts returns the line after every "[TARGET #idx]" line, in the
+// order of TargetIdxs.
+func TargetTexts(user string) []string {
+	var out []string
+	for _, loc := range targetRE.FindAllStringIndex(user, -1) {
+		rest := strings.TrimPrefix(user[loc[1]:], "\n")
+		if i := strings.IndexByte(rest, '\n'); i >= 0 {
+			rest = rest[:i]
+		}
+		out = append(out, rest)
+	}
+	return out
 }
 
 type wireRequest struct {
@@ -581,12 +821,70 @@ func (s *Server) endChat() {
 // anthropicJSONInstruction mirrors llm.JSONInstruction (A6).
 const anthropicJSONInstruction = "\n\nRespond with JSON only."
 
+// Hits returns every chat request received (refused ones included), in
+// arrival order.
+func (s *Server) Hits() []Hit {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Hit(nil), s.hits...)
+}
+
+// statusWriter writes the status of an answer into its Hit before the
+// client can see the answer (Hits).
+type statusWriter struct {
+	http.ResponseWriter
+	set  func(status int)
+	done bool
+}
+
+func (w *statusWriter) mark(code int) {
+	if !w.done {
+		w.done = true
+		w.set(code)
+	}
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.mark(code)
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	w.mark(http.StatusOK)
+	return w.ResponseWriter.Write(b)
+}
+
+// Unwrap lets http.ResponseController reach Flush and Hijack (streams).
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	// Read the body first: the server notices a client hanging up (e.g. a
 	// timed-out probe during SetDelay) only once the body has been consumed.
 	body, _ := io.ReadAll(r.Body)
+	if r.Method == http.MethodPost {
+		var probe struct {
+			OutputConfig *struct {
+				Format json.RawMessage `json:"format"`
+			} `json:"output_config"`
+		}
+		_ = json.Unmarshal(body, &probe)
+		s.mu.Lock()
+		i := len(s.hits)
+		s.hits = append(s.hits, Hit{Path: r.URL.Path, Format: probe.OutputConfig != nil && len(probe.OutputConfig.Format) > 0})
+		s.mu.Unlock()
+		w = &statusWriter{ResponseWriter: w, set: func(status int) {
+			s.mu.Lock()
+			if i < len(s.hits) { // Reset may have dropped it
+				s.hits[i].Status = status
+			}
+			s.mu.Unlock()
+		}}
+	}
 	s.mu.Lock()
 	delay, errStatus, errMsg, requireKey := s.delay, s.errStatus, s.errMsg, s.requireKey
+	for k, v := range s.respHeaders {
+		w.Header()[k] = append([]string(nil), v...)
+	}
 	s.mu.Unlock()
 	anthropic := strings.HasSuffix(r.URL.Path, "/v1/messages") || r.Header.Get("anthropic-version") != ""
 	if r.Method == http.MethodPost {
@@ -696,6 +994,10 @@ func (s *Server) handleOpenAI(w http.ResponseWriter, r *http.Request, body []byt
 		writeFailure(w, false, status, content, fail)
 		return
 	}
+	if fail != nil && *fail == FailHang {
+		<-r.Context().Done()
+		return
+	}
 	if h, ok := r.Context().Value(arrivalHitKey{}).(bool); ok {
 		cacheHit = h // SetCacheAfterAnswer: the cache state when the request arrived
 		s.mu.Lock()
@@ -705,6 +1007,11 @@ func (s *Server) handleOpenAI(w http.ResponseWriter, r *http.Request, body []byt
 	finish := "stop"
 	if c, cut := cutTruncated(content); cut {
 		content, finish = c, "length"
+	}
+	if fail != nil && *fail == FailRefusal {
+		// The content filter stopped the answer halfway (FailRefusal).
+		runes := []rune(content)
+		content, finish = string(runes[:len(runes)/2]), "content_filter"
 	}
 	prompt := int64(utf8.RuneCountInString(req.System)+utf8.RuneCountInString(req.User))/4 + 1
 	var hit int64
@@ -730,11 +1037,20 @@ func (s *Server) handleOpenAI(w http.ResponseWriter, r *http.Request, body []byt
 }
 
 type anthropicWire struct {
-	Model       string          `json:"model"`
-	MaxTokens   int             `json:"max_tokens"`
-	System      json.RawMessage `json:"system"`
-	Temperature *float64        `json:"temperature"`
-	Messages    []struct {
+	Model        string          `json:"model"`
+	MaxTokens    int             `json:"max_tokens"`
+	System       json.RawMessage `json:"system"`
+	Temperature  *float64        `json:"temperature"`
+	Stream       bool            `json:"stream"`
+	Thinking     map[string]any  `json:"thinking"`
+	OutputConfig *struct {
+		Effort string `json:"effort"`
+		Format *struct {
+			Type   string          `json:"type"`
+			Schema json.RawMessage `json:"schema"`
+		} `json:"format"`
+	} `json:"output_config"`
+	Messages []struct {
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
 	} `json:"messages"`
@@ -800,9 +1116,72 @@ func (s *Server) handleAnthropic(w http.ResponseWriter, r *http.Request, body []
 	}
 	req := Request{API: model.ProviderAnthropic, Model: wr.Model, System: system, RawUser: user, User: user,
 		TargetIdx: -1, Auth: r.Header.Get("Authorization"), Key: keyOf(r),
-		MaxTokens: wr.MaxTokens, Version: r.Header.Get("anthropic-version"), CacheControl: cache}
+		MaxTokens: wr.MaxTokens, Version: r.Header.Get("anthropic-version"), CacheControl: cache, Stream: wr.Stream}
 	if wr.Temperature != nil {
 		req.Temperature, req.HasTemp = *wr.Temperature, true
+	}
+	if wr.Thinking != nil {
+		req.Thinking, _ = wr.Thinking["type"].(string)
+		if d, has := wr.Thinking["display"]; has {
+			req.Display, _ = d.(string)
+			if req.Display != "summarized" && req.Display != "omitted" {
+				writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", "thinking.display: unknown value")
+				return
+			}
+		}
+		if req.Thinking == "between_tools" {
+			id := strings.ToLower(wr.Model)
+			switch {
+			case id != "claude-sonnet-5-5" && !strings.HasPrefix(id, "claude-sonnet-5-5-"):
+				writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", "thinking.type: between_tools is not supported for this model")
+				return
+			case len(wr.Thinking) != 1:
+				writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", "thinking: between_tools takes no other field")
+				return
+			}
+		}
+		if req.Thinking == "disabled" {
+			// The models whose thinking cannot be switched off refuse it
+			// (Anthropic's thinking page: Opus 5.5, Sonnet 5.5, Fable, Mythos).
+			id := strings.ToLower(wr.Model)
+			for _, p := range []string{"claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-", "claude-mythos-"} {
+				if strings.HasPrefix(id, p) {
+					writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", `"thinking.type.disabled" is not supported for this model`)
+					return
+				}
+			}
+			if len(wr.Thinking) != 1 {
+				writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", "thinking: disabled takes no other field")
+				return
+			}
+		}
+	}
+	if oc := wr.OutputConfig; oc != nil {
+		req.Effort = oc.Effort
+		if (req.Thinking == "between_tools" || req.Thinking == "disabled") && (oc.Effort == "xhigh" || oc.Effort == "max") {
+			writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", "thinking.type: "+req.Thinking+" needs effort high or below")
+			return
+		}
+		if f := oc.Format; f != nil {
+			s.mu.Lock()
+			reject := s.rejectFormat
+			s.mu.Unlock()
+			if reject {
+				writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", "output_config.format: Extra inputs are not permitted")
+				return
+			}
+			if f.Type != "json_schema" {
+				writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", "output_config.format.type: expected json_schema")
+				return
+			}
+			if msg := CheckSchema(f.Schema); msg != "" {
+				writeAnthropicErr(w, http.StatusBadRequest, "invalid_request_error", "output_config.format.schema: "+msg)
+				return
+			}
+			var compact bytes.Buffer
+			_ = json.Compact(&compact, f.Schema)
+			req.Schema = compact.String()
+		}
 	}
 	if strings.HasSuffix(user, anthropicJSONInstruction) {
 		req.JSONMode = true
@@ -818,9 +1197,17 @@ func (s *Server) handleAnthropic(w http.ResponseWriter, r *http.Request, body []
 		writeFailure(w, true, status, content, fail)
 		return
 	}
+	if fail != nil && *fail == FailHang {
+		<-r.Context().Done()
+		return
+	}
 	stop := "end_turn"
 	if c, cut := cutTruncated(content); cut {
 		content, stop = c, "max_tokens"
+	}
+	refused := fail != nil && *fail == FailRefusal
+	if refused {
+		content, stop = "", "refusal"
 	}
 	sysTok := int64(utf8.RuneCountInString(system)) / 4
 	input := int64(utf8.RuneCountInString(req.RawUser))/4 + 1
@@ -850,6 +1237,14 @@ func (s *Server) handleAnthropic(w http.ResponseWriter, r *http.Request, body []
 			"cache_creation_input_tokens": creation,
 		},
 	}
+	if refused {
+		resp["content"] = []any{}
+		resp["stop_details"] = map[string]any{"type": "refusal", "category": RefusalCategory, "explanation": "llmtest: injected refusal"}
+	}
+	if wr.Stream {
+		s.writeStream(w, r, req, resp)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -859,10 +1254,16 @@ func (s *Server) handleAnthropic(w http.ResponseWriter, r *http.Request, body []
 func (s *Server) answer(req *Request) (content string, fail *Failure, cacheHit bool, status int) {
 	if req.Role == RoleTranslate {
 		req.TargetIdx = TargetIdx(req.User)
+		req.TargetIdxs = TargetIdxs(req.User)
+		req.Batch = IsBatchSystem(req.System)
 	}
 	s.mu.Lock()
 	s.requests = append(s.requests, *req)
-	if q := s.fails[req.Role]; len(q) > 0 {
+	if req.Batch && len(s.batchFails) > 0 {
+		f := s.batchFails[0]
+		fail = &f
+		s.batchFails = s.batchFails[1:]
+	} else if q := s.fails[req.Role]; len(q) > 0 {
 		f := q[0]
 		fail = &f
 		s.fails[req.Role] = q[1:]
@@ -900,14 +1301,83 @@ func (s *Server) answer(req *Request) (content string, fail *Failure, cacheHit b
 		case FailNotJSON:
 			content = "Sorry, I cannot produce JSON right now."
 		case FailWrongIdx:
-			if req.Role == RoleTranslate {
-				content = fmt.Sprintf(`{"idx": %d, "zh": "错误的句子"}`, req.TargetIdx+1000)
+			switch {
+			case req.Batch:
+				content = mangleBatch(content, FailBatchWrongIds)
+			case req.Role == RoleTranslate:
+				content = fmt.Sprintf(`{"idx": %d, "zh": "错误的句子"}`, req.TargetIdx+WrongIdxOffset)
 			}
+		case FailBatchMissing, FailBatchExtra, FailBatchDuplicate, FailBatchWrongIds, FailBatchShuffled, FailBatchBareArray:
+			if req.Batch {
+				content = mangleBatch(content, *fail)
+			}
+		case FailTruncated:
+			r := []rune(content)
+			content = Truncated(string(r[:len(r)/2]))
 		case FailFenced:
 			content = "```json\n" + content + "\n```"
+		case FailSecondJSON:
+			content += SecondJSONTail
+		case FailTrailingText:
+			content += TrailingText
 		}
 	}
 	return content, fail, cacheHit, 0
+}
+
+// batchItem is one item of a batch translate answer.
+type batchItem struct {
+	Idx int    `json:"idx"`
+	Zh  string `json:"zh"`
+}
+
+// mangleBatch applies a FailBatch* mode to a batch answer {"items": […]}
+// (content that does not parse as one is returned unchanged).
+func mangleBatch(content string, mode Failure) string {
+	var a struct {
+		Items []batchItem `json:"items"`
+	}
+	if json.Unmarshal([]byte(content), &a) != nil || len(a.Items) == 0 {
+		return content
+	}
+	items := a.Items
+	switch mode {
+	case FailBatchMissing:
+		items = items[:len(items)-1]
+	case FailBatchExtra:
+		items = append(items, batchItem{Idx: items[len(items)-1].Idx + WrongIdxOffset, Zh: "多余的句子"})
+	case FailBatchDuplicate:
+		items = append(items, items[0])
+	case FailBatchWrongIds:
+		for i := range items {
+			items[i].Idx += WrongIdxOffset
+		}
+	case FailBatchShuffled:
+		for i, j := 0, len(items)-1; i < j; i, j = i+1, j-1 {
+			items[i], items[j] = items[j], items[i]
+		}
+	case FailBatchBareArray:
+		b, _ := json.Marshal(items)
+		return string(b)
+	}
+	b, _ := json.Marshal(map[string]any{"items": items})
+	return string(b)
+}
+
+// translationOf returns the canned translation of target idx with text
+// (s.mu held): SetTranslation override, by_text, by_idx, default.
+func (s *Server) translationOf(idx int, text string) string {
+	zh, ok := s.overrides[idx]
+	if !ok {
+		zh, ok = s.translate.ByText[text]
+	}
+	if !ok {
+		zh, ok = s.translate.ByIdx[strconv.Itoa(idx)]
+	}
+	if !ok {
+		zh = s.translate.Default
+	}
+	return zh
 }
 
 // writeFailure writes an injected or validation error in the API's format.
@@ -929,17 +1399,16 @@ func (s *Server) content(req Request) (string, error) {
 		if req.TargetIdx < 0 {
 			return "", fmt.Errorf("llmtest: translate request without [TARGET #idx]")
 		}
-		zh, ok := s.overrides[req.TargetIdx]
-		if !ok {
-			zh, ok = s.translate.ByText[TargetText(req.User)]
+		if req.Batch {
+			texts := TargetTexts(req.User)
+			items := make([]batchItem, len(req.TargetIdxs))
+			for i, idx := range req.TargetIdxs {
+				items[i] = batchItem{Idx: idx, Zh: s.translationOf(idx, texts[i])}
+			}
+			b, _ := json.Marshal(map[string]any{"items": items})
+			return string(b), nil
 		}
-		if !ok {
-			zh, ok = s.translate.ByIdx[strconv.Itoa(req.TargetIdx)]
-		}
-		if !ok {
-			zh = s.translate.Default
-		}
-		b, _ := json.Marshal(map[string]any{"idx": req.TargetIdx, "zh": zh})
+		b, _ := json.Marshal(map[string]any{"idx": req.TargetIdx, "zh": s.translationOf(req.TargetIdx, TargetText(req.User))})
 		return string(b), nil
 	}
 	if c, ok := s.responses[req.Role]; ok {

@@ -190,6 +190,48 @@ jobs:
           CGO_ENABLED: "0"
         run: go build -trimpath -o lectureflow ./cmd/lectureflow
 
+  # Informational: the Go tests under the race detector. -race needs cgo,
+  # and the Windows development machine has no C toolchain, so the tests
+  # have never run with it; the Linux runner has gcc. continue-on-error:
+  # a race report shows on this job (the run is still green) and does not
+  # block a merge or a release; whether to make it required is decided
+  # after the first results. No other job needs it.
+  #
+  # The same packages and order as the go job, with -race. No ffmpeg on
+  # this runner: the tests that need a real one skip (SPEC §14), as on the
+  # macOS job; the races sought are in the scheduler, stages and clients,
+  # which the tests exercise with fakes and no ffmpeg. -timeout 30m per package and
+  # 60 minutes for the job: the race detector makes tests several times
+  # slower than the 30-minute go job allows for.
+  go-race:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Go tests with the race detector
+        shell: pwsh
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          $all = @(go list ./...)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $slow = 'internal/stages', 'internal/sched', 'cmd/lectureflow', 'internal/api', 'internal/state',
+            'internal/agent', 'internal/fetch', 'internal/api/mockserve', 'internal/colab', 'internal/components',
+            'internal/sshremote'
+          $first = @($slow | ForEach-Object { "lectureflow/$_" } | Where-Object { $all -contains $_ })
+          $pkgs = $first + @($all | Where-Object { $first -notcontains $_ })
+          if ($pkgs.Count -ne $all.Count -or @($pkgs | Sort-Object -Unique).Count -ne $all.Count) {
+            throw "package order: $($pkgs.Count) packages, go list has $($all.Count)"
+          }
+          go test -race -p 4 -timeout 30m @pkgs
+          exit $LASTEXITCODE
+
   # The Python and desktop tests need no ffmpeg: they start at once and run
   # beside the Go tests.
   python:

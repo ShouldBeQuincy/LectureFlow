@@ -13,5 +13,6 @@
   "can_delete": true,
   "reviewable": true,
   "exports": [{"name": "Week 2 - Pipelining.bilingual.md", "url": "/api/lectures/01JLEC0000000000000000000B/export/Week%202%20-%20Pipelining.bilingual.md", "size": 182000}],
-  "usage": {"prompt_tokens": 901000, "cache_hit_tokens": 830000, "completion_tokens": 42900, "estimated_cost": 0.12}
+  "usage": {"prompt_tokens": 901000, "cache_hit_tokens": 830000, "completion_tokens": 42900, "estimated_cost": 0.12},
+  "usage_total": {"prompt_tokens": 1402000, "cache_hit_tokens": 1291000, "completion_tokens": 72900, "estimated_cost": 0.19}
 }

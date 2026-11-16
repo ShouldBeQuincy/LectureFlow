@@ -108,6 +108,73 @@ func TestCheck(t *testing.T) {
 	}
 }
 
+// TestShortTargetLengthRatio: for targets of at most ShortTargetWords
+// English words rule 4 skips the lower bound and computes the upper bound
+// for ShortTargetWords+1 words, i.e. at most MaxLengthRatio*(ShortTargetWords+1)
+// = 16 characters (amendment of SPEC §7.4 item 4, from the real acceptance
+// run: "Okay?" / "Anything desirable?" were rejected). The other rules still
+// apply to short targets; from 4 words on rule 4 is unchanged.
+func TestShortTargetLengthRatio(t *testing.T) {
+	const zh16 = "一二三四五六七八九十一二三四五六"
+	cases := []struct {
+		name, target, zh string
+		want             []string // failure codes
+	}{
+		// 1-3 words: upper bound 16 characters, no lower bound
+		{"1 word, acceptance case", "Okay?", "好的，明白了吗？", nil},                // 8
+		{"2 words, acceptance case", "Anything desirable?", "有什么想要的吗？", nil}, // 8
+		{"1 word at 16", "Okay?", zh16, nil},
+		{"1 word at 17", "Okay?", zh16 + "七", []string{CodeLengthRatio}},
+		{"2 words at 16", "Anything desirable?", zh16, nil},
+		{"2 words at 17", "Anything desirable?", zh16 + "七", []string{CodeLengthRatio}},
+		{"3 words at 16", "Is that clear?", zh16, nil},
+		{"3 words at 17", "Is that clear?", zh16 + "七", []string{CodeLengthRatio}},
+		{"1 word, one character", "Okay?", "好", nil},
+		{"3 words, one character", "Is that clear?", "清", nil},
+		{"contraction is one word", "Don't worry, okay?", "大家千万不要担心，好不好呀？", nil}, // 3 words, 14
+		{"hyphenated word is one word", "Well-known result.", "这是一个大家都熟知的结论。", nil},
+		{"number is a word", "Page 42.", "请大家翻到第 42 页看一下。", nil},
+		{"punctuation tokens are not words", "So — okay — right?", "所以说，好的，对吧，没问题吧？", nil},                // 3 words, 14
+		{"1 word expanded into a sentence", "Okay.", "好的，那我们现在就正式开始今天的课程内容吧。", []string{CodeLengthRatio}}, // 22
+
+		// other rules still apply to short targets
+		{"empty still fails", "Okay?", "", []string{CodeEmpty}},
+		{"English residue still fails", "Is that clear?", "Is that clear?", []string{CodeMostlyEnglish}},
+		{"term still enforced", "The cache.", "那个高速存储器。", []string{CodeTermMissing}},
+		{"number still checked", "Page 42.", "请大家翻到那一页。", []string{CodeNumberMissing}},
+
+		// 4 words and more: unchanged
+		{"4 words over the upper bound", "Is that clear now?", "大家现在对这个都已经清楚明白了吗？", []string{CodeLengthRatio}},         // 17/4
+		{"4 words under the lower bound", "one two three four", "好", []string{CodeLengthRatio}},                        // 1/4
+		{"4 words at the upper bound", "one two three four", zh16, nil},                                                // 16/4
+		{"contraction counted once at 4 words", "Don't you see it?", "你难道真的就是一点都没有看出来这个吗？", []string{CodeLengthRatio}}, // 18/4
+	}
+	for _, c := range cases {
+		var got []string
+		for _, f := range Failures(c.target, c.zh, glossary) {
+			got = append(got, f.Code)
+		}
+		if !slices.Equal(got, c.want) {
+			t.Errorf("%s: failures %v, want %v", c.name, got, c.want)
+		}
+	}
+	// the reported ratio uses the same word count as the check (22/4), so it
+	// lies outside [min, max] exactly when the check fails
+	if _, reason := Check("Okay.", "好的，那我们现在就正式开始今天的课程内容吧。", nil); !strings.Contains(reason, "the length ratio is 5.50 characters per English word, outside [0.5, 4]") {
+		t.Errorf("short target reason %q", reason)
+	}
+	for _, c := range []struct {
+		s string
+		n int
+	}{
+		{"Okay?", 1}, {"Don't worry.", 2}, {"well-known", 1}, {"Page 42 , 3.14 !", 3}, {"— ? …", 0}, {"rock 'n' roll", 3},
+	} {
+		if n := EnglishWords(c.s); n != c.n {
+			t.Errorf("EnglishWords(%q) = %d, want %d", c.s, n, c.n)
+		}
+	}
+}
+
 func TestMetrics(t *testing.T) {
 	if r := LatinRatio("abc缓存", nil); r != 0.6 {
 		t.Errorf("LatinRatio = %v", r)

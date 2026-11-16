@@ -24,6 +24,7 @@ import { t } from './i18n.js';
 import { obApi } from './onboarding_api.js';
 import { createColabLogin } from './colab_login.js';
 import * as C from './settings_colab.js';
+import { keepChildren } from './components_ui.js';
 
 export function remoteStep(env) {
   const S = {
@@ -46,6 +47,12 @@ export function remoteStep(env) {
   });
 
   const authorized = () => !!(S.colab && S.colab.status && S.colab.status.auth && S.colab.status.auth.present);
+  // the Google Cloud CLI's section, kept across the step's redraws so that
+  // the install's task view stays where it is (R81 L8; onboarding.js rerender)
+  const gSection = h('div', { class: 'ob-section' });
+  // the sign-in's section, kept likewise: its failure's alert and its
+  // waiting status stay where they are (R91 low-5; colab_login.js loginBlock)
+  const loginSection = h('div', { class: 'ob-section' });
 
   start();
 
@@ -147,28 +154,45 @@ export function remoteStep(env) {
     );
   }
 
-  function startFailed() {
+  // R93 (as R91 low-5): the start's failure (role="alert") is the same node
+  // while it is shown and says the same, so that the step's redraws (a
+  // click on "sign in to Google" draws it twice) leave it where it is and a
+  // screen reader does not read it again. prev: the one drawn last time,
+  // or null when it was not shown then (startAlert is reset by body()):
+  // shown again after it was gone (a retry that failed again), it is new.
+  let startAlert = null; // {key, el}
+  function startFailed(prev) {
     const error = S.colabError || login.startError;
     if (!error) return null;
-    return h(
-      'div',
-      { class: 'ob-callout is-warn', role: 'alert' },
-      icon('circle-alert', { size: 16 }),
-      h('div', null, h('p', null, t('onboarding.download.start_failed', { error })), h('p', { class: 'dim' }, t('onboarding.download.start_failed_todo'))),
-    );
+    const text = t('onboarding.download.start_failed', { error });
+    const todo = t('onboarding.download.start_failed_todo');
+    const key = JSON.stringify([error, text, todo]);
+    startAlert =
+      prev && prev.key === key
+        ? prev
+        : { key, el: h('div', { class: 'ob-callout is-warn', role: 'alert' }, icon('circle-alert', { size: 16 }), h('div', null, h('p', null, text), h('p', { class: 'dim' }, todo))) };
+    return startAlert.el;
   }
 
   function body() {
+    const prev = startAlert;
+    startAlert = null; // drawn again by startFailed only
+
     if (S.loading || (!authorized() && login.loading)) return h('div', { class: 'ob-loading' }, icon('loader-circle', { size: 18, class: 'spin' }), h('span', null, t('onboarding.download.starting')));
     if (S.unavailable) return h('p', { class: 'ob-callout is-info' }, icon('info', { size: 16 }), h('span', null, t('settings.colab.unavailable')));
     if (authorized()) return [h('p', { class: 'ob-callout is-ok', role: 'status' }, icon('circle-check', { size: 16 }), h('span', null, t('onboarding.remote.done'))), accountBlock()];
     const g = login.gcloudBlock();
-    return [startFailed(), g ? h('div', { class: 'ob-section' }, g) : null, h('div', { class: 'ob-section' }, h('h2', { class: 'ob-h2' }, icon('key-round', { size: 16 }), t('onboarding.remote.login_title')), login.loginBlock())];
+    if (g) keepChildren(gSection, [g]);
+    keepChildren(loginSection, [h('h2', { class: 'ob-h2' }, icon('key-round', { size: 16 }), t('onboarding.remote.login_title')), ...login.loginBlock()]);
+    return [startFailed(prev), g ? gSection : null, loginSection];
   }
 
   return {
     title: () => t('onboarding.remote.title'),
     desc: () => t('onboarding.remote.desc'),
+    // what skipping leaves out here: the sign-in (R75 M5); "continue" where
+    // the main button is "continue" (signed in, or no Colab here: R81 L5)
+    skipTip: () => t(S.unavailable || authorized() ? 'onboarding.skip_tip.continue' : 'onboarding.skip_tip.remote'),
     body,
     secondary() {
       if (!S.loading && (S.colabError || login.startError)) {

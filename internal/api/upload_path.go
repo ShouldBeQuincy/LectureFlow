@@ -10,9 +10,9 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"log/slog"
 	"mime"
 	"net/http"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -128,18 +128,28 @@ func (s *Server) copyFromPath(ctx context.Context, pr pathRequest, dir, base str
 }
 
 // checkSourcePath validates a path sent by the desktop page: absolute, no
-// device or extended-length prefix (UNC network paths are fine), an
-// existing regular file outside the data directory (also after following
-// links). It returns the resolved path and its info.
-func (s *Server) checkSourcePath(p string) (string, fs.FileInfo, error) {
+// device or extended-length prefix, granted by the desktop main process
+// (pathgrant.go: picked in the system dialog or dropped; the grant is used
+// up), an existing regular file outside the data directory (also after
+// following links). It returns the resolved path and its info. A path
+// without a grant, a network (UNC) path above all, is refused before any
+// system call touches it (security audit FB1 L-7); a UNC path the user
+// picked is granted like any other.
+func (s *Server) checkSourcePath(ctx context.Context, p string) (string, fs.FileInfo, error) {
 	bad := func(code string, status int) error {
 		return apiErr(status, code, map[string]any{"path": p})
 	}
 	if p == "" || strings.ContainsRune(p, 0) || !filepath.IsAbs(p) || weirdPathPrefix(p) {
 		return "", nil, bad("upload.path_invalid", http.StatusBadRequest)
 	}
+	if !s.useGrant(ctx, p) {
+		if networkPath(p) {
+			slog.Warn("path upload: refused a network path the user did not pick")
+		}
+		return "", nil, bad("upload.path_not_allowed", http.StatusForbidden)
+	}
 	clean := filepath.Clean(p)
-	resolved, err := filepath.EvalSymlinks(clean)
+	resolved, err := s.evalSymlinks(clean)
 	if err != nil {
 		return "", nil, sourceOpenErr(p, err)
 	}
@@ -149,7 +159,7 @@ func (s *Server) checkSourcePath(p string) (string, fs.FileInfo, error) {
 	if s.underDataDir(clean) || s.underDataDir(resolved) {
 		return "", nil, bad("upload.path_in_data_dir", http.StatusBadRequest)
 	}
-	info, err := os.Stat(resolved)
+	info, err := s.statSource(resolved)
 	if err != nil {
 		return "", nil, sourceOpenErr(p, err)
 	}
@@ -160,7 +170,8 @@ func (s *Server) checkSourcePath(p string) (string, fs.FileInfo, error) {
 }
 
 // weirdPathPrefix reports Windows device (\\.\) and extended-length (\\?\,
-// \??\) paths, in either slash direction. UNC paths (\\server\share) pass.
+// \??\) paths, in either slash direction. UNC paths (\\server\share) pass
+// here; without a grant checkSourcePath refuses them next.
 func weirdPathPrefix(p string) bool {
 	if runtime.GOOS != "windows" {
 		return false

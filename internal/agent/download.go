@@ -187,49 +187,61 @@ func (i *idleReader) Read(b []byte) (int, error) {
 	}
 }
 
-// untarGz unpacks a .tar.gz into dst: regular files, directories and
-// symbolic links whose target stays inside dst; no absolute paths, no "..",
-// no devices. Modes keep their execute bits, never set-id bits.
+// untarGz unpacks a .tar.gz into dst: regular files, directories, hard
+// links and symbolic links whose target stays inside dst; no absolute
+// paths, no "..", no devices, no link chains (untar_links.go). Modes keep
+// their execute bits, never set-id bits. The archive is read twice: the
+// first pass checks every entry, so a refused archive leaves dst as it was;
+// the second writes, with the hard links and then the symbolic links last.
 func untarGz(archive, dst string) error {
-	f, err := os.Open(archive)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		return err
-	}
-	defer gz.Close()
-	tr := tar.NewReader(gz)
-	type link struct{ path, target string }
-	var hard []link
-	for {
-		h, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
+	g := newLinkGuard()
+	if err := eachTarEntry(archive, func(h *tar.Header, _ io.Reader) error {
+		p, err := tarEntryPath(dst, h.Name)
+		if err != nil || p == "" {
 			return err
 		}
-		name := filepath.FromSlash(strings.TrimPrefix(h.Name, "./"))
-		if name == "" || name == "." {
-			continue
+		rel := relSlash(dst, p)
+		switch h.Typeflag {
+		case tar.TypeDir:
+			return g.entry(rel, true)
+		case tar.TypeReg:
+			return g.entry(rel, false)
+		case tar.TypeSymlink:
+			if !linkTargetOK(h.Linkname) || !within(dst, filepath.Join(filepath.Dir(p), filepath.FromSlash(h.Linkname))) {
+				return errUnsafeLink
+			}
+			return g.symlink(rel)
+		case tar.TypeLink:
+			src := filepath.Join(dst, filepath.FromSlash(h.Linkname))
+			if !within(dst, src) || src == dst {
+				return errUnsafeLink
+			}
+			return g.hardLink(rel, relSlash(dst, src))
 		}
-		if filepath.IsAbs(name) || strings.HasPrefix(name, `\`) || hasDotDot(name) {
-			return fmt.Errorf("unsafe path in archive")
-		}
-		p := filepath.Join(dst, name)
-		if !within(dst, p) {
-			return fmt.Errorf("unsafe path in archive")
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	type link struct{ path, target string }
+	var hard, soft []link
+	plain := map[string]bool{}
+	if err := eachTarEntry(archive, func(h *tar.Header, r io.Reader) error {
+		p, err := tarEntryPath(dst, h.Name)
+		if err != nil || p == "" {
+			return err
 		}
 		mode := os.FileMode(h.Mode).Perm() & 0o755
 		switch h.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(p, 0o700); err != nil {
+			if err := plainDirs(dst, p, plain); err != nil {
 				return err
 			}
+			return os.MkdirAll(p, 0o700)
 		case tar.TypeReg:
+			if err := plainDirs(dst, p, plain); err != nil {
+				return err
+			}
 			if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 				return err
 			}
@@ -237,36 +249,28 @@ func untarGz(archive, dst string) error {
 			if err != nil {
 				return err
 			}
-			_, err = io.Copy(out, io.LimitReader(tr, h.Size))
+			_, err = io.Copy(out, io.LimitReader(r, h.Size))
 			if cerr := out.Close(); err == nil {
 				err = cerr
 			}
-			if err != nil {
-				return err
-			}
+			return err
 		case tar.TypeSymlink:
-			t := h.Linkname
-			if filepath.IsAbs(t) || strings.HasPrefix(t, "/") {
-				return fmt.Errorf("unsafe link in archive")
-			}
-			if !within(dst, filepath.Join(filepath.Dir(p), filepath.FromSlash(t))) {
-				return fmt.Errorf("unsafe link in archive")
-			}
-			if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-				return err
-			}
-			if err := os.Symlink(t, p); err != nil {
-				return err
-			}
+			soft = append(soft, link{p, h.Linkname})
 		case tar.TypeLink:
 			hard = append(hard, link{p, filepath.Join(dst, filepath.FromSlash(h.Linkname))})
 		default:
 			// devices, fifos and the like: skipped
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	for _, l := range hard {
-		if !within(dst, l.target) {
-			return fmt.Errorf("unsafe link in archive")
+		if err := plainDirs(dst, l.target, plain); err != nil {
+			return err
+		}
+		if err := plainDirs(dst, l.path, plain); err != nil {
+			return err
 		}
 		b, err := os.ReadFile(l.target)
 		if err != nil {
@@ -281,7 +285,71 @@ func untarGz(archive, dst string) error {
 			return err
 		}
 	}
+	for _, l := range soft {
+		if err := plainDirs(dst, l.path, plain); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(l.path), 0o700); err != nil {
+			return err
+		}
+		if err := os.Symlink(l.target, l.path); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// eachTarEntry calls fn for each entry of a .tar.gz, with its contents.
+func eachTarEntry(archive string, fn func(h *tar.Header, r io.Reader) error) error {
+	f, err := os.Open(archive)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	for {
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := fn(h, tr); err != nil {
+			return err
+		}
+	}
+}
+
+// tarEntryPath maps an entry name to a path below dst ("" = nothing to
+// write: the archive's root).
+func tarEntryPath(dst, entry string) (string, error) {
+	name := filepath.FromSlash(strings.TrimPrefix(entry, "./"))
+	if name == "" || name == "." {
+		return "", nil
+	}
+	if filepath.IsAbs(name) || strings.HasPrefix(name, `\`) || hasDotDot(name) {
+		return "", errUnsafePath
+	}
+	p := filepath.Join(dst, name)
+	if !within(dst, p) {
+		return "", errUnsafePath
+	}
+	if p == filepath.Clean(dst) {
+		return "", nil
+	}
+	return p, nil
+}
+
+// relSlash is p relative to dst, "/"-separated.
+func relSlash(dst, p string) string {
+	rel, _ := filepath.Rel(dst, p)
+	return filepath.ToSlash(rel)
 }
 
 func hasDotDot(p string) bool {

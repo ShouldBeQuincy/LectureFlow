@@ -19,7 +19,7 @@
 import '../vendor/browser-polyfill.js';
 import { el, t, localize } from '../ui/dom.js';
 import { applyChosenLanguage } from '../ui/language.js';
-import { createSendCard } from '../ui/sendcard.js';
+import { createSendCard, fitSend } from '../ui/sendcard.js';
 import { createBulkCard } from '../ui/bulkcard.js';
 import { guardClicks } from '../ui/clickguard.js';
 import { windowNotice } from '../lib/embed.js';
@@ -130,6 +130,10 @@ async function main() {
     await card.start();
     return;
   }
+  // the send block keeps in sight in a window tall enough for it (the
+  // viewport scrolls; SEC42 中-1)
+  const fit = () => fitSend(document.documentElement, window.innerHeight, document);
+  window.addEventListener('resize', fit);
   card = createSendCard({
     mount,
     ask,
@@ -137,6 +141,7 @@ async function main() {
     onView: (v) => {
       document.body.dataset.view = v.view;
       document.body.dataset.reason = v.reason || '';
+      fit();
     },
     openUrl: (url) => browser.tabs.create({ url }),
   });

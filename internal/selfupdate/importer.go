@@ -119,7 +119,8 @@ func (c ctxReader) Read(p []byte) (int, error) {
 // MaxImportFiles, named with StagingName) into a fresh staging directory,
 // then they are verified and the package becomes the pending update. The
 // staging directory is removed afterwards. Errors: not_configured, busy,
-// and the import's own (signature_invalid, version_mismatch,
+// untrusted_dir, untrusted_install_dir, other_copy_pending (before
+// anything is staged), and the import's own (signature_invalid, version_mismatch,
 // manifest_invalid, not_newer, too_old, no_package, checksum,
 // import_incomplete, import_invalid, io_failed); fill's errors as they are.
 func (u *Updater) ImportWith(ctx context.Context, fill func(dir string) error) (Status, error) {
@@ -129,6 +130,13 @@ func (u *Updater) ImportWith(ctx context.Context, fill func(dir string) error) (
 	err := func() error {
 		if err := u.untrusted(); err != nil {
 			return err
+		}
+		if err := u.otherCopyPending(); err != nil {
+			return err
+		}
+		if u.opt.NoInstall {
+			// (a copy that cannot update itself: before anything is staged)
+			return cerr(CodeNoPackage, map[string]any{"platform": u.platform, "kind": u.kind}, nil)
 		}
 		if err := os.MkdirAll(u.dir, 0o755); err != nil {
 			return ioErr(err)

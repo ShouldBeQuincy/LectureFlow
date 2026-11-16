@@ -1,0 +1,18 @@
+[BEFORE]
+(none)
+[TARGET #0]
+Okay, let's get started with today's lecture.
+[TARGET #1]
+Today we talk about the cache hierarchy in modern processors.
+[ASR]
+(Raw speech recognition output; may contain errors. For reference only.)
+Today we talk about the cash hierarchy in modern processors.
+[TARGET #2]
+A write-back cache only writes a line to memory on eviction.
+[ASR]
+(Raw speech recognition output; may contain errors. For reference only.)
+A right back cache only writes a line to memory on eviction.
+[AFTER]
+Each cache line is 64 bytes on most x86 machines.
+So the first question is how we find a line in the cache.
+We split the address into a tag, an index and an offset.

@@ -164,6 +164,21 @@ func TestChaptersInputHash(t *testing.T) {
 	}
 }
 
+// TestChaptersInputHashPinned pins ChaptersInputHash to literal values
+// (review R26 A-7). Every lecture stores this hash with its chapters; a
+// change to the function makes the chapters of every existing lecture show
+// "章节可能已过时" (and, after a summary rerun, regenerate). Change these
+// values only on purpose. (SHA-256 of "8:chapters3:sum1:33:a b3:c d3:e f"
+// and of "8:chapters0:1:0".)
+func TestChaptersInputHashPinned(t *testing.T) {
+	if h := ChaptersInputHash("sum", chapterSentences("a b", "c d", "e f")); h != "506c2cf8b2dffaa8b70d0a8ba26200d9b90f7fa5660ddeb9700137fab01cf028" {
+		t.Errorf("ChaptersInputHash changed: %s", h)
+	}
+	if h := ChaptersInputHash("", nil); h != "e1148ed1acbe76502a80a162705872c1e770a4e5efffae2d573373c7928e559e" {
+		t.Errorf("ChaptersInputHash of nothing changed: %s", h)
+	}
+}
+
 func TestTitleRequest(t *testing.T) {
 	full := TitleRequest(TitleInput{Summary: "S.", SyllabusEntry: "| Week | Topic |\n| 3 | Stream ciphers |", OriginalFilename: "CSC1003_2026-10-06.mp4"})
 	if full.System != TitleSystem {

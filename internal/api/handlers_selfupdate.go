@@ -87,25 +87,27 @@ func (s *Server) requireSelfUpdate(w http.ResponseWriter) bool {
 
 // selfUpdateHTTP is the HTTP status of each selfupdate code.
 var selfUpdateHTTP = map[string]int{
-	selfupdate.CodeNotConfigured:    http.StatusConflict,
-	selfupdate.CodeBusy:             http.StatusConflict,
-	selfupdate.CodeNotAvailable:     http.StatusConflict,
-	selfupdate.CodeTooOld:           http.StatusConflict,
-	selfupdate.CodeNoPackage:        http.StatusConflict,
-	selfupdate.CodeNotNewer:         http.StatusConflict,
-	selfupdate.CodeCancelled:        http.StatusConflict,
-	selfupdate.CodeUntrustedDir:     http.StatusConflict,
-	selfupdate.CodeSignatureInvalid: http.StatusBadRequest,
-	selfupdate.CodeVersionMismatch:  http.StatusBadRequest,
-	selfupdate.CodeManifestInvalid:  http.StatusBadRequest,
-	selfupdate.CodeChecksum:         http.StatusBadRequest,
-	selfupdate.CodeImportIncomplete: http.StatusBadRequest,
-	selfupdate.CodeImportInvalid:    http.StatusBadRequest,
-	selfupdate.CodeSourcesInvalid:   http.StatusBadRequest,
-	selfupdate.CodeUnreachable:      http.StatusBadGateway,
-	selfupdate.CodeNoManifest:       http.StatusBadGateway,
-	selfupdate.CodeDownloadFailed:   http.StatusBadGateway,
-	selfupdate.CodeIO:               http.StatusInternalServerError,
+	selfupdate.CodeNotConfigured:       http.StatusConflict,
+	selfupdate.CodeBusy:                http.StatusConflict,
+	selfupdate.CodeNotAvailable:        http.StatusConflict,
+	selfupdate.CodeTooOld:              http.StatusConflict,
+	selfupdate.CodeNoPackage:           http.StatusConflict,
+	selfupdate.CodeNotNewer:            http.StatusConflict,
+	selfupdate.CodeCancelled:           http.StatusConflict,
+	selfupdate.CodeUntrustedDir:        http.StatusConflict,
+	selfupdate.CodeUntrustedInstallDir: http.StatusConflict,
+	selfupdate.CodeOtherCopyPending:    http.StatusConflict,
+	selfupdate.CodeSignatureInvalid:    http.StatusBadRequest,
+	selfupdate.CodeVersionMismatch:     http.StatusBadRequest,
+	selfupdate.CodeManifestInvalid:     http.StatusBadRequest,
+	selfupdate.CodeChecksum:            http.StatusBadRequest,
+	selfupdate.CodeImportIncomplete:    http.StatusBadRequest,
+	selfupdate.CodeImportInvalid:       http.StatusBadRequest,
+	selfupdate.CodeSourcesInvalid:      http.StatusBadRequest,
+	selfupdate.CodeUnreachable:         http.StatusBadGateway,
+	selfupdate.CodeNoManifest:          http.StatusBadGateway,
+	selfupdate.CodeDownloadFailed:      http.StatusBadGateway,
+	selfupdate.CodeIO:                  http.StatusInternalServerError,
 }
 
 // failSelfUpdate writes a selfupdate error; other errors (the upload and
@@ -204,7 +206,7 @@ func (s *Server) postSelfUpdateImport(w http.ResponseWriter, r *http.Request) {
 		}
 		resolved := make([]string, 0, len(paths))
 		for _, p := range paths {
-			src, _, err := s.checkSourcePath(p)
+			src, _, err := s.checkSourcePath(ctx, p)
 			if err != nil {
 				s.fail(w, r, err)
 				return

@@ -121,7 +121,13 @@ export function asrModeStep(env) {
       // only the CPU: why the remote GPU is recommended
       const notes = recommendedMode(S.rec) === 'remote' ? ((S.rec && S.rec.notes) || []).map(hwText).filter(Boolean) : [];
       const group = h('div', { class: 'ob-modes', role: 'radiogroup', 'aria-label': t('onboarding.asr_mode.title') }, MODES.map(([m, ic]) => card(m, ic)));
-      return [group, notes.map((n) => h('p', { class: 'ob-callout is-info' }, icon('info', { size: 16 }), h('span', null, n)))];
+      // r7 (T22 G13): "install as recommended" of the step before only chose
+      // the components; when the download starts is said here — only when
+      // the chosen way has something to download (R75 L6: all installed,
+      // the guide run again from the settings, nothing starts)
+      const plan = S.plans[choice];
+      const when = plan && plan.download_bytes > 0 ? h('p', { class: 'ob-hint' }, icon('download', { size: 14 }), ' ', t(env.storageShown ? 'onboarding.asr_mode.download_after_storage' : 'onboarding.asr_mode.download_after')) : null;
+      return [group, notes.map((n) => h('p', { class: 'ob-callout is-info' }, icon('info', { size: 16 }), h('span', null, n))), when];
     },
     primary: () => ({ label: t('onboarding.continue'), icon: 'arrow-right', disabled: S.loading || S.busy || !choice, onclick: proceed }),
     onSkip() {

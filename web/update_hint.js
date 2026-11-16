@@ -40,6 +40,7 @@ import { icon } from './icons.js';
 import { t } from './i18n.js';
 import * as U from './util.js';
 import { api } from './api.js';
+import { externalLinkFailed } from './onboarding_api.js';
 import { loadStatus as loadSelfUpdate, configured, recentFailure, resultText, downloadError, suRequest } from './settings_update.js';
 
 const IDLE_MS = 10 * 60 * 1000;
@@ -69,7 +70,7 @@ function releaseURL(a) {
 
 function openExternal(url) {
   const lf = window.lectureflow;
-  if (lf && typeof lf.openExternal === 'function') Promise.resolve(lf.openExternal(url)).catch(() => {});
+  if (lf && typeof lf.openExternal === 'function') Promise.resolve(lf.openExternal(url)).catch(externalLinkFailed);
 }
 
 // The failed installation the user dismissed on the workbench (its time);

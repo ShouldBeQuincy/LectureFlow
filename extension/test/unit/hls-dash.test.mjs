@@ -87,7 +87,7 @@ test('HLS: only trick-play streams means no track', () => {
 });
 
 test('HLS media playlist: duration, segments, BOM and CRLF, comments', () => {
-  const text = '﻿#EXTM3U\r\n# a comment\r\n#EXT-X-TARGETDURATION:10\r\n#EXTINF:9.5,\r\nseg0.aac\r\n#EXTINF:10.25,title\r\nseg1.aac\r\n#EXT-X-ENDLIST\r\n';
+  const text = '\ufeff#EXTM3U\r\n# a comment\r\n#EXT-X-TARGETDURATION:10\r\n#EXTINF:9.5,\r\nseg0.aac\r\n#EXTINF:10.25,title\r\nseg1.aac\r\n#EXT-X-ENDLIST\r\n';
   const p = parseHls(text, BASE);
   assert.equal(p.type, 'media');
   assert.equal(p.durationSec, 19.75);
@@ -199,7 +199,7 @@ test('DASH: segment URLs belong to their set (templates, lists, BaseURL files)',
   assert.ok(!video.childPatterns.some((p) => new RegExp(p).test('https://media.example.org/x/v1080/seg_00012.mp4')));
   assert.deepEqual(audio.childUrls, ['https://media.example.org/x/audio_128.mp4']);
   assert.deepEqual(de.childUrls.sort(), ['https://media.example.org/x/b/1.mp4', 'https://media.example.org/x/b/init.mp4']);
-  assert.equal(templateToRegex('a_$Bandwidth$_$Time$.m4s', 'r', 500), 'a_500_\\d+\\.m4s');
+  assert.equal(templateToRegex('a_$Bandwidth$_$Time$.m4s', 'r', 500), 'a_500_\\d{1,32}\\.m4s');
   assert.equal(templateToRegex('$$x', 'r'), '\\$x');
 });
 

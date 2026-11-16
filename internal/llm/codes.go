@@ -25,8 +25,11 @@ const (
 	// the last failure of a request (SPEC §12, §17.6, appendix D2); every
 	// one has role and retries (transport retries made), some more
 	CodeTruncated     = "llm.truncated"            // role, retries, provider, model, max_tokens (0 = the server's limit)
+	CodeRefusal       = "llm.refusal"              // role, retries, provider, model, category ("" = none given)
 	CodeNetwork       = "llm.network"              // role, retries
 	CodeTimeout       = "llm.timeout"              // role, retries, seconds
+	CodeIdleTimeout   = "llm.idle_timeout"         // role, retries, seconds (the idle timeout of a streamed request; SEC4 M5)
+	CodeTimeLimit     = "llm.time_limit"           // role, retries, seconds, provider, model (a streamed answer still coming at the attempt timeout; SEC4 M4)
 	CodeBadResponse   = "llm.bad_response"         // role, retries
 	CodeRejected      = "llm.rejected"             // role, retries, status, provider, model
 	CodeNoBalance     = "llm.insufficient_balance" // role, retries, provider
@@ -52,7 +55,7 @@ const (
 // ErrorCodes lists the codes this package defines.
 var ErrorCodes = []string{
 	CodeSnapshotProviderDeleted, CodeNoModel, CodeNoAPIKey, CodeUnknownRole, CodeProviderNotConfigured,
-	CodeTruncated, CodeNetwork, CodeTimeout, CodeBadResponse, CodeRejected, CodeNoBalance,
+	CodeTruncated, CodeRefusal, CodeNetwork, CodeTimeout, CodeIdleTimeout, CodeTimeLimit, CodeBadResponse, CodeRejected, CodeNoBalance,
 	CodeRateLimited, CodeOverloaded, CodeServerError, CodeRequestFailed,
 	CodeProbeNoModel, CodeProbeNoModelNoList, CodeProbeBadBaseURL, CodeProbeTimeout, CodeProbeNetwork,
 	CodeProbeHTTP, CodeProbeNotJSON, CodeProbeBadModelList, CodeProbeNoAPIKey, CodeProbeFailed,

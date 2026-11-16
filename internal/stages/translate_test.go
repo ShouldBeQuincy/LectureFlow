@@ -19,6 +19,7 @@ import (
 	"lectureflow/internal/db"
 	"lectureflow/internal/llm/llmtest"
 	"lectureflow/internal/model"
+	"lectureflow/internal/qa"
 	"lectureflow/internal/sched"
 	"lectureflow/internal/state"
 )
@@ -349,7 +350,13 @@ func TestTranslateCancelKeepsWritten(t *testing.T) {
 	}
 }
 
-func TestTranslateUnusableSentenceFailsStage(t *testing.T) {
+// v3.2.x P1 (Q2a; replaces the Gate B ruling "done must not leave
+// untranslated sentences", under which this run failed with
+// CodeTranslateFailed): a sentence whose answers are unusable three times is
+// written as pending — zh "", qa_failed, the reason — and the stage
+// finishes with a warning and stats.pending_sentences. No later run sends it
+// again by itself; "重新翻译这句" does.
+func TestTranslateUnusableSentencePending(t *testing.T) {
 	e := newEnv(t)
 	l := e.lecture("L1", "m.mp4")
 	e.insertSample(l.ID)
@@ -360,38 +367,77 @@ func TestTranslateUnusableSentenceFailsStage(t *testing.T) {
 		}
 		return zhJSON(idx, plainZh[idx])
 	})
-	r := e.run(e.stage(e.deps(fake), model.StageTranslate), l.ID)
-	var ce *model.CodedError
-	if r.err == nil || sched.IsPermanent(r.err) || !errors.As(r.err, &ce) || ce.Info.Code != CodeTranslateFailed ||
-		!paramsMatch(&ce.Info, "n", 1, "ids", "#2", "attempts", 3) || r.job.Status != model.StatusFailed {
+	stg := e.stage(e.deps(fake), model.StageTranslate)
+	r := e.run(stg, l.ID)
+	if r.err != nil || r.job.Status != model.StatusDone || r.progress.last() != 1 {
 		t.Fatalf("err %v status %s", r.err, r.job.Status)
 	}
+	if r.stats.PendingSentences != 1 || infoCode(r.stats.WarningInfo) != WarnTranslatePending ||
+		!paramsMatch(r.stats.WarningInfo, "n", 1, "ids", "#2") || !strings.Contains(r.stats.Warning, "1 句待处理") || !strings.Contains(r.stats.Warning, "#2") {
+		t.Fatalf("stats %+v %+v", r.stats, r.stats.WarningInfo)
+	}
 	ss := e.sentences(l.ID)
-	if ss[2].ZhStatus != model.ZhNone {
-		t.Errorf("sentence 2 status %s", ss[2].ZhStatus)
+	p := ss[2]
+	if p.ZhStatus != model.ZhQAFailed || p.Zh == nil || *p.Zh != "" || p.ZhHash == nil || p.QAError == nil || !isPending(p) {
+		t.Fatalf("sentence 2: %+v", p)
+	}
+	wantReason := qa.UnusableReason(3, "answer idx does not match target #2")
+	if *p.QAError != wantReason {
+		t.Errorf("qa_error %q, want %q", *p.QAError, wantReason)
+	}
+	if info := qa.ErrorInfo(*p.QAError); info == nil || info.Code != qa.CodeSentenceUnusable || !paramsMatch(info, "attempts", 3) || info.Detail != *p.QAError {
+		t.Errorf("qa_error_info %+v", info)
 	}
 	for _, s := range ss {
 		if s.Idx != 2 && s.ZhStatus != model.ZhOK {
 			t.Errorf("sentence %d status %s", s.Idx, s.ZhStatus)
 		}
 	}
-	// 3 attempts for sentence 2
-	n := 0
+	// 3 attempts for sentence 2; the second and the third tell the model
+	// what was wrong with the answer before (same prefix, same request).
+	var asks []llmCall
 	for _, c := range fake.Calls() {
 		if llmtest.TargetIdx(c.User) == 2 {
-			n++
+			asks = append(asks, c)
 		}
 	}
-	if n != 3 {
-		t.Errorf("sentence 2 asked %d times, want 3", n)
+	if len(asks) != 3 {
+		t.Fatalf("sentence 2 asked %d times, want 3", len(asks))
 	}
-	// retry only redoes sentence 2
+	feedback := ctxbuild.WithRetryFeedback(asks[0].User, []string{"answer idx does not match target #2"})
+	if strings.Contains(asks[0].User, "REJECTED") || asks[1].User != feedback || asks[2].User != feedback ||
+		asks[1].System != asks[0].System || asks[2].System != asks[0].System {
+		t.Errorf("retry requests:\n%q\n%q", asks[1].User, asks[2].User)
+	}
+
+	// A retry or an incremental run does not send the pending sentence
+	// again, and still reports it.
+	newPendingTranslate(t, e, l.ID, state.NoteIncremental)
 	fake2 := answerFn(func(idx, _ int, _ string) string { return zhJSON(idx, plainZh[idx]) })
-	if r := e.run(e.stage(e.deps(fake2), model.StageTranslate), l.ID); r.err != nil {
-		t.Fatal(r.err)
+	stg2 := e.stage(e.deps(fake2), model.StageTranslate)
+	r2 := e.run(stg2, l.ID)
+	if r2.err != nil || len(fake2.Calls()) != 0 || r2.stats.PendingSentences != 1 || infoCode(r2.stats.WarningInfo) != WarnTranslatePending {
+		t.Fatalf("run without a request for it: err %v, %d calls, stats %+v", r2.err, len(fake2.Calls()), r2.stats)
+	}
+
+	// "重新翻译这句": stale, and the incremental run translates it; nothing
+	// is pending afterwards.
+	s2, err := state.RetranslateSentence(e.ctx, e.st, l.ID, 2)
+	if err != nil || s2.ZhStatus != model.ZhStale {
+		t.Fatalf("retranslate: %+v %v", s2, err)
+	}
+	if started, err := state.StartIncrementalTranslate(e.ctx, e.st, l.ID); err != nil || !started {
+		t.Fatalf("incremental translate: %v %v", started, err)
+	}
+	r3 := e.run(stg2, l.ID)
+	if r3.err != nil || r3.stats.PendingSentences != 0 || r3.stats.Warning != "" || r3.stats.WarningInfo != nil {
+		t.Fatalf("after the retranslation: err %v stats %+v", r3.err, r3.stats)
 	}
 	if got := targetIdxs(fake2); !slices.Equal(got, []int{2}) {
-		t.Errorf("retry translated %v", got)
+		t.Errorf("retranslation sent %v", got)
+	}
+	if s := e.sentences(l.ID)[2]; s.ZhStatus != model.ZhOK || s.Zh == nil || *s.Zh != plainZh[2] || s.QAError != nil {
+		t.Errorf("sentence 2 after the retranslation: %+v", s)
 	}
 }
 

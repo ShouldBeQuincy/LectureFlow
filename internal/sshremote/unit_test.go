@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/pem"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -28,18 +29,19 @@ func (m memKV) GetKV(_ context.Context, k string) (string, bool, error) {
 func (m memKV) SetKV(_ context.Context, k, v string) error { m[k] = v; return nil }
 
 func TestKeysAreSealed(t *testing.T) {
-	sealed, line, err := newKey("lectureflow-test")
+	ctx := context.Background()
+	sealed, line, err := newKey("lectureflow-test", KeyRef("s1"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !secrets.IsSealed(sealed) || strings.Contains(sealed, "PRIVATE KEY") {
-		t.Fatal("the private key is not sealed")
+	if !secrets.IsBound(sealed) || strings.Contains(sealed, "PRIVATE KEY") {
+		t.Fatal("the private key is not sealed bound")
 	}
 	if !strings.HasPrefix(line, "restrict ssh-ed25519 ") || !strings.HasSuffix(line, " lectureflow-test") {
 		t.Fatalf("authorized_keys line %q", line)
 	}
-	kv := memKV{"k": sealed}
-	signer, err := loadSigner(context.Background(), kv, "k")
+	kv := memKV{KeyRef("s1"): sealed}
+	signer, err := loadSigner(ctx, kv, "s1", KeyRef("s1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,8 +50,29 @@ func TestKeysAreSealed(t *testing.T) {
 	}
 	// A plain value is refused (never used, never written).
 	kv["plain"] = "-----BEGIN OPENSSH PRIVATE KEY-----"
-	if _, err := loadSigner(context.Background(), kv, "plain"); err == nil {
+	if _, err := loadSigner(ctx, kv, "s1", "plain"); err == nil {
 		t.Fatal("a plain key was used")
+	}
+	// sec3 L3: the key opens for its own server only. Copied into another
+	// server's row, or reached through another server's key_ref, it does
+	// not.
+	kv[KeyRef("s2")] = sealed
+	if _, err := loadSigner(ctx, kv, "s2", KeyRef("s2")); !errors.Is(err, secrets.ErrUndecryptable) {
+		t.Fatalf("s1's key copied into s2's row: %v", err)
+	}
+	if _, err := loadSigner(ctx, kv, "s2", KeyRef("s1")); !errors.Is(err, secrets.ErrUndecryptable) {
+		t.Fatalf("s2 with key_ref pointing at s1's row: %v", err)
+	}
+	// 3.2.0's unbound format (sealed again bound at the next start) still opens
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	block, _ := ssh.MarshalPrivateKey(priv, "old")
+	old, err := secrets.Seal(pem.EncodeToMemory(block))
+	if err != nil {
+		t.Fatal(err)
+	}
+	kv[KeyRef("s3")] = old
+	if _, err := loadSigner(ctx, kv, "s3", KeyRef("s3")); err != nil {
+		t.Fatalf("enc:v1: key: %v", err)
 	}
 }
 

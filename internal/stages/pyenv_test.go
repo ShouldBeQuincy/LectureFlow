@@ -52,7 +52,7 @@ func TestWorkerRunsWithoutTelemetry(t *testing.T) {
 // Analytics) and has pyenv's environment.
 func TestImportCheckWithoutTelemetry(t *testing.T) {
 	t.Setenv("DO_NOT_TRACK", "0")
-	cmd := importCheckCmd(context.Background(), "python", []string{"openvino", "openvino_genai"})
+	cmd := importCheckCmd(context.Background(), "python", "", []string{"openvino", "openvino_genai"})
 	if len(cmd.Args) != 4 || cmd.Args[1] != "-I" || cmd.Args[2] != "-c" {
 		t.Fatalf("args %q", cmd.Args)
 	}

@@ -12,8 +12,9 @@ import (
 	"time"
 
 	"lectureflow/internal/ctxbuild"
-	"lectureflow/internal/db"
+	"lectureflow/internal/llm"
 	"lectureflow/internal/model"
+	"lectureflow/internal/state"
 )
 
 // chaptersStage is the auxiliary task chapters (SPEC-v2 P7, lead ruling 9
@@ -55,13 +56,32 @@ func checkChapters(a *chaptersAnswer, n int) error {
 		case c.TitleEn == "" || c.TitleZh == "":
 			return fmt.Errorf("chapter %d has an empty title", i+1)
 		case ctxbuild.EnglishWords(c.TitleEn) > ctxbuild.ChapterTitleWords:
-			return fmt.Errorf("title_en %q has more than %d words", c.TitleEn, ctxbuild.ChapterTitleWords)
+			return &chapterTitleRejected{
+				feedback: fmt.Sprintf("title_en %q has more than %d words", c.TitleEn, ctxbuild.ChapterTitleWords),
+				summary: fmt.Sprintf("chapter %d: title_en has %d words; at most %d are allowed",
+					i+1, ctxbuild.EnglishWords(c.TitleEn), ctxbuild.ChapterTitleWords),
+			}
 		case ctxbuild.ZhLen(c.TitleZh) > ctxbuild.ChapterTitleZhLen:
-			return fmt.Errorf("title_zh %q has more than %d characters", c.TitleZh, ctxbuild.ChapterTitleZhLen)
+			return &chapterTitleRejected{
+				feedback: fmt.Sprintf("title_zh %q has more than %d characters", c.TitleZh, ctxbuild.ChapterTitleZhLen),
+				summary: fmt.Sprintf("chapter %d: title_zh has %d characters; at most %d are allowed",
+					i+1, ctxbuild.ZhLen(c.TitleZh), ctxbuild.ChapterTitleZhLen),
+			}
 		}
 	}
 	return nil
 }
+
+// chapterTitleRejected is a chapter title over its limit. The retry
+// feedback (Problems, askJSONRetry) quotes the title, as it always did; the
+// error text (Error) names the chapter, the field, the count and the limit
+// only: it becomes the job error's detail and the scheduler's "job failed"
+// line of the service log, which must not hold generated text (R7 A-S4).
+// checkChapters' other errors hold numbers only and stay plain.
+type chapterTitleRejected struct{ feedback, summary string }
+
+func (e *chapterTitleRejected) Error() string      { return e.summary }
+func (e *chapterTitleRejected) Problems() []string { return []string{e.feedback} }
 
 func (s *chaptersStage) Run(ctx context.Context, lectureID string, progress func(float64)) error {
 	d := s.d
@@ -78,11 +98,11 @@ func (s *chaptersStage) Run(ctx context.Context, lectureID string, progress func
 	}
 	req := ctxbuild.ChaptersRequest(summary, ss)
 	progress(0.1)
-	a, unusable, err := askJSONRetry(ctx, d.LLM, s.role, req.System, req.User,
+	a, unusable, err := askJSONRetry(llm.WithJSONSchema(ctx, ctxbuild.SchemaChapters), d.LLM, s.role, req.System, req.User,
 		func(a *chaptersAnswer) error { return checkChapters(a, len(ss)) })
 	if err != nil {
 		if unusable {
-			return model.Errorf("chapters.invalid_output", map[string]any{"attempts": auxAttempts}, err)
+			return model.Errorf("chapters.invalid_output", map[string]any{"attempts": auxAttempts}, withoutAnswerText(err))
 		}
 		return err
 	}
@@ -107,33 +127,10 @@ func (s *chaptersStage) Run(ctx context.Context, lectureID string, progress func
 }
 
 // chaptersInput reads the summary ("" when none) and the sentences in one
-// transaction, so the stored hash describes exactly what the model saw.
+// transaction, so the stored hash describes exactly what the model saw
+// (state.ChaptersInput, shared with the scheduler's refresh check).
 func (d Deps) chaptersInput(ctx context.Context, lectureID string) (string, []ctxbuild.Sentence, error) {
-	var (
-		summary string
-		ss      []ctxbuild.Sentence
-	)
-	err := d.Store.Tx(ctx, func(tx db.Store) error {
-		if _, err := tx.GetLecture(ctx, lectureID); err != nil {
-			return err
-		}
-		sum, err := tx.GetSummary(ctx, lectureID)
-		switch {
-		case err == nil:
-			summary = sum.Text
-		case errors.Is(err, db.ErrNotFound):
-			summary = ""
-		default:
-			return err
-		}
-		rows, err := tx.ListSentences(ctx, lectureID, 0, 0)
-		if err != nil {
-			return err
-		}
-		ss = ctxbuild.FromModel(rows)
-		return nil
-	})
-	return summary, ss, err
+	return state.ChaptersInput(ctx, d.Store, lectureID)
 }
 
 // ChaptersInputHash is the current input hash of the lecture's chapters

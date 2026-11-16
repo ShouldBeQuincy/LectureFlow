@@ -31,7 +31,7 @@
 // and starts one itself only when none was started (older saved states,
 // skipped steps).
 
-import { h, btn } from './dom.js';
+import { h, btn, toast } from './dom.js';
 import { icon } from './icons.js';
 import { t } from './i18n.js';
 import * as U from './util.js';
@@ -67,7 +67,12 @@ export async function startChosenInstall(env) {
   if (tasks.some((x) => x.id === env.data[key] && taskActive(x))) return;
   try {
     const r = await obApi.install(ids, { quiet: true });
-    if (r && r.task) env.data[key] = r.task.id;
+    if (r && r.task) {
+      env.data[key] = r.task.id;
+      // r7 (T22 G13): "install as recommended" (step 3) only chose; this is
+      // where the download starts, and it says so
+      toast(t(remote ? 'onboarding.download.started_remote' : 'onboarding.download.started'), 'info');
+    }
   } catch (e) {
     // already being installed by another task: follow that one
     const tk = e.status === 409 ? ((await obApi.tasks({ quiet: true }).catch(() => [])) || []).filter((x) => taskActive(x) && (x.ids || []).some((id) => ids.includes(id))).pop() : null;
@@ -83,11 +88,14 @@ export function downloadStep(env) {
   const S = { loading: true, comps: [], task: null, sources: null, nothing: false, none: false, acting: false, startError: '' };
   let timer = null;
   let alive = true;
+  // the task view says the task's state when it changes (no live figures:
+  // components_ui.js taskView, T23 general 18)
   const view = taskView({ components: () => S.comps, busy: () => S.acting, onAction: act });
   const unsubscribe = onComponentsEvent((ev) => {
     const tk = S.task && ((ev && ev.tasks) || []).find((x) => x.id === S.task.id);
     if (alive && tk && !S.acting) apply(tk);
   });
+  const redraw = () => env.rerender();
 
   start();
 
@@ -114,7 +122,7 @@ export function downloadStep(env) {
     }
     S.loading = false;
     if (!alive) return;
-    env.rerender();
+    redraw();
     schedule();
   }
 
@@ -148,7 +156,7 @@ export function downloadStep(env) {
   function apply(tk) {
     const before = S.task.state;
     S.task = tk;
-    if (tk.state !== before || !taskActive(tk)) env.rerender();
+    if (tk.state !== before || !taskActive(tk)) redraw();
     else view.update(tk);
     if (tk.state === 'done' && before !== 'done') followUp(tk);
     schedule();
@@ -177,7 +185,7 @@ export function downloadStep(env) {
     await install(left);
     S.acting = false;
     if (!alive) return;
-    env.rerender();
+    redraw();
     schedule();
   }
 
@@ -229,7 +237,7 @@ export function downloadStep(env) {
     }
     S.acting = false;
     if (!alive) return;
-    env.rerender();
+    redraw();
     schedule();
   }
 
@@ -251,7 +259,10 @@ export function downloadStep(env) {
 
   return {
     title: () => t('onboarding.download.title'),
-    desc: () => t('onboarding.download.desc'),
+    // r7 (T22 G13): once everything is installed, no "runs in the background" any more
+    desc: () => (S.nothing || (S.task && S.task.state === 'done') ? t('onboarding.download.desc_done') : t('onboarding.download.desc')),
+    // R75 M5: only a download that runs goes on in the background; else skipping is "continue"
+    skipTip: () => t(taskActive(S.task) ? 'onboarding.skip_tip.download' : 'onboarding.skip_tip.continue'),
     body,
     secondary() {
       if (S.none) return [btn(t('onboarding.download.choose'), { kind: 'ghost', icon: 'cpu', fkey: 'ob:dl:choose', onclick: () => env.goto('computer') })];
@@ -278,6 +289,20 @@ export function downloadStep(env) {
 // ---- step 6 ----
 
 const TEST_ACTIVE = new Set(['waiting', 'running']);
+
+/**
+ * r7 (T22 G9): the self-test's recommendation in plain words — how long an
+ * hour of recording takes with it on this computer (its RTF × 60 minutes),
+ * instead of "RTF ≤ 0.5". Without the recommended run's speed, the settings
+ * page's sentence (selftest.pick_*).
+ */
+export function pickText(b, combo) {
+  const fastest = b.pick.rule === 'lowest_rtf';
+  const run = (b.results || []).find((r) => r && r.ok && r.model === b.pick.model && r.precision === b.pick.precision);
+  if (!run || !(run.rtf > 0)) return t(fastest ? 'selftest.pick_fastest' : 'selftest.pick_best', { combo });
+  const n = U.count(Math.max(1, Math.round(run.rtf * 60)));
+  return t(fastest ? 'onboarding.selftest.pick_fastest' : 'onboarding.selftest.pick_best', { combo, n });
+}
 
 export function selftestStep(env) {
   const S = { loading: true, ready: false, downloading: false, devices: [], busy: new Set(), error: '' };
@@ -441,7 +466,7 @@ export function selftestStep(env) {
             'p',
             { class: 'ob-dev-pick' },
             icon(inUse ? 'circle-check' : 'sparkles', { size: 14 }),
-            h('span', null, t(b.pick.rule === 'lowest_rtf' ? 'selftest.pick_fastest' : 'selftest.pick_best', { combo })),
+            h('span', null, pickText(b, combo)),
             inUse ? h('span', { class: 'dim' }, t('selftest.pick_in_use')) : btn(t('selftest.apply_pick'), { size: 'sm', kind: 'primary', disabled: busy, fkey: `ob:dev:${d.id}:apply`, onclick: () => apply(d, b.pick.model, b.pick.precision) }),
           ),
         );

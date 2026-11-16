@@ -326,6 +326,45 @@ func TestCheckTrustPrivate(t *testing.T) {
 	}
 }
 
+// Everything below the updates directory is looked at, within bounds: a
+// tree larger than the bounds cannot be vouched for, so it is not trusted
+// (security audit M-3).
+func TestCheckTrustWalksTheUpdatesDirectory(t *testing.T) {
+	data := privateDataDir(t)
+	updates := filepath.Join(data, "updates")
+	for _, f := range []string{"3.2.0/update.json", "3.2.0/update.json.minisig", "backup/3.1.0/app/LectureFlow.exe", "backup/3.1.0/backup.json", "previous.json"} {
+		p := filepath.Join(updates, filepath.FromSlash(f))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// the shell's profile with its record, as in an unmoved data directory
+	if err := os.Mkdir(filepath.Join(data, ShellProfileDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, ShellProfileDir, TrustRecordFile), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckTrust(updates); err != nil {
+		t.Fatalf("a private tree: %v", err)
+	}
+	orig := updatesTree
+	t.Cleanup(func() { updatesTree = orig })
+	updatesTree = dirperm.TreeOptions{MaxEntries: 5}
+	err := CheckTrust(updates)
+	if CodeOf(err) != CodeUntrustedDir || InfoOf(err).Params["path"] != updates ||
+		!strings.Contains(InfoOf(err).Params["who"].(string), "not confirmed: more than 5 entries") {
+		t.Fatalf("beyond the bounds: %v", err)
+	}
+	updatesTree = dirperm.TreeOptions{MaxDepth: 2}
+	if err := CheckTrust(updates); CodeOf(err) != CodeUntrustedDir || !strings.Contains(InfoOf(err).Params["who"].(string), "deeper than 2 levels") {
+		t.Fatalf("too deep: %v", err)
+	}
+}
+
 // Download and import refuse an untrusted data directory.
 func TestUntrustedDirRefusesDownloadAndImport(t *testing.T) {
 	f := newFakeGH(t)

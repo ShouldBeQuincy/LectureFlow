@@ -1,0 +1,327 @@
+[
+  {
+    "id": "cuda:0",
+    "backend": "faster-whisper",
+    "kind": "cuda",
+    "label": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+    "enabled": true,
+    "model": "large-v3",
+    "precision": "float16",
+    "max_parallel": 1,
+    "priority": 300,
+    "detected_at": "2026-10-24T08:00:00Z",
+    "present": true,
+    "paused": false,
+    "new": false,
+    "model_ready": null,
+    "compile_cached": null,
+    "benchmark": null,
+    "selftest": {
+      "device_id": "cuda:0",
+      "state": "idle",
+      "step": 0,
+      "steps": 0,
+      "progress": 0,
+      "started_at": null
+    },
+    "selftest_blocked": null,
+    "slots_used": 1,
+    "running": [
+      {
+        "job_id": "01JJOB0000000000000000000C",
+        "lecture_id": "01JLECTURE000000000000000B",
+        "lecture_title": "Week 3 · Vigenère and one-time pads",
+        "course_id": "01JC0URSE0000000000000000A",
+        "progress": 0.42
+      }
+    ],
+    "battery_hold": false,
+    "options": {
+      "models": [
+        "large-v3",
+        "large-v2",
+        "large-v3-turbo",
+        "medium",
+        "small",
+        "base"
+      ],
+      "precisions": [
+        "auto",
+        "float16",
+        "int8_float16"
+      ],
+      "recommended": {
+        "model": "large-v3",
+        "precision": "auto"
+      }
+    },
+    "vram_hint": {
+      "code": "system.devices.vram_low",
+      "params": {
+        "extra": [
+          {
+            "code": "system.devices.vram_queue_switch",
+            "params": {
+              "avail_mb": 4096,
+              "per_job_mb": 5000,
+              "reserve_mb": 0,
+              "suggest": "large-v3-turbo",
+              "suggest_mb": 1600,
+              "suggest_precision": "int8_float16"
+            }
+          }
+        ],
+        "model": "large-v3",
+        "need_gb": 6,
+        "suggest": "large-v3-turbo",
+        "vram_gb": 4
+      }
+    }
+  },
+  {
+    "id": "ov:GPU",
+    "backend": "openvino",
+    "kind": "igpu",
+    "label": "Intel(R) Graphics (iGPU)",
+    "enabled": true,
+    "model": "large-v3-turbo",
+    "precision": "fp16",
+    "max_parallel": 1,
+    "priority": 200,
+    "detected_at": "2026-10-24T08:00:00Z",
+    "present": true,
+    "paused": false,
+    "new": false,
+    "model_ready": false,
+    "compile_cached": false,
+    "benchmark": {
+      "version": 1,
+      "status": "done",
+      "started_at": "2026-10-24T08:10:00Z",
+      "finished_at": "2026-10-24T08:16:40Z",
+      "audio": {
+        "source": "lecture",
+        "lecture_id": "01JLECTURE000000000000000B",
+        "start_ms": 1510000,
+        "end_ms": 1630500,
+        "reference_words": 312
+      },
+      "results": [
+        {
+          "model": "large-v3-turbo",
+          "precision": "fp16",
+          "ok": true,
+          "load_s": 21.4,
+          "transcribe_s": 14.9,
+          "rtf": 0.124,
+          "wer": 0.057,
+          "first_compile": true,
+          "prepared": false,
+          "peak_mem_mb": 2710,
+          "words": true
+        },
+        {
+          "model": "large-v3-turbo",
+          "precision": "int8",
+          "ok": true,
+          "load_s": 9.8,
+          "transcribe_s": 11.2,
+          "rtf": 0.093,
+          "wer": 0.058,
+          "first_compile": false,
+          "prepared": true,
+          "peak_mem_mb": 1980,
+          "words": true
+        }
+      ],
+      "pick": {
+        "model": "large-v3-turbo",
+        "precision": "fp16",
+        "rule": "wer_rtf_le_0_5"
+      }
+    },
+    "selftest": {
+      "device_id": "ov:GPU",
+      "state": "done",
+      "step": 2,
+      "steps": 3,
+      "progress": 1,
+      "started_at": "2026-10-24T08:10:00Z",
+      "finished_at": "2026-10-24T08:16:40Z",
+      "result": {
+        "version": 1,
+        "status": "done",
+        "started_at": "2026-10-24T08:10:00Z",
+        "finished_at": "2026-10-24T08:16:40Z",
+        "audio": {
+          "source": "lecture",
+          "lecture_id": "01JLECTURE000000000000000B",
+          "start_ms": 1510000,
+          "end_ms": 1630500,
+          "reference_words": 312
+        },
+        "results": [
+          {
+            "model": "large-v3-turbo",
+            "precision": "fp16",
+            "ok": true,
+            "load_s": 21.4,
+            "transcribe_s": 14.9,
+            "rtf": 0.124,
+            "wer": 0.057,
+            "first_compile": true,
+            "prepared": false,
+            "peak_mem_mb": 2710,
+            "words": true
+          },
+          {
+            "model": "large-v3-turbo",
+            "precision": "int8",
+            "ok": true,
+            "load_s": 9.8,
+            "transcribe_s": 11.2,
+            "rtf": 0.093,
+            "wer": 0.058,
+            "first_compile": false,
+            "prepared": true,
+            "peak_mem_mb": 1980,
+            "words": true
+          }
+        ],
+        "pick": {
+          "model": "large-v3-turbo",
+          "precision": "fp16",
+          "rule": "wer_rtf_le_0_5"
+        }
+      }
+    },
+    "selftest_blocked": null,
+    "slots_used": 0,
+    "running": [],
+    "battery_hold": false,
+    "options": {
+      "models": [
+        "large-v3-turbo",
+        "large-v3",
+        "medium",
+        "small",
+        "base"
+      ],
+      "precisions": [
+        "fp16",
+        "int8",
+        "int4"
+      ],
+      "recommended": {
+        "model": "large-v3-turbo",
+        "precision": "fp16"
+      }
+    }
+  },
+  {
+    "id": "ov:NPU",
+    "backend": "openvino",
+    "kind": "npu",
+    "label": "Intel(R) AI Boost",
+    "enabled": true,
+    "model": "large-v3-turbo",
+    "precision": "fp16",
+    "max_parallel": 1,
+    "priority": 100,
+    "detected_at": "2026-10-24T08:00:00Z",
+    "present": true,
+    "paused": false,
+    "new": true,
+    "model_ready": false,
+    "compile_cached": false,
+    "benchmark": null,
+    "selftest": {
+      "device_id": "ov:NPU",
+      "state": "running",
+      "phase": "compiling_model",
+      "step": 1,
+      "steps": 3,
+      "candidate": {
+        "model": "large-v3-turbo",
+        "precision": "fp16"
+      },
+      "progress": 0,
+      "started_at": "2026-10-24T08:30:00Z"
+    },
+    "selftest_blocked": null,
+    "slots_used": 1,
+    "running": [],
+    "battery_hold": false,
+    "options": {
+      "models": [
+        "large-v3-turbo",
+        "large-v3",
+        "medium",
+        "small",
+        "base"
+      ],
+      "precisions": [
+        "fp16",
+        "int8",
+        "int4"
+      ],
+      "recommended": {
+        "model": "large-v3-turbo",
+        "precision": "fp16"
+      }
+    }
+  },
+  {
+    "id": "ov:CPU",
+    "backend": "openvino",
+    "kind": "cpu",
+    "label": "Intel(R) Core(TM) Ultra 9 386H",
+    "enabled": false,
+    "model": "large-v3-turbo",
+    "precision": "int8",
+    "max_parallel": 1,
+    "priority": 0,
+    "detected_at": null,
+    "present": false,
+    "paused": true,
+    "new": false,
+    "model_ready": false,
+    "compile_cached": true,
+    "benchmark": null,
+    "selftest": {
+      "device_id": "ov:CPU",
+      "state": "idle",
+      "step": 0,
+      "steps": 0,
+      "progress": 0,
+      "started_at": null
+    },
+    "selftest_blocked": {
+      "code": "asr.ov_device_unavailable",
+      "params": {
+        "device": "Intel(R) Core(TM) Ultra 9 386H"
+      }
+    },
+    "slots_used": 0,
+    "running": [],
+    "battery_hold": false,
+    "options": {
+      "models": [
+        "large-v3-turbo",
+        "large-v3",
+        "medium",
+        "small",
+        "base"
+      ],
+      "precisions": [
+        "fp16",
+        "int8",
+        "int4"
+      ],
+      "recommended": {
+        "model": "large-v3-turbo",
+        "precision": "fp16"
+      }
+    }
+  }
+]

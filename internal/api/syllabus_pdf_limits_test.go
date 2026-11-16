@@ -69,6 +69,17 @@ func fakePDFLimitsWorker(mode string, args []string) int {
 			return 5
 		}
 		return 0
+	case "argsenv": // system_isolation_test.go: the arguments and the environment, JSON
+		b, _ := json.Marshal(map[string][]string{"args": args, "env": os.Environ()})
+		if out == "" { // a diagnostics command (runCommand): on stdout
+			fmt.Println(string(b))
+			return 0
+		}
+		res, _ := json.Marshal(map[string]any{"pages": []string{string(b)}})
+		if os.WriteFile(out, res, 0o644) != nil {
+			return 5
+		}
+		return 0
 	}
 	return 3
 }

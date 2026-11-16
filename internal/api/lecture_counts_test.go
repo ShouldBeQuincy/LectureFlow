@@ -23,6 +23,12 @@ import (
 // methods (the implementation before perf-fix).
 type noCounter struct{ db.Store }
 
+// ListJobHistory keeps db.JobHistory (Lecture.usage_total, v3.2.x r7): only
+// the batch counts are hidden, so the single-lecture views stay comparable.
+func (n noCounter) ListJobHistory(ctx context.Context, scope, scopeID string) ([]model.Job, error) {
+	return n.Store.(db.JobHistory).ListJobHistory(ctx, scope, scopeID)
+}
+
 // countFixtures builds lectures covering every case of the counts and
 // returns them by name.
 func countFixtures(t *testing.T, e *env) (map[string]Lecture, []Course) {

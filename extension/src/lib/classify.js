@@ -67,10 +67,23 @@ export function kindOfCodecs(codecs) {
 }
 
 /**
- * Azure Media Services and similar servers name the format in the path:
- * ".../x.ism/manifest(format=m3u8-aapl)". Returns "hls", "dash" or "".
+ * What a path's extension names, as classifyUrl reads it when nothing else
+ * (Content-Type, a segment extension, a format in the path) says more:
+ * C_HLS, C_DASH, C_FILE or ''. ext: lower case, as extensionOfPath gives it.
  */
-function formatInPath(pathname) {
+export function extensionClass(ext) {
+  if (HLS_EXT.has(ext)) return C_HLS;
+  if (DASH_EXT.has(ext)) return C_DASH;
+  if (AUDIO_EXT.has(ext) || VIDEO_EXT.has(ext)) return C_FILE;
+  return '';
+}
+
+/**
+ * Azure Media Services and similar servers name the format in the path:
+ * ".../x.ism/manifest(format=m3u8-aapl)". Returns "hls", "dash" or "",
+ * or C_SEGMENT for Smooth Streaming (unsupported).
+ */
+export function formatInPath(pathname) {
   const p = decodeURIComponentSafe(pathname).toLowerCase();
   if (/\.isml?\/manifest\(format=m3u8/.test(p)) return C_HLS;
   if (/\.isml?\/manifest\(format=mpd/.test(p)) return C_DASH;

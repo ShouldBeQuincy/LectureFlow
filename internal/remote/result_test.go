@@ -13,7 +13,7 @@ import (
 
 func TestValidateResultKeepsKnownKeys(t *testing.T) {
 	raw := []byte(`{"prompt_terms_used":3,"unknown_top":{"x":[1,2]},"sentences":[
-		{"start_ms":0,"end_ms":1000,"text":"Hello\u0000 world‮.","low_conf_words":[{"i":1,"w":"world"}],
+		{"start_ms":0,"end_ms":1000,"text":"Hello\u0000 world` + "\u202e" + `.","low_conf_words":[{"i":1,"w":"world"}],
 		 "words":[{"w":"Hello","s":0,"e":400},{"w":"world","s":420,"e":1000}],"secret":"dropped"},
 		{"start_ms":1000,"end_ms":2500,"text":"Next."}],
 		"timing":{"load_s":1.5,"transcribe_s":2,"audio_s":3,"postprocess":{"textrepair":{"changed":2}},"list":[1]},
@@ -23,7 +23,7 @@ func TestValidateResultKeepsKnownKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(out)
-	for _, bad := range []string{"unknown_top", "secret", "\u0000", "‮", `"list"`} {
+	for _, bad := range []string{"unknown_top", "secret", "\u0000", "\u202e", `"list"`} {
 		if strings.Contains(s, bad) {
 			t.Fatalf("%q kept: %s", bad, s)
 		}
@@ -84,7 +84,9 @@ func TestValidateResultOfTheFakeWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, res, err := ValidateResult(raw, 0); err != nil || len(res.Sentences) == 0 {
+	// with the fake recording's length (60 s, its last sentence ends there);
+	// a length of 0 is refused since SEC41 L4
+	if _, res, err := ValidateResult(raw, 60000); err != nil || len(res.Sentences) == 0 {
 		t.Fatalf("%v", err)
 	}
 }

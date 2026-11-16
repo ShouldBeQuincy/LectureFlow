@@ -103,10 +103,11 @@ If you have ever felt anxious after missing a class, or kept dragging a progress
 ## Privacy
 
 - **Audio and transcription stay on your computer.** Nothing is uploaded.
-- Only if you set up a model provider is the transcribed text sent to **the provider you chose**, for correction, summaries, and translation. You can also choose "transcription only" and use no online service at all.
+- Only if you set up a model provider is the transcribed text sent to **the provider you chose**, for correction, summaries, and translation; when it works out a lecture's title, the lecture's original file name (for lectures sent from the browser extension, the page or platform title) goes along with the summary. You can also choose "transcription only" and use no online service at all.
 - With the Google Colab backend, your recordings are uploaded to Google's servers; you'll be told clearly when you choose it. LectureFlow also asks Google, with your own authorization, for your Colab account's compute-unit balance and the GPUs you may borrow, and, only while a runtime is in use, for that runtime's memory and GPU readings to show in the resources panel.
 - Saved API keys and your Colab authorization are stored encrypted, protected by your system account (DPAPI on Windows, the Keychain on macOS). If you move the data folder to another computer or user account, you enter them again.
 - LectureFlow collects no usage data. No telemetry, no accounts.
+- Web mode (running the server program directly and opening it in a browser, without the desktop app) has no access token, so other accounts and programs on this computer can reach it (it listens only on this computer's own address, so other computers on your network cannot). On a shared computer, use the desktop app.
 - The browser extension talks only to LectureFlow on your computer, and reads the recording site's cookies only when you send a lecture: see its [privacy policy](docs/extension/privacy.md).
 
 ## Transcription backends
@@ -144,7 +145,7 @@ Status notes: \* may also support doing transcription and translation fully on-d
 
 ## Getting started
 
-1. Download the installer for your system from [Releases](https://github.com/ShouldBeQuincy/LectureFlow/releases): `LectureFlow-Setup-3.2.0-x64.exe` (or the portable build) for Windows, `LectureFlow-3.2.0-arm64.dmg` for Apple Silicon Macs. What's new: [release notes](docs/release-notes/3.2.0.md).
+1. Download the installer for your system from [Releases](https://github.com/ShouldBeQuincy/LectureFlow/releases): `LectureFlow-Setup-3.3.0-x64.exe` (or the portable build) for Windows, `LectureFlow-3.3.0-arm64.dmg` for Apple Silicon Macs. What's new: [release notes](docs/release-notes/3.3.0.md).
 2. The installers are not code-signed yet, so your system will show a security warning. See [docs/install.md](docs/install.md) for how to continue.
 3. Open LectureFlow and follow the short setup guide: choose a language, check your computer, choose a plan, download components. You can skip any step and come back later.
 4. Add a course: give it a name and a start date, and optionally paste the course outline and upload slides (not required, but they noticeably improve accuracy on technical terms).

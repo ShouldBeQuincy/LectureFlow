@@ -43,10 +43,20 @@ export function createDataDirRestrict(opts) {
     busy = true;
     opts.changed();
     try {
-      await api.restrictDataDir();
-      if (alive) toast(t('system.data_dir_restricted'), 'success');
+      const res = await api.restrictDataDir();
+      if (alive) {
+        toast(t('system.data_dir_restricted'), 'success');
+        // the update's rollback state was kept where others could change
+        // it and went with the old permissions (system_datadir.go)
+        if (res && res.rollback_reset) toast(t('system.data_dir_rollback_reset'), 'info');
+      }
     } catch (e) {
-      if (alive) toast(e.message || t('common.load_failed'), 'error');
+      if (alive) {
+        toast(e.message || t('common.load_failed'), 'error');
+        // the state can go although the request then fails (409): the
+        // error body says so next to "error"
+        if (e.body && e.body.rollback_reset) toast(t('system.data_dir_rollback_reset'), 'info');
+      }
     }
     // the row is the server's: read the diagnostics before the button is usable again
     try {

@@ -109,6 +109,10 @@ module.exports = {
     entitlementsInherit: 'packaging/entitlements.mac.plist',
     notarize: macNotarize,
     minimumSystemVersion: macos.minimum_system_version,
+    // ssh-1b: the SSH servers' agent for Linux and Windows (resources/agent,
+    // scripts/stage.js) is no macOS code and is left unsigned; the
+    // darwin-arm64 one is signed like every Mach-O file of the app.
+    signIgnore: ['/Contents/Resources/agent/(linux-x64|windows-x64)/'],
   },
   dmg: {
     artifactName: 'LectureFlow-${version}-arm64.${ext}',

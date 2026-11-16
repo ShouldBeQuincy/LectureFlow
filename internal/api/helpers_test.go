@@ -165,6 +165,12 @@ func newEnvWith(t *testing.T, ec envConfig) *env {
 	return e
 }
 
+// isScriptRun: args run a worker script with flag, as pyenv.ScriptArgs
+// puts it: "-s", the script (*.py), flag, ...
+func isScriptRun(args []string, flag string) bool {
+	return len(args) > 2 && args[0] == "-s" && strings.HasSuffix(args[1], ".py") && args[2] == flag
+}
+
 // fakeCmd stands in for ffmpeg / python in the diagnostics.
 func fakeCmd(_ context.Context, name string, args ...string) (string, string, error) {
 	switch {
@@ -172,11 +178,11 @@ func fakeCmd(_ context.Context, name string, args ...string) (string, string, er
 		return "ffmpeg version 9.0.1-test Copyright\nmore", "", nil
 	case len(args) == 1 && args[0] == "--version":
 		return "Python 3.13.1\n", "", nil
-	case len(args) == 2 && args[0] == "-c":
+	case len(args) == 3 && args[0] == "-I" && args[1] == "-c":
 		return "", "FutureWarning: something\n", nil
-	case len(args) > 1 && args[1] == "--selftest":
+	case isScriptRun(args, "--selftest"):
 		return "SELFTEST ok device=cuda compute_type=float16 load_s=1.0 transcribe_s=0.10 segments=0\n", "", nil
-	case len(args) == 2 && args[1] == "--check-cudnn": // ext-step1
+	case len(args) == 3 && isScriptRun(args, "--check-cudnn"): // ext-step1
 		return "CUDNN ok version=9.1.0\n", "", nil
 	}
 	return "", "unknown", errUnknownCmd

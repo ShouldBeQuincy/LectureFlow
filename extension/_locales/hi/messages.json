@@ -23,7 +23,7 @@
     "message": "LectureFlow से कनेक्ट है"
   },
   "connConnectedVersion": {
-    "message": "LectureFlow $P1$",
+    "message": "कनेक्ट है · $P1$",
     "description": "Connected, with app version",
     "placeholders": {
       "p1": {
@@ -71,12 +71,25 @@
   "noAccess": {
     "message": "एक्सटेंशन यह पेज नहीं पढ़ सकता।"
   },
+  "pageLoading": {
+    "message": "पेज अभी लोड हो रहा है। थोड़ी देर बाद फिर से कोशिश करें।",
+    "description": "Popup: the page did not finish loading before detection gave up waiting"
+  },
   "noTracks": {
     "message": "कोई ट्रैक नहीं मिला"
   },
   "tracksDetected": {
     "message": "मिले ट्रैक: $P1$",
     "description": "Header with the track count",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "tracksDetectedOne": {
+    "message": "मिले ट्रैक: $P1$",
+    "description": "Header with the track count when exactly one track was found (singular where the language needs it)",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -96,7 +109,7 @@
     }
   },
   "sourceGeneric": {
-    "message": "सामान्य डिटेक्शन"
+    "message": "पेज पर मिला"
   },
   "unreviewed": {
     "message": "समीक्षा नहीं हुई",
@@ -126,7 +139,7 @@
     "message": "सुझाया गया"
   },
   "unreadable": {
-    "message": "प्लेलिस्ट पढ़ी नहीं जा सकी"
+    "message": "इस ट्रैक की जानकारी पढ़ी नहीं जा सकी; हो सकता है इसे फ़ेच न किया जा सके"
   },
   "kind_video": {
     "message": "वीडियो"
@@ -180,7 +193,7 @@
     "message": "इस पेज की रिपोर्ट नहीं बन सकी।"
   },
   "reportSaved": {
-    "message": "रिपोर्ट सेव हो गई। शेयर करने से पहले इसे एक बार पढ़ लें।"
+    "message": "रिपोर्ट वहाँ सेव हो गई जहाँ आपका ब्राउज़र फ़ाइलें सेव करता है। यह डेवलपर्स के लिए है, ताकि वे इस साइट को सपोर्ट कर सकें, और यह कभी अपने-आप नहीं भेजी जाती। इसमें संवेदनशील हिस्से छिपाए गए हैं, पर इस साइट का पता बना रहता है; शेयर करने से पहले इसे एक बार पढ़ लें।"
   },
   "finding_email": {
     "message": "कुछ हिस्सा ईमेल पते जैसा दिखता है।"
@@ -219,7 +232,7 @@
     "message": "प्लेटफ़ॉर्म प्रोफ़ाइल"
   },
   "profilesHint": {
-    "message": "प्रोफ़ाइल किसी प्लेटफ़ॉर्म के ट्रैक को नाम देती हैं। ख़ुद इंपोर्ट की गई प्रोफ़ाइल पर “समीक्षा नहीं हुई” लिखा होता है और उन्हें पहले इस्तेमाल किया जाता है।"
+    "message": "प्रोफ़ाइल एक छोटी फ़ाइल होती है, जो एक्सटेंशन को बताती है कि किसी रिकॉर्डिंग प्लेटफ़ॉर्म के ट्रैक क्या कहलाते हैं और डिफ़ॉल्ट रूप से कौन-सा चुनना है; आम प्लेटफ़ॉर्म की प्रोफ़ाइल पहले से शामिल हैं। ख़ुद इंपोर्ट की गई प्रोफ़ाइल पर “समीक्षा नहीं हुई” लिखा होता है और उन्हें पहले इस्तेमाल किया जाता है।"
   },
   "importProfile": {
     "message": "लोकल प्रोफ़ाइल इंपोर्ट करें"
@@ -327,7 +340,7 @@
   },
   "titleGenerated": {
     "message": "शीर्षक LectureFlow देगा",
-    "description": "Generic detection reads no title"
+    "description": "No title to show: the page has none, or only a placeholder or the site name; LectureFlow names the lecture"
   },
   "durationMinutes": {
     "message": "$P1$ मिनट",
@@ -367,7 +380,7 @@
     "description": "Course select label"
   },
   "courseNone": {
-    "message": "LectureFlow में अभी कोई कोर्स नहीं है। पहले LectureFlow में एक कोर्स बनाएँ।",
+    "message": "LectureFlow में अभी कोई कोर्स नहीं है।",
     "description": "No courses"
   },
   "sendButton": {
@@ -393,6 +406,15 @@
   "selectTrack": {
     "message": "$P1$ चुनें",
     "description": "Checkbox label",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "trackOnHost": {
+    "message": "$P1$ पर",
+    "description": "Track list: in a track’s small line, after its kind and quality, when the track is on another site than the page (EU-03; AUD3 中-1). $P1$ is a host name such as media.example.net (never a path)",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -448,7 +470,7 @@
     "description": "Fetch task state"
   },
   "state_failed": {
-    "message": "फ़ेच विफल",
+    "message": "विफल",
     "description": "Fetch task state"
   },
   "state_needs_refresh": {
@@ -587,7 +609,7 @@
     "description": "Options section"
   },
   "reportsHint": {
-    "message": "प्रोफ़ाइल लिखने या सुधारने के लिए निजी जानकारी हटाई गई डिटेक्शन रिपोर्ट एक्सपोर्ट करें। किसी रिकॉर्डिंग पेज पर एक बार एक्सटेंशन के आइकन पर क्लिक करने के बाद वह पेज यहाँ दिखेगा।",
+    "message": "डिटेक्शन रिपोर्ट डेवलपर्स के लिए एक फ़ाइल है, जिससे LectureFlow किसी नई रिकॉर्डिंग साइट को सपोर्ट कर सके या मौजूदा सपोर्ट बेहतर हो सके (प्रोफ़ाइल लिखकर)। रिपोर्ट में संवेदनशील हिस्से छिपाए जाते हैं: इसमें कुकी नहीं होतीं; पतों में साइट का नाम और पाथ रहते हैं (पाथ की लंबी आईडी उसी ढाँचे के नकली मानों से बदल दी जाती हैं), और पैरामीटर-मान प्लेसहोल्डर से बदल दिए जाते हैं; लेक्चर के शीर्षक जैसे पेज के टेक्स्ट का सिर्फ़ ढाँचा रहता है; अगर कुछ भी निजी जानकारी जैसा लगे, तो रिपोर्ट एक्सपोर्ट नहीं होती। कुछ भी अपने-आप नहीं भेजा जाता; शेयर करने से पहले इसे एक बार पढ़ लें। किसी रिकॉर्डिंग पेज पर एक बार एक्सटेंशन के आइकन पर क्लिक करने के बाद वह पेज यहाँ दिखेगा।",
     "description": "Options: reports"
   },
   "reportsEmpty": {
@@ -597,6 +619,18 @@
   "reportRow": {
     "message": "$P1$ · ट्रैक: $P2$",
     "description": "Options: one page",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "reportRowOne": {
+    "message": "$P1$ · ट्रैक: $P2$",
+    "description": "Options: one page with exactly one track (singular where the language needs it)",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -771,6 +805,15 @@
   "chooseTracks": {
     "message": "ट्रैक चुनें… ($P1$)",
     "description": "Opens the full track list",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "tracksHidden": {
+    "message": "नहीं दिखाए गए ट्रैक (बहुत ज़्यादा होने के कारण): $P1$",
+    "description": "Track list: how many tracks are left out because the page gave too many to list (they cannot be chosen); $1 is a number",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -1016,6 +1059,47 @@
     "message": "इस्तेमाल में नहीं: id बिल्ट-इन प्रोफ़ाइल जैसी ही है। फ़ाइल दोबारा इंपोर्ट करें और पुष्टि करें।",
     "description": "Settings: chip on a local profile with a built-in profile’s id that was never confirmed"
   },
+  "profileInvalid": {
+    "message": "इस्तेमाल में नहीं: ख़ुद इंपोर्ट की गई यह प्रोफ़ाइल अब जाँच में पास नहीं होती ($P1$)। फ़ाइल ठीक करके दोबारा इंपोर्ट करें।",
+    "description": "Settings: chip on a local profile that no longer passes the profile checks (for example a sessionInfo POST stored before local profiles were limited to GET); $1 is the first problem, as \"path message\" in English",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "profileTooSlow": {
+    "message": "इस्तेमाल में नहीं: नियम $P1$ का मिलान बहुत धीमा रहा ($P2$ ms)। फ़ाइल ठीक करके दोबारा इंपोर्ट करें।",
+    "description": "Settings: chip on a local profile stopped by the runtime regex guard (one match too slow, or too much time in all); $1 is the place of the rule in the file (\"/tracks/1/detect/urlPattern\"), $2 the milliseconds",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "profileTooSlowBuiltin": {
+    "message": "इस्तेमाल में नहीं: बिल्ट-इन प्रोफ़ाइल के नियम $P1$ का मिलान इस कंप्यूटर पर बहुत धीमा रहा ($P2$ ms)। यह LectureFlow की गड़बड़ी है, कृपया हमें बताएँ। एक्सटेंशन अपडेट होने पर इसे फिर से आज़माया जाएगा।",
+    "description": "Settings: chip on a built-in profile stopped by the runtime regex guard (several slow matches, or one very slow); $1 is the place of the rule, $2 the milliseconds",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "profileReenable": {
+    "message": "फिर से चालू करें",
+    "description": "Settings: button on a built-in profile stopped as too slow: use it again"
+  },
+  "policyStopped": {
+    "message": "पाबंदी का पता नहीं: प्रोफ़ाइल बहुत धीमी थी, इसलिए बंद कर दी गई",
+    "description": "Popup and in-page card: chip when the runtime regex guard stopped the platform profile during this detection, so the restriction switch could not be read"
+  },
   "embedWhy": {
     "message": "यह रिकॉर्डिंग पेज $P1$ के एक पेज में एम्बेड है। ताकि कोई दूसरी साइट धोखे से आपसे क्लिक न करवा सके, इस विंडो में पुष्टि करें।",
     "description": "Confirmation window: why it opened; $1 is the site the recording page is embedded in (an origin)",
@@ -1054,5 +1138,119 @@
   "errConfirmWindow": {
     "message": "LectureFlow की पुष्टि वाली विंडो से भेजें।",
     "description": "Error: this frame must confirm in the extension’s window"
+  },
+  "openApp": {
+    "message": "LectureFlow खोलें",
+    "description": "Popup, not connected: LectureFlow is installed but not running; the button starts it (T26 G1)"
+  },
+  "discNotOpen": {
+    "message": "LectureFlow इंस्टॉल है, पर अभी खुला नहीं है। इसे शुरू करने के लिए “LectureFlow खोलें” पर क्लिक करें, या अगर आपने इसे ख़ुद खोल लिया है तो “फिर से जाँचें” पर क्लिक करें।",
+    "description": "Popup, not connected: LectureFlow is installed but not running; opening the popup does not start it (T26 G1). Quotes openApp (starts it) and connRecheck (only looks again; SEC42 低-2)"
+  },
+  "failNetwork": {
+    "message": "नेटवर्क में दिक्कत की वजह से फ़ेच पूरा नहीं हुआ। इंटरनेट वापस आने पर LectureFlow में “फिर कोशिश करें” पर क्लिक करें; फ़ेच वहीं से आगे चलेगा।",
+    "description": "Queued view: the fetch failed for the network (retryable; T26 G3). “Retry” is LectureFlow’s button (downloads.action.retry)"
+  },
+  "failDisk": {
+    "message": "डिस्क में जगह कम है, या फ़ेच की गई फ़ाइलें लिखी नहीं जा सकीं। कुछ जगह खाली करें या LectureFlow के डेटा फ़ोल्डर वाली डिस्क जाँचें, फिर LectureFlow में “फिर कोशिश करें” पर क्लिक करें।",
+    "description": "Queued view: the fetch failed for the disk (no space, or not writable; retryable; T26 G3)"
+  },
+  "failEngineMissing": {
+    "message": "LectureFlow का बिल्ट-इन फ़ेच टूल नहीं मिला। LectureFlow फिर से इंस्टॉल करें, फिर LectureFlow में “फिर कोशिश करें” पर क्लिक करें।",
+    "description": "Queued view: the fetch failed because LectureFlow’s aria2c is missing (retryable after a reinstall; T26 G3)"
+  },
+  "failUnsupported": {
+    "message": "यह ट्रैक लाइव स्ट्रीम है या ऐसे फ़ॉर्मेट में है जिसे LectureFlow अभी सपोर्ट नहीं करता, इसलिए इसे फ़ेच नहीं किया जा सकता और दोबारा कोशिश करने से भी कुछ नहीं होगा। अगर इस पेज पर दूसरे ट्रैक हैं, तो उनमें से कोई एक भेजें।",
+    "description": "Queued view: a live stream or an unsupported format (not retryable; T26 G3)"
+  },
+  "failUnsafeAddress": {
+    "message": "इस लेक्चर के ट्रैक के पते इसी कंप्यूटर या इसके लोकल नेटवर्क की ओर जाते हैं, या उन्हें सुरक्षित रूप से जाँचा नहीं जा सकता, इसलिए सुरक्षा के लिए LectureFlow ने फ़ेच करने से मना कर दिया। दोबारा कोशिश करने से कुछ नहीं होगा।",
+    "description": "Queued view: the tracks’ addresses lead to this computer, the local network, or cannot be checked (not retryable; T26 G3)"
+  },
+  "failAngle": {
+    "message": "दूसरी फ़ीड में वीडियो नहीं है, इसलिए इसे दूसरे कैमरा एंगल के रूप में सेव नहीं किया जा सकता। “मुख्य ऑडियो और वीडियो” चुनकर लेक्चर फिर से भेजें।",
+    "description": "Queued view: the second picture has no video (not retryable; T26 G3). Quotes presetMain"
+  },
+  "failTooLarge": {
+    "message": "यह रिकॉर्डिंग एक फ़ेच की आकार-सीमा से बड़ी है, इसलिए इसे फ़ेच नहीं किया जा सकता। हो सकता है यह लाइव स्ट्रीम हो, या सर्वर लगातार डेटा भेजता जा रहा हो। अगर इस पेज पर दूसरे ट्रैक हैं, तो उनमें से कोई एक भेजें।",
+    "description": "Queued view: the recording is over the size one fetch may hold (downloads.too_large; a live stream, or a server that keeps sending; not retryable, so no “Retry”; C165b)"
+  },
+  "failNotMedia": {
+    "message": "जो फ़ेच हुआ वह रिकॉर्डिंग नहीं है (शायद साइन-इन या एरर पेज), इसलिए दोबारा कोशिश करने से कुछ नहीं होगा। पक्का करें कि लेक्चर अपने पेज पर चल रहा है, फिर इसे दोबारा भेजें।",
+    "description": "Queued view: what was fetched is not a recording (an empty file, a web page, a playlist, a refused format; not retryable; T26 G3)"
+  },
+  "failedCode": {
+    "message": "फ़ेच पूरा नहीं हुआ (कोड $P1$)। LectureFlow में इसका कारण देखकर फिर कोशिश कर सकते हैं।",
+    "description": "Queued view: the fetch failed with a code this version does not know (LectureFlow treats it as retryable; T26 G3)",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "failEmbeddedHint": {
+    "message": "अगर रिकॉर्डिंग किसी दूसरी साइट में एम्बेड की गई है, तो प्लेयर का अपना पेज खोलें और वहाँ से इसे फिर से भेजें।",
+    "description": "Added after the failed note or the needs_refresh text when the platform refused the fetch (401 / 403) and the lecture may have been sent from a page that embeds the player (EU-02; SEC46 低-3): the cookies it needs may only reach the player’s own page"
+  },
+  "errOpenGone": {
+    "message": "LectureFlow में अब यह लेक्चर या यह फ़ेच नहीं है: शायद इसे डिलीट कर दिया गया है या हटा दिया गया है।",
+    "description": "“Open in LectureFlow”: the lecture was deleted or the task removed (open.not_found; T26 G3)"
+  },
+  "presetUnavailable": {
+    "message": "“$P1$” नहीं चुना जा सकता: $P2$।",
+    "description": "Send card, under the three choices: why one cannot be chosen (T26 G4). $P1$ is the choice (presetDual…), $P2$ its reason (presetDualNone…, no final full stop)",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "bulkRefreshNote": {
+    "message": "रीफ़्रेश ज़रूरी: $P1$। इन्हें यहाँ नहीं चुना जा सकता; फ़ेच जारी रखने के लिए सूची में उनकी पंक्ति पर “LectureFlow को भेजें” पर क्लिक करें।",
+    "description": "Bulk card: lectures whose fetch needs a refresh cannot be ticked; each is resumed from its own row’s button (T26 G5). Quotes sendButton; $P1$ is how many",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "bulkWaiting": {
+    "message": "आपकी पुष्टि का इंतज़ार…",
+    "description": "Bulk card button while the reminder before sending restricted recordings is open: nothing is sent yet (T26 G6)"
+  },
+  "connectingApp": {
+    "message": "LectureFlow से कनेक्ट हो रहा है…",
+    "description": "Popup and cards: the tracks are found, waiting for LectureFlow to answer (T26 G7)"
+  },
+  "launchingApp": {
+    "message": "LectureFlow शुरू हो रहा है…",
+    "description": "Popup: the user clicked “Open LectureFlow”; it is being started (T26 G7)"
+  },
+  "discRegister": {
+    "message": "पहले से इंस्टॉल है और खुला है? LectureFlow में “डायग्नॉस्टिक्स” खोलें, “ब्राउज़र एक्सटेंशन कनेक्शन” ढूँढें, “फिर से रजिस्टर करें” पर क्लिक करें, फिर यहाँ लौटकर “फिर से जाँचें” पर क्लिक करें।",
+    "description": "Not connected, “not found”: the browser’s registration may be broken; LectureFlow’s Diagnostics page (nav.system) › Browser extension connection (common.check.browser_ext) › Register again (system.ext.register) fixes it (T26 G8). Quotes connRecheck"
+  },
+  "courseCreate": {
+    "message": "LectureFlow में “कोर्स जोड़ें” पर क्लिक करके एक कोर्स बनाएँ, फिर “फिर से जाँचें” पर क्लिक करें।",
+    "description": "No course in LectureFlow yet: where to make one (nav.add_course), then the button beside it (T26 G9). Quotes connRecheck"
+  },
+  "doneTitle": {
+    "message": "फ़ेच पूरा हुआ",
+    "description": "Queued view title once the fetch is done and the lecture made (T26 J2)"
+  },
+  "failedTitle": {
+    "message": "फ़ेच पूरा नहीं हुआ",
+    "description": "Queued view title when the fetch failed (T26 J2)"
+  },
+  "closeHintCard": {
+    "message": "आप यह कार्ड बंद कर सकते हैं; फ़ेच LectureFlow में चलता रहेगा।",
+    "description": "In-page card, queued: the card may be closed (closeHint says “window”, for the popup and the confirmation window; T26 J2)"
+  },
+  "exportReportHint": {
+    "message": "डेवलपर्स के लिए एक फ़ाइल बनाता है, जिससे LectureFlow इस रिकॉर्डिंग साइट को सपोर्ट कर सके; कुछ भी अपने-आप नहीं भेजा जाता। फ़ाइल में संवेदनशील हिस्से छिपाए जाते हैं: इसमें कुकी नहीं होतीं; पतों में साइट का नाम और पाथ रहते हैं (पाथ की लंबी आईडी उसी ढाँचे के नकली मानों से बदल दी जाती हैं), और आईडी, सिग्नेचर व दूसरे पैरामीटर-मान प्लेसहोल्डर से बदल दिए जाते हैं; लेक्चर के शीर्षक जैसे पेज के टेक्स्ट का सिर्फ़ ढाँचा रहता है। अगर कुछ भी निजी जानकारी जैसा लगे, तो फ़ाइल एक्सपोर्ट नहीं होती। शेयर करने से पहले इसे एक बार पढ़ लें।",
+    "description": "Tooltip of the popup’s “Export detection report”: what it is, for whom, what the redaction does (src/lib/redact.js, report.js; T26 G14, SEC42 低-5: no promise beyond what it does)"
   }
 }

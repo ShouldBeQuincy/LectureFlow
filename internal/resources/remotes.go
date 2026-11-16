@@ -7,9 +7,12 @@ package resources
 // Colab's card is built from its Status (Deps.Remote) and the scheduler's
 // colab:remote row (which lecture each running job is, its title as the
 // device cards show it). The Service's build adds them next to
-// Snapshot.Remote: snap.Remotes = remoteCards(remote, devIn).
+// Snapshot.Remote: snap.Remotes = remoteCards(remote, devIn). ssh-1b: the
+// SSH servers' cards (Deps.RemoteCards, sshremote's) follow it, their
+// running lectures titled as the device cards title them.
 
 import (
+	"context"
 	"math"
 
 	"lectureflow/internal/colab"
@@ -43,7 +46,7 @@ func ColabCard(st colab.Status, running []sched.RunningASR, titles map[string]mo
 		lecture[r.JobID] = r.LectureID
 	}
 	for _, j := range st.Jobs {
-		cj := remote.CardJob{LectureID: lecture[j.JobID], JobID: j.JobID, Stage: cardStage(j), Split: j.Split}
+		cj := remote.CardJob{LectureID: lecture[j.JobID], JobID: j.JobID, Stage: cardStage(j), Split: j.Split, Reconnect: j.Reconnect}
 		cj.LectureTitle = titles[cj.LectureID].Title
 		p := math.Max(0, math.Min(1, j.Overall))
 		cj.Progress = &p
@@ -81,6 +84,33 @@ func cardStage(j colab.JobInfo) string {
 		return "verify"
 	}
 	return "wait"
+}
+
+// remoteCard names remote.Card where build's local variable "remote" (the
+// Colab status) hides the package.
+type remoteCard = remote.Card
+
+// titledCards gives the SSH servers' running lectures their titles (ssh-1b):
+// the ones the device cards show (titles), else read from the store.
+func (s *Service) titledCards(ctx context.Context, cards []remote.Card, titles map[string]model.Lecture) []remote.Card {
+	for i := range cards {
+		for j := range cards[i].Jobs {
+			cj := &cards[i].Jobs[j]
+			if cj.LectureTitle != "" || cj.LectureID == "" {
+				continue
+			}
+			l, ok := titles[cj.LectureID]
+			if !ok && s.d.Store != nil {
+				if got, err := s.d.Store.GetLecture(ctx, cj.LectureID); err == nil {
+					l, ok = got, true
+				}
+			}
+			if ok {
+				cj.LectureTitle = l.Title
+			}
+		}
+	}
+	return cards
 }
 
 // Clients is the number of connected SSE clients (SetClients): Colab reads

@@ -82,7 +82,7 @@ func provider(id, key string) model.Provider {
 
 func rawKey(t *testing.T, st *sqlStore, id string) string {
 	t.Helper()
-	v, err := st.storedProviderKey(context.Background(), id)
+	v, _, err := st.storedProviderKey(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestCredentialsSealedAtRest(t *testing.T) {
 		t.Fatalf("SetSecretKV stored %q", raw)
 	}
 	// a value sealed already is not sealed twice
-	pre, _ := secrets.Seal([]byte("pre-sealed"))
+	pre, _ := secrets.SealFor(SealPurposeKV, "colab.credential", []byte("pre-sealed"))
 	if err := st.SetKV(ctx, "colab.credential", pre); err != nil || rawKV(t, st, "colab.credential") != pre {
 		t.Fatalf("pre-sealed value changed: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestSealStoredSecretsMigration(t *testing.T) {
 
 func assertNoSecretInLogs(t *testing.T, out string, st *sqlStore, ids ...string) {
 	t.Helper()
-	for _, needle := range []string{fakeKeyA, fakeKeyB, fakeKeyC, testRefresh, testSecret, secrets.Prefix} {
+	for _, needle := range []string{fakeKeyA, fakeKeyB, fakeKeyC, testRefresh, testSecret, secrets.Prefix, secrets.PrefixV2} {
 		if strings.Contains(out, needle) {
 			t.Errorf("the log holds %q:\n%s", needle, out)
 		}
@@ -361,13 +361,13 @@ func TestSealStoredSecretsReseals(t *testing.T) {
 	if err != nil || res.Resealed != 3 || res.Sealed != 0 || res.Unreadable != 0 {
 		t.Fatalf("%+v %v", res, err)
 	}
-	if b, err := secrets.Open(rawKV(t, st, "remote.ssh.key.s1")); err != nil || !strings.HasPrefix(string(b), "-----BEGIN") {
-		t.Fatalf("the owner-sealed row was not sealed again: %v", err)
+	if b, err := secrets.OpenFor(SealPurposeKV, "remote.ssh.key.s1", rawKV(t, st, "remote.ssh.key.s1")); err != nil || !strings.HasPrefix(string(b), "-----BEGIN") {
+		t.Fatalf("the owner-sealed row was not sealed again (bound to its row): %v", err)
 	}
 	if rawKV(t, st, "app.locale") != "en" {
 		t.Fatal("a plain row was touched")
 	}
-	if b, err := secrets.OpenWith(dataKey(6), rawKey(t, st, "p1")); err != nil || string(b) != fakeKeyA {
+	if b, err := secrets.OpenWithFor(dataKey(6), SealPurposeProviderKey, ProviderKeyBinding("p1", "https://llm.example.org"), rawKey(t, st, "p1")); err != nil || string(b) != fakeKeyA {
 		t.Fatalf("not sealed with the current key: %v", err)
 	}
 	if got := fileHolds(t, path, old[len(secrets.Prefix):len(secrets.Prefix)+24]); len(got) > 0 {
@@ -401,7 +401,7 @@ func TestSealSecretsExtraKeys(t *testing.T) {
 	if err := d.QueryRow(`SELECT api_key FROM provider WHERE id = 'p1'`).Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
-	if b, _, err := secrets.OpenAny(raw); err != nil || string(b) != fakeKeyA {
+	if b, cur, err := secrets.OpenAnyFor(SealPurposeProviderKey, ProviderKeyBinding("p1", "https://llm.example.org"), raw); err != nil || !cur || string(b) != fakeKeyA {
 		t.Fatalf("resealed: %v", err)
 	}
 	empty, err := openRaw(filepath.Join(t.TempDir(), "empty.db"))
@@ -507,6 +507,9 @@ func TestScrubSecrets(t *testing.T) {
 	if err := st.SetKV(ctx, "remote.ssh.key.s1", secrets.Prefix+"c2VhbGVkLWJ5LWl0cy1vd25lcg"); err != nil { // sealed by its owner
 		t.Fatal(err)
 	}
+	if err := st.SetKV(ctx, "remote.ssh.key.s2", secrets.PrefixV2+"Ym91bmQtYnktaXRzLW93bmVy"); err != nil { // bound (sec3 L3)
+		t.Fatal(err)
+	}
 	st.Close()
 	d, err := openRaw(path)
 	if err != nil {
@@ -522,7 +525,7 @@ func TestScrubSecrets(t *testing.T) {
 	if err := d.QueryRow(`SELECT count(*) FROM provider`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("providers: %d %v", n, err)
 	}
-	if err := d.QueryRow(`SELECT count(*) FROM kv WHERE key = 'remote.ssh.key.s1'`).Scan(&n); err != nil || n != 0 {
+	if err := d.QueryRow(`SELECT count(*) FROM kv WHERE key LIKE 'remote.ssh.key.%'`).Scan(&n); err != nil || n != 0 {
 		t.Fatalf("an owner-sealed row was kept: %d %v", n, err)
 	}
 	if err := d.QueryRow(`SELECT count(*) FROM kv WHERE key LIKE 'filler.%'`).Scan(&n); err != nil || n == 0 {

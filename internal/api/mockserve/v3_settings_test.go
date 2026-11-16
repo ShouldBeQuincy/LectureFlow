@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,6 +40,15 @@ func TestMockAppSettingsSection(t *testing.T) {
 	oldCopy, oldVerify, oldGap := setCopyDuration, setVerifyDuration, setRestartGap
 	setCopyDuration, setVerifyDuration, setRestartGap = 200*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond
 	t.Cleanup(func() { setCopyDuration, setVerifyDuration, setRestartGap = oldCopy, oldVerify, oldGap })
+	// The move's clock is stepped by the test, 20 ms per poll: polling the
+	// wall clock, a loaded machine could sleep past the 100 ms verifying or
+	// restart window and miss that state (flaky under go test -p 4).
+	var clockMu sync.Mutex
+	clock := time.Date(2026, 11, 11, 9, 0, 0, 0, time.UTC)
+	oldNow := setNow
+	setNow = func() time.Time { clockMu.Lock(); defer clockMu.Unlock(); return clock }
+	t.Cleanup(func() { setNow = oldNow })
+	advance := func(d time.Duration) { clockMu.Lock(); clock = clock.Add(d); clockMu.Unlock() }
 	srv := testServer(t)
 	u := srv.URL
 
@@ -58,8 +68,8 @@ func TestMockAppSettingsSection(t *testing.T) {
 		t.Fatalf("move: %d %s", code, b)
 	}
 	seen := map[string]bool{}
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
+	deadline := setNow().Add(3 * time.Second)
+	for setNow().Before(deadline) {
 		code, b, _ = mockDo(t, "GET", u+"/api/app/data-dir?mock=1", "")
 		if code == 503 {
 			seen["restart"] = true
@@ -76,7 +86,7 @@ func TestMockAppSettingsSection(t *testing.T) {
 				break
 			}
 		}
-		time.Sleep(20 * time.Millisecond)
+		advance(20 * time.Millisecond)
 	}
 	if !seen["copying"] || !seen["verifying"] || !seen["restart"] || !seen["idle"] {
 		t.Errorf("states seen: %v", seen)

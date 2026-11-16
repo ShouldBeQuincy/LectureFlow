@@ -1,0 +1,13 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
+-- Copyright (C) 2026 LectureFlow contributors. Licensed under the GNU AGPL v3 or later; see LICENSE.
+-- Schema marker (round 2, N33): no table changes. This version seals the
+-- credentials in the bound format (enc:v2:), which LectureFlow 3.2.0
+-- (schema 14) does not know. Raising user_version to 15 makes 3.2.0 refuse
+-- the database as one from a newer version (NewerSchemaError,
+-- startup.data_dir_newer) instead of misreading the sealed values. Going
+-- back to an older version needs the backup made before this upgrade (it
+-- holds no credential), and the keys entered again.
+-- The body is one statement with no effect: Migrate runs it with
+-- ExecContext inside the migration's transaction, which steps it and
+-- discards its row.
+SELECT 1;

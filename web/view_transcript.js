@@ -11,7 +11,7 @@
 // Chinese and waits for a model provider, the Chinese column is hidden.
 
 import { api } from './api.js';
-import { h, clear, toast, preserveFocus, copyText, errorBlock } from './dom.js';
+import { h, clear, toast, preserveFocus, copyText, errorBlock, focusOpener } from './dom.js';
 import { icon } from './icons.js';
 import { bindContextMenu, menuButton } from './menu.js';
 import * as Clip from './audiobar.js';
@@ -20,6 +20,8 @@ import * as U from './util.js';
 import { t } from './i18n.js';
 import { zh as zhText, zhLang, zhQuery, markNeedles } from './zh_display.js';
 import { englishOnly } from './lecture_english.js';
+import { canRetranslateCurrent, retranslateCurrent, heldToast } from './retranslate_current.js';
+import { retranslateWatch, translationHeld } from './retranslate_watch.js';
 
 const PAGE = 200;
 const enc = encodeURIComponent;
@@ -56,6 +58,22 @@ export function refTime(ms) {
 
 export function citeRef(course, label, ms) {
   return `${coursePart(course)} ${label}@${refTime(ms)}`;
+}
+
+/**
+ * copyText that leaves the focus where it was (T23 serious 3). With the
+ * clipboard API refused (a window without the focus) dom.js copies through
+ * a hidden text field, which takes the focus and, removed, leaves it on the
+ * page's body: a keyboard user lost their place in the sentences. When the
+ * focus is lost so, it goes back as from a closed dialog (dom.js
+ * focusOpener: the same element, else the one with its data-fkey).
+ */
+export async function copyKeepingFocus(text) {
+  const back = focusOpener();
+  const ok = await copyText(text);
+  const a = document.activeElement;
+  if (!a || a === document.body || !a.isConnected) back();
+  return ok;
 }
 
 // ---- marks: colour + shape (A12.1: never colour alone) ----
@@ -96,6 +114,7 @@ export function mountTranscript(root, lecture, ctx) {
   let searchTimer = null;
   let changedTimer = null;
   let barKey = null; // clip whose bar is shown (Clip.currentKey())
+  const retranslated = retranslateWatch(); // "translate again" asked: the translation it had (T25 S3)
 
   // Paging and refreshes run one after another, never interleaved.
   const serial = (fn) => (chain = chain.then(fn, fn));
@@ -212,13 +231,61 @@ export function mountTranscript(root, lecture, ctx) {
 
   function loadMore(manual) {
     if (loading || allLoaded() || (loadFailed && !manual)) return;
+    if (!moreFocused && document.activeElement === moreBtn) {
+      let kb = true;
+      try {
+        kb = typeof moreBtn.matches !== 'function' || moreBtn.matches(':focus-visible');
+      } catch {
+        kb = true;
+      }
+      moreFocused = kb ? 'kb' : 'mouse';
+      document.addEventListener('pointerdown', dropMoreFocus, true);
+    }
     loading = true;
     loadFailed = false;
     updateFooter();
     serial(doLoadMore);
   }
 
+  // "加载更多" had the focus when the page was asked for: it is disabled
+  // while the page loads and hidden after the last one, and the focus would
+  // be left on the page (T6 #5). Once loaded it goes back to the button, or,
+  // the button gone, to the first sentence just loaded (its time, the row's
+  // first control), else the last sentence shown — from the keyboard only:
+  // a mouse user's Space would then play that sentence instead of scrolling
+  // (R29); the button gone, their focus stays on the page as before. Focus
+  // moved elsewhere meanwhile stays, and so does a pointer press anywhere
+  // meanwhile (the user went on: the focus is theirs).
+  let moreFocused = false; // false | 'kb' | 'mouse'
+  function dropMoreFocus() {
+    moreFocused = false;
+    document.removeEventListener('pointerdown', dropMoreFocus, true);
+  }
+  function settleMoreFocus(firstNew) {
+    const how = moreFocused;
+    dropMoreFocus();
+    if (!how) return;
+    const a = document.activeElement;
+    if (a && a !== moreBtn && a !== document.body && a !== document.documentElement) return;
+    if (!moreBtn.hidden && !moreBtn.disabled) {
+      if (a !== moreBtn) moreBtn.focus({ preventScroll: true });
+      return;
+    }
+    if (how !== 'kb') return;
+    const shownRow = (r) => r && !r.hidden;
+    let row = firstNew != null && shownRow(rows.get(firstNew)) ? rows.get(firstNew) : null;
+    // the first new sentence stands where the button was (on screen): no
+    // scrolling. The last one shown instead (a filter hid every new one)
+    // may be far off screen: the browser scrolls it into view, so the
+    // focus is not on something the user cannot see (R29 detail b)
+    const isNew = !!row;
+    for (let i = sentences.length - 1; !row && i >= 0; i--) if (shownRow(rows.get(sentences[i].idx))) row = rows.get(sentences[i].idx);
+    const ts = row && row.querySelector('.ts');
+    if (ts) ts.focus(isNew ? { preventScroll: true } : undefined);
+  }
+
   async function doLoadMore() {
+    let firstNew = null;
     try {
       const page = await api.sentences(lec.id, sentences.length, PAGE);
       if (!alive || !page) return;
@@ -231,6 +298,7 @@ export function mountTranscript(root, lecture, ctx) {
         const row = renderRow(s);
         rows.set(s.idx, row);
         listEl.append(row);
+        if (firstNew == null) firstNew = s.idx;
       }
     } catch (e) {
       loadFailed = true;
@@ -241,6 +309,7 @@ export function mountTranscript(root, lecture, ctx) {
         updateFooter();
         applyFilter(false);
         renderState();
+        settleMoreFocus(firstNew);
         // Keep filling while the bottom is still on screen.
         if (!loadFailed && !allLoaded() && !query.trim() && inView(sentinel)) setTimeout(() => loadMore(false), 0);
       }
@@ -289,6 +358,7 @@ export function mountTranscript(root, lecture, ctx) {
       preserveFocus(() => {
         for (let i = 0; i < fresh.length; i++) {
           const s = fresh[i];
+          retranslated.seen(s); // T25 S3: the same translation back is said
           if (i < sentences.length) {
             if (JSON.stringify(sentences[i]) !== JSON.stringify(s)) {
               sentences[i] = s;
@@ -507,6 +577,8 @@ export function mountTranscript(root, lecture, ctx) {
                 title: mark.title,
                 'aria-label': t(open ? 'transcript.mark.aria_collapse' : 'transcript.mark.aria_expand', { label: mark.label }),
                 'aria-expanded': open ? 'true' : 'false',
+                // C1: the details the button shows (only there while open)
+                'aria-controls': open ? detailId(s.idx) : null,
                 dataset: { fkey: `mk:${s.idx}` },
                 onclick: () => toggleExpand(s.idx),
               },
@@ -568,13 +640,17 @@ export function mountTranscript(root, lecture, ctx) {
     return h('div', { class: 's-zh' }, h('span', { class: 's-zh-text', lang: zhLang() }, highlightZh(s.zh, q)));
   }
 
+  function detailId(idx) {
+    return `s-detail-${idx}`;
+  }
+
   function detail(s) {
     const p = s.patch;
     const mark = markFor(s);
     const line = (label, ...content) => h('div', { class: 'd-line' }, h('span', { class: 'd-k' }, label), h('div', { class: 'd-v' }, content));
     return h(
       'div',
-      { class: 's-detail' },
+      { class: 's-detail', id: detailId(s.idx) },
       line(t('transcript.detail.asr_vs_current'), s.asr_text === s.text ? h('span', { class: 'muted' }, t('transcript.detail.same')) : h('span', { class: 'd-diff' }, diffView(s.asr_text, s.text))),
       p ? line(t('transcript.detail.class'), h('span', { class: `d-mark mk-${p.class}` }, glyph(p.class, mark && mark.hollow), markName(p.class)), h('span', { class: 'muted' }, ` ${U.CLASS_HINTS[p.class] || ''}`)) : null,
       p ? line(t('player.side.reason'), p.reason ? h('span', { lang: 'en' }, p.reason) : t('review.no_reason')) : null,
@@ -597,7 +673,7 @@ export function mountTranscript(root, lecture, ctx) {
     const can = lec.reviewable;
     // done: the toast text after a successful copy
     const copy = async (text, done) => {
-      const ok = await copyText(text);
+      const ok = await copyKeepingFocus(text);
       toast(ok ? done : t('common.copy_failed'), ok ? 'success' : 'warn');
     };
     return [
@@ -610,6 +686,7 @@ export function mountTranscript(root, lecture, ctx) {
       can ? { label: t('player.menu.edit'), icon: 'pencil', onSelect: () => startEdit(s.idx) } : null,
       can && s.human_text != null ? { label: t('player.menu.reset'), icon: 'undo-2', hint: t('player.menu.reset_hint'), onSelect: () => sentenceOp(s.idx, 'reset') } : null,
       can && (s.zh_status === 'ok' || s.zh_status === 'qa_failed') ? { label: t('player.menu.retranslate'), icon: 'languages', onSelect: () => sentenceOp(s.idx, 'retranslate') } : null,
+      can && canRetranslateCurrent(s) ? { label: t('player.menu.retranslate_current'), icon: 'languages', hint: t('player.menu.retranslate_current_hint'), onSelect: () => retranslateCurrentOp(s.idx) } : null,
       'sep',
       // SPEC-v2 P1: one second before the sentence
       lec.playable ? { label: t('player.entry.open_in_player'), icon: 'external-link', onSelect: () => (location.hash = `#/play/${enc(lec.id)}?t=${Math.max(0, s.start_ms - 1000)}`) } : null,
@@ -655,11 +732,21 @@ export function mountTranscript(root, lecture, ctx) {
     if (b) b.focus();
   }
 
+  // R78b medium 2: while the lecture's translation is held (stale, failed,
+  // cancelled) an edit or "translate again" waits for its next run; the
+  // texts say so instead of promising a translation now
+  const held = () => translationHeld(lec);
+
   function editBox(s) {
+    // round 9 WV-02 (T28 suggestion 4): the two notes of the box describe
+    // it (one edit box at a time; the ids carry its sentence all the same)
+    const hintId = `tx-edit-${s.idx}-hint`;
+    const zhNoteId = `tx-edit-${s.idx}-zh-note`;
     const ta = h('textarea', {
       class: 'input s-edit-ta',
       rows: '2',
       'aria-label': t('transcript.edit.aria', { n: s.idx + 1 }),
+      'aria-describedby': `${hintId} ${zhNoteId}`,
       dataset: { fkey: `edit:${s.idx}` },
     });
     ta.value = editing.draft;
@@ -685,8 +772,10 @@ export function mountTranscript(root, lecture, ctx) {
         { class: 's-edit-actions' },
         h('button', { type: 'button', class: 'btn btn-sm btn-primary', disabled: !lec.reviewable, onclick: () => saveEdit(s.idx) }, t('common.save')),
         h('button', { type: 'button', class: 'btn btn-sm', onclick: () => endEdit(s.idx) }, t('common.cancel')),
-        h('span', { class: 'muted small' }, lec.reviewable ? t('transcript.edit.hint') : busyText()),
+        h('span', { class: 'muted small', id: hintId }, !lec.reviewable ? busyText() : held() ? t('transcript.edit.hint_held') : t('transcript.edit.hint')),
       ),
+      // T22 S2, T23 general 7: the translation is not edited itself
+      h('p', { class: 'muted small', id: zhNoteId }, held() ? t('player.edit.zh_note_held') : t('player.edit.zh_note')),
     );
   }
 
@@ -697,27 +786,44 @@ export function mountTranscript(root, lecture, ctx) {
       toast(t('player.edit.empty'), 'warn');
       return;
     }
+    const wait = held(); // as the lecture was when it was sent
     try {
       const updated = await api.sentenceEdit(lec.id, idx, text);
       if (!alive || !updated) return;
+      retranslated.drop(idx); // the English changed: its translation is a new one
       sentences[idx] = updated;
       endEdit(idx);
-      toast(t('player.edit.saved'), 'success');
+      // WV-01: the held text stays until closed
+      if (wait) heldToast(t('player.edit.saved_held'));
+      else toast(t('player.edit.saved'), 'success');
     } catch {
       // shown by the API layer; keep the edit box open
     }
   }
 
   async function sentenceOp(idx, op) {
+    const was = sentences[idx];
+    const wait = held(); // as the lecture was when it was sent
     try {
       const updated = op === 'reset' ? await api.sentenceReset(lec.id, idx) : await api.sentenceRetranslate(lec.id, idx);
       if (!alive || !updated) return;
+      // held: no result comes soon, nothing to compare (the next run translates the whole lecture's waiting sentences)
+      if (op === 'retranslate' && !wait) retranslated.start(was);
+      else retranslated.drop(idx);
       sentences[idx] = updated;
       rerender(idx);
-      toast(op === 'reset' ? t('player.menu.reset_done') : t('player.menu.retranslate_done'), 'success');
+      if (wait) heldToast(t(op === 'reset' ? 'player.menu.reset_done_held' : 'player.menu.retranslate_held'));
+      else toast(t(op === 'reset' ? 'player.menu.reset_done' : 'player.menu.retranslate_done'), 'success');
     } catch {
       // shown by the API layer
     }
+  }
+
+  async function retranslateCurrentOp(idx) {
+    const updated = await retranslateCurrent(lec.id, idx, lec); // R78c: says when the translation is held
+    if (!alive || !updated) return;
+    sentences[idx] = updated;
+    rerender(idx);
   }
 
   function syncBusy() {
@@ -749,6 +855,7 @@ export function mountTranscript(root, lecture, ctx) {
     },
     destroy() {
       alive = false;
+      dropMoreFocus(); // a page still loading leaves no pointerdown listener behind (R29 detail a)
       io.disconnect();
       unClip();
       clearTimeout(searchTimer);

@@ -142,6 +142,14 @@ type Store interface {
 	// ListCurrentJobsByStatus returns current jobs in any of the statuses,
 	// oldest scope first (lecture/material created_at, then job created_at).
 	ListCurrentJobsByStatus(ctx context.Context, statuses ...string) ([]model.Job, error)
+	// ListScanJobs is ListCurrentJobsByStatus(pending, queued), in the same
+	// order, without the pending jobs of draft lectures (launched_at IS
+	// NULL) whose stage is in draftHeld: the stages state.Deps holds with
+	// "not_started" on a draft before checking anything else, so the
+	// scheduler's scan has nothing to do with them (performance audit F08).
+	// A job whose lecture row is missing is still listed. Queued jobs are
+	// always listed. draftHeld empty: exactly ListCurrentJobsByStatus.
+	ListScanJobs(ctx context.Context, draftHeld []string) ([]model.Job, error)
 	// ListJobsFinishedSince returns all jobs (current or not) with finished_at >= since (for usage_today).
 	ListJobsFinishedSince(ctx context.Context, since string) ([]model.Job, error)
 	// CASJobStatus: UPDATE job SET status=to (+ fields) WHERE id=? AND status=from AND is_current=1.

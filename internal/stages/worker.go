@@ -211,9 +211,11 @@ func (d Deps) runWorker(ctx context.Context, w workerCall) ([]byte, error) {
 		return nil, model.Errorf(w.code+workerError, nil, fmt.Errorf("%s的输出文件无法写入：%v", w.label, err))
 	}
 
-	cmd := exec.CommandContext(ctx, py, script, "--in", jobPath, "--out", tmpPath)
+	// -s and the environment without pyenv.Dropped (pyenv "Isolation"), with
+	// pyenv's switches (no usage reporting)
+	cmd := exec.CommandContext(ctx, py, pyenv.ScriptArgs(script, "--in", jobPath, "--out", tmpPath)...)
 	cmd.Dir = dir
-	cmd.Env = pyenv.Environ("PYTHONIOENCODING=utf-8", "PYTHONUNBUFFERED=1") // no usage reporting (pyenv)
+	cmd.Env = pyenv.Environ("PYTHONIOENCODING=utf-8", "PYTHONUNBUFFERED=1")
 	cmd.WaitDelay = 3 * time.Second
 	tail := &tailBuffer{n: stderrTailBytes}
 	cmd.Stderr = tail

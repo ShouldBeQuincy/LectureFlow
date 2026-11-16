@@ -23,7 +23,7 @@
     "message": "LectureFlow подключён"
   },
   "connConnectedVersion": {
-    "message": "LectureFlow $P1$",
+    "message": "Подключено · $P1$",
     "description": "Connected, with app version",
     "placeholders": {
       "p1": {
@@ -71,12 +71,25 @@
   "noAccess": {
     "message": "Расширение не может прочитать эту страницу."
   },
+  "pageLoading": {
+    "message": "Страница ещё загружается. Попробуйте чуть позже.",
+    "description": "Popup: the page did not finish loading before detection gave up waiting"
+  },
   "noTracks": {
     "message": "Дорожки не найдены"
   },
   "tracksDetected": {
     "message": "Найдено дорожек: $P1$",
     "description": "Header with the track count",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "tracksDetectedOne": {
+    "message": "Найдено дорожек: $P1$",
+    "description": "Header with the track count when exactly one track was found (singular where the language needs it)",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -96,7 +109,7 @@
     }
   },
   "sourceGeneric": {
-    "message": "Общий поиск"
+    "message": "Найдено на странице"
   },
   "unreviewed": {
     "message": "Не проверен",
@@ -126,7 +139,7 @@
     "message": "Рекомендуется"
   },
   "unreadable": {
-    "message": "Плейлист не читается"
+    "message": "Не удалось прочитать сведения об этой дорожке; возможно, её нельзя будет получить"
   },
   "kind_video": {
     "message": "Видео"
@@ -180,7 +193,7 @@
     "message": "Не удалось составить отчёт для этой страницы."
   },
   "reportSaved": {
-    "message": "Отчёт сохранён. Прежде чем делиться им, просмотрите его."
+    "message": "Отчёт сохранён туда, куда браузер сохраняет файлы. Он нужен разработчикам для поддержки этого сайта и никогда не отправляется автоматически. Отчёт обезличен, но в нём остаётся адрес этого сайта; прежде чем делиться им, просмотрите его."
   },
   "finding_email": {
     "message": "Что-то похоже на адрес электронной почты."
@@ -219,7 +232,7 @@
     "message": "Профили платформ"
   },
   "profilesHint": {
-    "message": "Профили дают дорожкам платформы понятные названия. Импортированные из файла помечены «Не проверен» и используются в первую очередь."
+    "message": "Профиль — это небольшой файл, который сообщает расширению, как называются дорожки платформы записей и какую выбрать по умолчанию; для распространённых платформ профили встроены. Импортированные из файла помечаются «Не проверен» и используются в первую очередь."
   },
   "importProfile": {
     "message": "Импортировать профиль из файла"
@@ -327,7 +340,7 @@
   },
   "titleGenerated": {
     "message": "Название придумает LectureFlow",
-    "description": "Generic detection reads no title"
+    "description": "No title to show: the page has none, or only a placeholder or the site name; LectureFlow names the lecture"
   },
   "durationMinutes": {
     "message": "$P1$ мин",
@@ -367,7 +380,7 @@
     "description": "Course select label"
   },
   "courseNone": {
-    "message": "В LectureFlow пока нет курсов. Сначала создайте курс в LectureFlow.",
+    "message": "В LectureFlow пока нет курсов.",
     "description": "No courses"
   },
   "sendButton": {
@@ -393,6 +406,15 @@
   "selectTrack": {
     "message": "Выбрать: $P1$",
     "description": "Checkbox label",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "trackOnHost": {
+    "message": "на сайте $P1$",
+    "description": "Track list: in a track’s small line, after its kind and quality, when the track is on another site than the page (EU-03; AUD3 中-1). $P1$ is a host name such as media.example.net (never a path)",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -448,7 +470,7 @@
     "description": "Fetch task state"
   },
   "state_failed": {
-    "message": "Ошибка получения",
+    "message": "Ошибка",
     "description": "Fetch task state"
   },
   "state_needs_refresh": {
@@ -587,7 +609,7 @@
     "description": "Options section"
   },
   "reportsHint": {
-    "message": "Экспортируйте обезличенный отчёт, чтобы написать или улучшить профиль. Страница записи появится здесь, после того как вы нажмёте на ней на значок расширения.",
+    "message": "Отчёт о поиске дорожек — это файл для разработчиков: с его помощью LectureFlow учат работать с новым сайтом записей или улучшают поддержку уже известного (пишут профиль). Отчёт обезличен: без cookie; в адресах остаются сайт и путь (длинные идентификаторы в пути заменены фиктивными значениями того же вида), а значения параметров заменены заполнителями; от текста страницы, например названий лекций, остаётся только формат; если что-то похоже на личные данные, отчёт не экспортируется. Ничего не отправляется автоматически; прежде чем делиться отчётом, просмотрите его. Страница записи появится здесь, после того как вы нажмёте на ней на значок расширения.",
     "description": "Options: reports"
   },
   "reportsEmpty": {
@@ -597,6 +619,18 @@
   "reportRow": {
     "message": "$P1$ · дорожек: $P2$",
     "description": "Options: one page",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "reportRowOne": {
+    "message": "$P1$ · дорожек: $P2$",
+    "description": "Options: one page with exactly one track (singular where the language needs it)",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -771,6 +805,15 @@
   "chooseTracks": {
     "message": "Выбрать дорожки… ($P1$)",
     "description": "Opens the full track list",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "tracksHidden": {
+    "message": "Не показано дорожек: $P1$ (их слишком много)",
+    "description": "Track list: how many tracks are left out because the page gave too many to list (they cannot be chosen); $1 is a number",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -1016,6 +1059,47 @@
     "message": "Не используется: тот же id, что у встроенного профиля. Импортируйте файл снова и подтвердите замену.",
     "description": "Settings: chip on a local profile with a built-in profile’s id that was never confirmed"
   },
+  "profileInvalid": {
+    "message": "Не используется: этот профиль из файла больше не проходит проверку ($P1$). Исправьте файл и импортируйте его снова.",
+    "description": "Settings: chip on a local profile that no longer passes the profile checks (for example a sessionInfo POST stored before local profiles were limited to GET); $1 is the first problem, as \"path message\" in English",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "profileTooSlow": {
+    "message": "Не используется: правило $P1$ выполнялось слишком долго ($P2$ мс). Исправьте файл и импортируйте его снова.",
+    "description": "Settings: chip on a local profile stopped by the runtime regex guard (one match too slow, or too much time in all); $1 is the place of the rule in the file (\"/tracks/1/detect/urlPattern\"), $2 the milliseconds",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "profileTooSlowBuiltin": {
+    "message": "Не используется: правило $P1$ встроенного профиля выполнялось на этом компьютере слишком долго ($P2$ мс). Это ошибка LectureFlow, сообщите нам о ней. После обновления расширения оно попробует использовать профиль снова.",
+    "description": "Settings: chip on a built-in profile stopped by the runtime regex guard (several slow matches, or one very slow); $1 is the place of the rule, $2 the milliseconds",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "profileReenable": {
+    "message": "Включить снова",
+    "description": "Settings: button on a built-in profile stopped as too slow: use it again"
+  },
+  "policyStopped": {
+    "message": "Ограничения неизвестны: профиль работал слишком медленно и отключён",
+    "description": "Popup and in-page card: chip when the runtime regex guard stopped the platform profile during this detection, so the restriction switch could not be read"
+  },
   "embedWhy": {
     "message": "Эта страница записи встроена в страницу сайта $P1$. Чтобы другой сайт не мог обманом заставить вас нажать кнопку, подтвердите отправку в этом окне.",
     "description": "Confirmation window: why it opened; $1 is the site the recording page is embedded in (an origin)",
@@ -1054,5 +1138,119 @@
   "errConfirmWindow": {
     "message": "Отправьте запись из окна подтверждения LectureFlow.",
     "description": "Error: this frame must confirm in the extension’s window"
+  },
+  "openApp": {
+    "message": "Открыть LectureFlow",
+    "description": "Popup, not connected: LectureFlow is installed but not running; the button starts it (T26 G1)"
+  },
+  "discNotOpen": {
+    "message": "LectureFlow установлен, но не открыт. Нажмите «Открыть LectureFlow», чтобы запустить его, или «Проверить снова», если вы уже открыли его сами.",
+    "description": "Popup, not connected: LectureFlow is installed but not running; opening the popup does not start it (T26 G1). Quotes openApp (starts it) and connRecheck (only looks again; SEC42 低-2)"
+  },
+  "failNetwork": {
+    "message": "Получение записи прервалось из-за проблемы с сетью. Когда подключение восстановится, нажмите «Повторить» в LectureFlow, чтобы продолжить.",
+    "description": "Queued view: the fetch failed for the network (retryable; T26 G3). “Retry” is LectureFlow’s button (downloads.action.retry)"
+  },
+  "failDisk": {
+    "message": "Не хватает места на диске, или полученные файлы не удалось записать. Освободите место или проверьте диск с папкой данных LectureFlow, затем нажмите «Повторить» в LectureFlow.",
+    "description": "Queued view: the fetch failed for the disk (no space, or not writable; retryable; T26 G3)"
+  },
+  "failEngineMissing": {
+    "message": "Встроенный инструмент LectureFlow для получения записей не найден. Переустановите LectureFlow, затем нажмите «Повторить» в LectureFlow.",
+    "description": "Queued view: the fetch failed because LectureFlow’s aria2c is missing (retryable after a reinstall; T26 G3)"
+  },
+  "failUnsupported": {
+    "message": "Эта дорожка — прямая трансляция или формат, который LectureFlow пока не поддерживает, поэтому получить её нельзя, и повторная попытка не поможет. Если на странице есть другие дорожки, отправьте одну из них.",
+    "description": "Queued view: a live stream or an unsupported format (not retryable; T26 G3)"
+  },
+  "failUnsafeAddress": {
+    "message": "Адреса дорожек этой лекции ведут на этот компьютер или в его локальную сеть либо не могут быть безопасно проверены, поэтому LectureFlow отказался их получать. Повторная попытка не поможет.",
+    "description": "Queued view: the tracks’ addresses lead to this computer, the local network, or cannot be checked (not retryable; T26 G3)"
+  },
+  "failAngle": {
+    "message": "Во второй видеодорожке нет изображения, поэтому её нельзя сохранить как второй ракурс. Выберите «Основное аудио и видео» и отправьте лекцию снова.",
+    "description": "Queued view: the second picture has no video (not retryable; T26 G3). Quotes presetMain"
+  },
+  "failTooLarge": {
+    "message": "Эта запись превышает допустимый размер для одной задачи получения, поэтому получить её нельзя. Возможно, это прямая трансляция или сервер непрерывно присылает данные. Если на странице есть другие дорожки, отправьте одну из них.",
+    "description": "Queued view: the recording is over the size one fetch may hold (downloads.too_large; a live stream, or a server that keeps sending; not retryable, so no “Retry”; C165b)"
+  },
+  "failNotMedia": {
+    "message": "Получена не запись (возможно, страница входа или ошибки), поэтому повторная попытка не поможет. Убедитесь, что лекция воспроизводится на своей странице, и отправьте её снова.",
+    "description": "Queued view: what was fetched is not a recording (an empty file, a web page, a playlist, a refused format; not retryable; T26 G3)"
+  },
+  "failedCode": {
+    "message": "Получение записи не завершено (код $P1$). Причину можно посмотреть в LectureFlow и там же повторить попытку.",
+    "description": "Queued view: the fetch failed with a code this version does not know (LectureFlow treats it as retryable; T26 G3)",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "failEmbeddedHint": {
+    "message": "Если запись встроена в страницу другого сайта, откройте страницу самого проигрывателя и отправьте запись ещё раз оттуда.",
+    "description": "Added after the failed note or the needs_refresh text when the platform refused the fetch (401 / 403) and the lecture may have been sent from a page that embeds the player (EU-02; SEC46 低-3): the cookies it needs may only reach the player’s own page"
+  },
+  "errOpenGone": {
+    "message": "В LectureFlow больше нет этой лекции или задачи получения: возможно, их удалили.",
+    "description": "“Open in LectureFlow”: the lecture was deleted or the task removed (open.not_found; T26 G3)"
+  },
+  "presetUnavailable": {
+    "message": "Вариант «$P1$» недоступен: $P2$.",
+    "description": "Send card, under the three choices: why one cannot be chosen (T26 G4). $P1$ is the choice (presetDual…), $P2$ its reason (presetDualNone…, no final full stop)",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "bulkRefreshNote": {
+    "message": "Нужен доступ: $P1$. Эти лекции нельзя отметить здесь: чтобы продолжить получение, нажмите «Отправить в LectureFlow» в строке каждой из них в списке.",
+    "description": "Bulk card: lectures whose fetch needs a refresh cannot be ticked; each is resumed from its own row’s button (T26 G5). Quotes sendButton; $P1$ is how many",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "bulkWaiting": {
+    "message": "Ожидание подтверждения…",
+    "description": "Bulk card button while the reminder before sending restricted recordings is open: nothing is sent yet (T26 G6)"
+  },
+  "connectingApp": {
+    "message": "Подключение к LectureFlow…",
+    "description": "Popup and cards: the tracks are found, waiting for LectureFlow to answer (T26 G7)"
+  },
+  "launchingApp": {
+    "message": "Запуск LectureFlow…",
+    "description": "Popup: the user clicked “Open LectureFlow”; it is being started (T26 G7)"
+  },
+  "discRegister": {
+    "message": "LectureFlow уже установлен и открыт? В LectureFlow откройте «Диагностика», найдите «Подключение браузерного расширения», нажмите «Зарегистрировать снова», затем вернитесь сюда и нажмите «Проверить снова».",
+    "description": "Not connected, “not found”: the browser’s registration may be broken; LectureFlow’s Diagnostics page (nav.system) › Browser extension connection (common.check.browser_ext) › Register again (system.ext.register) fixes it (T26 G8). Quotes connRecheck"
+  },
+  "courseCreate": {
+    "message": "В LectureFlow нажмите «Добавить курс», чтобы создать курс, затем нажмите «Проверить снова».",
+    "description": "No course in LectureFlow yet: where to make one (nav.add_course), then the button beside it (T26 G9). Quotes connRecheck"
+  },
+  "doneTitle": {
+    "message": "Запись получена",
+    "description": "Queued view title once the fetch is done and the lecture made (T26 J2)"
+  },
+  "failedTitle": {
+    "message": "Получение не завершено",
+    "description": "Queued view title when the fetch failed (T26 J2)"
+  },
+  "closeHintCard": {
+    "message": "Эту карточку можно закрыть: получение записи продолжится в LectureFlow.",
+    "description": "In-page card, queued: the card may be closed (closeHint says “window”, for the popup and the confirmation window; T26 J2)"
+  },
+  "exportReportHint": {
+    "message": "Создаёт файл для разработчиков, который помогает LectureFlow поддержать этот сайт с записями; ничего не отправляется автоматически. Файл обезличен: без cookie; в адресах остаются сайт и путь (длинные идентификаторы в пути заменены фиктивными значениями того же вида), а идентификаторы, подписи и другие значения параметров заменены заполнителями; от текста страницы, например названия лекции, остаётся только формат. Если что-то похоже на личные данные, файл не экспортируется. Прежде чем делиться файлом, просмотрите его.",
+    "description": "Tooltip of the popup’s “Export detection report”: what it is, for whom, what the redaction does (src/lib/redact.js, report.js; T26 G14, SEC42 低-5: no promise beyond what it does)"
   }
 }

@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"io/fs"
 	"os"
@@ -253,6 +254,51 @@ func TestSnapshotWithoutSecretsNothingToRemove(t *testing.T) {
 	}
 }
 
+// A bound (enc:v2:, sec3 L3) kv row is a credential too: counted by
+// InspectFile and removed from the backup, also when it is the only one.
+func TestSnapshotWithoutSecretsBoundRow(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	src := filepath.Join(dir, "lectureflow.db")
+	d, err := openRaw(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if err := migrateUpTo(ctx, d, 9); err != nil {
+		t.Fatal(err)
+	}
+	const bound = "enc:v2:dGVzdC1ib3VuZC12YWx1ZS11cGdyYWRl" // test value only
+	if _, err := d.Exec(`INSERT INTO kv (key, value) VALUES ('remote.ssh.key.y', ?), ('ui.locale', 'zh-CN')`, bound); err != nil {
+		t.Fatal(err)
+	}
+	info, err := InspectFile(ctx, src)
+	if err != nil || !info.HasSecrets {
+		t.Fatalf("a bound row is a credential: %+v %v", info, err)
+	}
+	dst := filepath.Join(dir, "copy.db")
+	if err := SnapshotWithoutSecrets(ctx, src, dst); err != nil {
+		t.Fatal(err)
+	}
+	for _, needle := range []string{bound, "enc:v2:"} {
+		if where := fileHolds(t, dst, needle); len(where) > 0 {
+			t.Fatalf("the backup holds %q in %v", needle, where)
+		}
+	}
+	b, err := openFile(dst, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	var creds int
+	var locale string
+	b.QueryRow(`SELECT count(*) FROM kv WHERE key = 'remote.ssh.key.y'`).Scan(&creds)
+	b.QueryRow(`SELECT value FROM kv WHERE key = 'ui.locale'`).Scan(&locale)
+	if creds != 0 || locale != "zh-CN" {
+		t.Fatalf("backup: %d credential rows, locale %q", creds, locale)
+	}
+}
+
 // A failed copy leaves no file behind (the destination directory is missing;
 // a cancelled context).
 func TestSnapshotWithoutSecretsFailureLeavesNothing(t *testing.T) {
@@ -275,5 +321,73 @@ func TestSnapshotWithoutSecretsFailureLeavesNothing(t *testing.T) {
 		if e.Name() != "lectureflow.db" && !strings.HasPrefix(e.Name(), "lectureflow.db-") && e.Name() != "missing-dir" {
 			t.Fatalf("left behind: %s", e.Name())
 		}
+	}
+}
+
+// HeaderUserVersion reads the version of a valid newer database, but a
+// damaged header whose magic survived gives no version (R9 suggestion 2):
+// it must not be taken for one from a newer LectureFlow.
+func TestHeaderUserVersionDamagedHeader(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "newer.db")
+	d, err := OpenDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer := SchemaVersion() + 3
+	if _, err := d.Exec(`PRAGMA user_version = ` + strconv.Itoa(newer)); err != nil {
+		t.Fatal(err)
+	}
+	d.Close()
+	if v, ok := HeaderUserVersion(path); !ok || v != newer {
+		t.Fatalf("valid newer database: %d %v, want %d", v, ok, newer)
+	}
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	variant := func(name string, change func(h []byte)) string {
+		b := append([]byte(nil), good...)
+		change(b)
+		p := filepath.Join(dir, name+".db")
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	setVersion := func(v uint32) func(h []byte) {
+		return func(h []byte) { binary.BigEndian.PutUint32(h[60:64], v) }
+	}
+	bad := map[string]func(h []byte){
+		// bytes 16-99 overwritten: user_version reads as 0x41414141
+		"garbage": func(h []byte) {
+			for i := 16; i < 100; i++ {
+				h[i] = 'A'
+			}
+		},
+		"max-fraction":  func(h []byte) { h[21] = 65 },
+		"min-fraction":  func(h []byte) { h[22] = 0 },
+		"leaf-fraction": func(h []byte) { h[23] = 33 },
+		"write-version": func(h []byte) { h[18] = 7 },
+		"read-version":  func(h []byte) { h[19] = 0 },
+		"page-size-odd": func(h []byte) { binary.BigEndian.PutUint16(h[16:18], 1000) },
+		"page-size-low": func(h []byte) { binary.BigEndian.PutUint16(h[16:18], 256) },
+		"page-size-0":   func(h []byte) { binary.BigEndian.PutUint16(h[16:18], 0) },
+		"too-new":       setVersion(uint32(SchemaVersion() + HeaderVersionHeadroom + 1)),
+		"negative":      setVersion(0xFFFFFFFF),
+	}
+	for name, change := range bad {
+		if v, ok := HeaderUserVersion(variant(name, change)); ok {
+			t.Errorf("%s: version %d from a damaged header", name, v)
+		}
+	}
+	// still valid: page size 1 (65536) and the version at the headroom's edge
+	edge := SchemaVersion() + HeaderVersionHeadroom
+	p := variant("edge", func(h []byte) {
+		binary.BigEndian.PutUint16(h[16:18], 1)
+		binary.BigEndian.PutUint32(h[60:64], uint32(edge))
+	})
+	if v, ok := HeaderUserVersion(p); !ok || v != edge {
+		t.Fatalf("edge: %d %v, want %d", v, ok, edge)
 	}
 }

@@ -1,0 +1,162 @@
+{
+ "about": "Expected output of web/markdown.js (serialized by testdata/markdown_test.mjs), written by the renderer as it was before the AUD5 low-3 change (ea6206ce): the change keeps every output the same. joinable: the cases that render the same joined by \"\\n\\n---\\n\\n\".",
+ "joinable": [
+  "syllabus",
+  "lists-mixed-indent",
+  "lists-lazy-and-blank",
+  "lists-ordered-deep",
+  "tables-outer-pipes",
+  "tables-align-inline",
+  "tables-mismatch",
+  "blockquotes",
+  "emphasis",
+  "links",
+  "raw-html-entities",
+  "breaks-escapes",
+  "headings",
+  "rules",
+  "line-endings",
+  "empty",
+  "blank-only",
+  "chinese",
+  "hostile-html",
+  "hostile-protocols",
+  "hostile-entities",
+  "hostile-quotes",
+  "hostile-in-blocks",
+  "hostile-images",
+  "hostile-styles"
+ ],
+ "cases": [
+  {
+   "name": "syllabus",
+   "src": "# CSC0000 Algorithms — Syllabus\n\n**Instructor:** Dr. Example (office: Room 101) · **TA:** A. Student\n\n## Course overview\n\nThis course introduces the design and analysis of algorithms: *divide and conquer*, _dynamic programming_, greedy methods and ~~linear~~ graph algorithms.\nLecture notes are on [the course site](https://example.org/csc0000 \"Course site\") and https://example.org/forum.\n\n## Weekly schedule\n\n| Week | Date | Topic | Reading | Due |\n|:----:|------|:------|--------:|-----|\n| 1 | 09-08 | Introduction; `O(n)` notation | CLRS 1–3 | |\n| 2 | 09-15 | Divide & conquer<br>Master theorem | CLRS 4 | HW1 |\n| 3 | 09-22 | Sorting: `a | b` in code, \\| escaped | CLRS 6–8 |\n| **Part II** |\n| 4 | 09-29 | Dynamic programming | CLRS 15 | HW2 | extra |\n\n## Assessment\n\n- Homework (4 × 5%) — 20%\n- Midterm — 30%\n  - closed book\n  - one A4 cheat sheet\n- Final — 50%\n\n1. Read the notes\n2. Attempt the exercises\n   1. warm-up\n   2. challenge\n3. Ask on the forum\n\n> Late work loses 10% per day.\n> > Except with a medical note.\n\n---\n\n### 术语 / Terms\n\n- **渐进记号** (asymptotic notation)\n- *主定理* (master theorem)\n",
+   "html": "<h1>CSC0000 Algorithms — Syllabus</h1><p><strong>Instructor:</strong> Dr. Example (office: Room 101) · <strong>TA:</strong> A. Student</p><h2>Course overview</h2><p>This course introduces the design and analysis of algorithms: <em>divide and conquer</em>, <em>dynamic programming</em>, greedy methods and <del>linear</del> graph algorithms. Lecture notes are on <a href=\"https://example.org/csc0000\" rel=\"noopener noreferrer\" target=\"_blank\">the course site</a> and <a href=\"https://example.org/forum\" rel=\"noopener noreferrer\" target=\"_blank\">https://example.org/forum</a>.</p><h2>Weekly schedule</h2><div class=\"md-table-wrap\"><table><thead><tr><th style=\"textAlign:center\">Week</th><th>Date</th><th style=\"textAlign:left\">Topic</th><th style=\"textAlign:right\">Reading</th><th>Due</th></tr></thead><tbody><tr><td style=\"textAlign:center\">1</td><td>09-08</td><td style=\"textAlign:left\">Introduction; <code>O(n)</code> notation</td><td style=\"textAlign:right\">CLRS 1–3</td><td></td></tr><tr><td style=\"textAlign:center\">2</td><td>09-15</td><td style=\"textAlign:left\">Divide &amp; conquer<br>Master theorem</td><td style=\"textAlign:right\">CLRS 4</td><td>HW1</td></tr><tr><td style=\"textAlign:center\">3</td><td>09-22</td><td style=\"textAlign:left\">Sorting: <code>a | b</code> in code, | escaped</td><td style=\"textAlign:right\">CLRS 6–8</td><td></td></tr><tr><td style=\"textAlign:center\"><strong>Part II</strong></td><td></td><td style=\"textAlign:left\"></td><td style=\"textAlign:right\"></td><td></td></tr><tr><td style=\"textAlign:center\">4</td><td>09-29</td><td style=\"textAlign:left\">Dynamic programming</td><td style=\"textAlign:right\">CLRS 15</td><td>HW2</td></tr></tbody></table></div><h2>Assessment</h2><ul><li>Homework (4 × 5%) — 20%</li><li>Midterm — 30%<ul><li>closed book</li><li>one A4 cheat sheet</li></ul></li><li>Final — 50%</li></ul><ol><li>Read the notes</li><li>Attempt the exercises<ol><li>warm-up</li><li>challenge</li></ol></li><li>Ask on the forum</li></ol><blockquote><p>Late work loses 10% per day.</p><blockquote><p>Except with a medical note.</p></blockquote></blockquote><hr><h3>术语 / Terms</h3><ul><li><strong>渐进记号</strong> (asymptotic notation)</li><li><em>主定理</em> (master theorem)</li></ul>"
+  },
+  {
+   "name": "lists-mixed-indent",
+   "src": "- a\n  - b\n    - c\n   - d\n- e\n\n  continued paragraph of e\n\n* other kind\n+ third kind\n\n3. three\n4. four\n\n2026. Year is text\na line\n1. interrupts",
+   "html": "<ul><li>a<ul><li>b<ul><li>c</li><li>d</li></ul></li></ul></li><li>e<p>continued paragraph of e</p></li><li>other kind</li><li>third kind</li></ul><ol start=\"3\"><li>three</li><li>four</li><li>Year is text a line</li><li>interrupts</li></ol>"
+  },
+  {
+   "name": "lists-lazy-and-blank",
+   "src": "- item\nlazy continuation\n- item two\n\n\n- after blanks\n\npara\n- - -\n- x",
+   "html": "<ul><li>item lazy continuation</li><li>item two</li><li>after blanks</li></ul><p>para</p><hr><ul><li>x</li></ul>"
+  },
+  {
+   "name": "lists-ordered-deep",
+   "src": "1) paren\n2) two\n   - sub\n      1. deep\n         - deeper\n            - deepest\n\n- \n-\n- empty above",
+   "html": "<ol><li>paren</li><li>two<ul><li>sub<ol><li>deep<ul><li>deeper<ul><li>deepest</li></ul></li></ul></li></ol></li></ul></li></ol><ul><li></li><li></li><li>empty above</li></ul>"
+  },
+  {
+   "name": "tables-outer-pipes",
+   "src": "a | b\n--|--\n1 | 2\n\n| x |\n|---|\n| y |\nnot | a table\nstill text",
+   "html": "<div class=\"md-table-wrap\"><table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table></div><div class=\"md-table-wrap\"><table><thead><tr><th>x</th></tr></thead><tbody><tr><td>y</td></tr><tr><td>not</td></tr></tbody></table></div><p>still text</p>"
+  },
+  {
+   "name": "tables-align-inline",
+   "src": "| L | C | R |\n|:--|:-:|--:|\n| `|` | **b** | [l](https://e.x) |\n| <br/>x | &amp; | ~~s~~ |\n# heading ends table",
+   "html": "<div class=\"md-table-wrap\"><table><thead><tr><th style=\"textAlign:left\">L</th><th style=\"textAlign:center\">C</th><th style=\"textAlign:right\">R</th></tr></thead><tbody><tr><td style=\"textAlign:left\"><code>|</code></td><td style=\"textAlign:center\"><strong>b</strong></td><td style=\"textAlign:right\"><a href=\"https://e.x\" rel=\"noopener noreferrer\" target=\"_blank\">l</a></td></tr><tr><td style=\"textAlign:left\"><br>x</td><td style=\"textAlign:center\">&amp;</td><td style=\"textAlign:right\"><del>s</del></td></tr></tbody></table></div><h1>heading ends table</h1>"
+  },
+  {
+   "name": "tables-mismatch",
+   "src": "| a | b |\n| --- | --- | --- |\nmismatched delimiter is text",
+   "html": "<p>| a | b | | --- | --- | --- | mismatched delimiter is text</p>"
+  },
+  {
+   "name": "blockquotes",
+   "src": "> quote line one\nnot lazy here\n> - list in quote\n>   - nested\n> ```\n> code in quote\n> ```\n\n>> double\n> > spaced double\n>no space",
+   "html": "<blockquote><p>quote line one</p></blockquote><p>not lazy here</p><blockquote><ul><li>list in quote<ul><li>nested</li></ul></li></ul><pre class=\"md-pre\"><code>code in quote</code></pre></blockquote><blockquote><blockquote><p>double spaced double</p></blockquote><p>no space</p></blockquote>"
+  },
+  {
+   "name": "fenced-code",
+   "src": "```js\nconst a = \"<b>\";\n\n  indented\n```\nafter\n~~~~\ntilde ``` inside\n~~~~\n````\nunclosed fence\n# not a heading",
+   "html": "<pre class=\"md-pre\"><code>const a = \"&lt;b&gt;\";\n\n  indented</code></pre><p>after</p><pre class=\"md-pre\"><code>tilde ``` inside</code></pre><pre class=\"md-pre\"><code>unclosed fence\n# not a heading</code></pre>"
+  },
+  {
+   "name": "emphasis",
+   "src": "**bold** *it* _it_ __bold__ ~~strike~~ ***both*** **_mixed_**\nsnake_case_name and __init__ and a_b_c, 2*3*4, * not *, ** not **\n*unclosed and **unclosed and _unclosed ~~unclosed\n*a `code*` b* and **x\\*y** and _under_score_\n*multi*word* **a**b** _x_y_ ~~a~~b~~",
+   "html": "<p><strong>bold</strong> <em>it</em> <em>it</em> <strong>bold</strong> <del>strike</del> <strong>*both</strong>* <strong><em>mixed</em></strong> snake_case_name and <strong>init</strong> and a_b_c, 2<em>3</em>4, * not <em>, *</em> not ** <em>unclosed and *</em>unclosed and _unclosed ~~unclosed <em>a <code>code*</code> b</em> and <strong>x*y</strong> and <em>under_score</em> <em>multi</em>word* <strong>a</strong>b** <em>x_y</em> <del>a</del>b~~</p>"
+  },
+  {
+   "name": "links",
+   "src": "[plain](https://example.org) [t](https://example.org \"Title\") [t2](https://example.org 'T') [t3](https://example.org (T))\n[angle](<https://example.org/a b>) [paren](https://e.x/a_(b)) [nest [x] y](https://e.x) [empty]()\n[js](javascript:alert(1)) [data](data:text/html,x) [vb](vbscript:x) [file](file:///c:/x) [rel](/relative) [m](mailto:a@example.org)\n[ent](&#106;avascript:alert(1)) [esc](https\\://e.x) [sp](https://e.x/a b) [q](\"https://e.x\")\n![alt text](https://e.x/i.png) ![alt *em*](x) [![img in link](a)](https://e.x) [**bold link**](https://e.x)\n<https://example.org/auto> <mailto:a@example.org> <javascript:alert(1)> <http://a b> <ftp://x>\nbare https://example.org/path?q=1. and (https://en.wikipedia.org/wiki/A_(b)) and https://e.x/a), HTTP://UP.EXAMPLE x\nhttp:///nohost https://?q http://# xhttp://word https://e.x/`code` https://e.x/<b>\n[unclosed](https://e.x [x]y [x] (y) [a](b \"c) [a](<b) [a](b (c) d)",
+   "html": "<p><a href=\"https://example.org\" rel=\"noopener noreferrer\" target=\"_blank\">plain</a> <a href=\"https://example.org\" rel=\"noopener noreferrer\" target=\"_blank\">t</a> <a href=\"https://example.org\" rel=\"noopener noreferrer\" target=\"_blank\">t2</a> <a href=\"https://example.org\" rel=\"noopener noreferrer\" target=\"_blank\">t3</a> angle <a href=\"https://e.x/a_(b)\" rel=\"noopener noreferrer\" target=\"_blank\">paren</a> <a href=\"https://e.x\" rel=\"noopener noreferrer\" target=\"_blank\">nest [x] y</a> empty js data vb file rel <a href=\"mailto:a@example.org\" rel=\"noopener noreferrer\" target=\"_blank\">m</a> ent <a href=\"https://e.x\" rel=\"noopener noreferrer\" target=\"_blank\">esc</a> [sp](<a href=\"https://e.x/a\" rel=\"noopener noreferrer\" target=\"_blank\">https://e.x/a</a> b) q alt text alt <em>em</em> <a href=\"https://e.x\" rel=\"noopener noreferrer\" target=\"_blank\">img in link</a> <a href=\"https://e.x\" rel=\"noopener noreferrer\" target=\"_blank\"><strong>bold link</strong></a> <a href=\"https://example.org/auto\" rel=\"noopener noreferrer\" target=\"_blank\">https://example.org/auto</a> <a href=\"mailto:a@example.org\" rel=\"noopener noreferrer\" target=\"_blank\">mailto:a@example.org</a> &lt;javascript:alert(1)&gt; &lt;<a href=\"http://a\" rel=\"noopener noreferrer\" target=\"_blank\">http://a</a> b&gt; &lt;ftp://x&gt; bare <a href=\"https://example.org/path?q=1\" rel=\"noopener noreferrer\" target=\"_blank\">https://example.org/path?q=1</a>. and (<a href=\"https://en.wikipedia.org/wiki/A_(b)\" rel=\"noopener noreferrer\" target=\"_blank\">https://en.wikipedia.org/wiki/A_(b)</a>) and <a href=\"https://e.x/a\" rel=\"noopener noreferrer\" target=\"_blank\">https://e.x/a</a>), <a href=\"HTTP://UP.EXAMPLE\" rel=\"noopener noreferrer\" target=\"_blank\">HTTP://UP.EXAMPLE</a> x http:///nohost https://?q http://# xhttp://word <a href=\"https://e.x/\" rel=\"noopener noreferrer\" target=\"_blank\">https://e.x/</a><code>code</code> <a href=\"https://e.x/\" rel=\"noopener noreferrer\" target=\"_blank\">https://e.x/</a>&lt;b&gt; [unclosed](<a href=\"https://e.x\" rel=\"noopener noreferrer\" target=\"_blank\">https://e.x</a> [x]y [x] (y) [a](b \"c) [a](&lt;b) [a](b (c) d)</p>"
+  },
+  {
+   "name": "raw-html-entities",
+   "src": "<script>alert(1)</script> <img src=x onerror=alert(1)> <a href=\"javascript:alert(1)\">x</a>\n<!-- comment --> <br> <BR /> <br    /> <b>bold?</b> <style>*{}</style>\n&amp; &lt;tag&gt; &quot;q&quot; &#x4e2d;&#25991; &#0; &#xD800; &#1114112; &bogus; &nbsp;| &copy; &mdash; & alone",
+   "html": "<p>&lt;script&gt;alert(1)&lt;/script&gt; &lt;img src=x onerror=alert(1)&gt; &lt;a href=\"javascript:alert(1)\"&gt;x&lt;/a&gt; &lt;!-- comment --&gt; <br> <br> &lt;br    /&gt; &lt;b&gt;bold?&lt;/b&gt; &lt;style&gt;*{}&lt;/style&gt; &amp; &lt;tag&gt; \"q\" 中文 � � � &amp;bogus;  | © — &amp; alone</p>"
+  },
+  {
+   "name": "breaks-escapes",
+   "src": "hard break  \nnext line\\\nafter backslash\nsoft\nend\n\n\\# not heading \\* not em \\[not link\\] \\\\ \\a\n\ntrailing spaces at end   ",
+   "html": "<p>hard break<br>next line<br>after backslash soft end</p><p># not heading * not em [not link] \\ \\a</p><p>trailing spaces at end</p>"
+  },
+  {
+   "name": "headings",
+   "src": "# h1\n## h2 ##\n### h3 ### \n#### h4 #\n##### h5#\n###### h6\n####### seven\n#no space\n   # three spaces\n    # four spaces\n# ##\n#\n# *em* `code` [l](https://e.x)",
+   "html": "<h1>h1</h1><h2>h2</h2><h3>h3</h3><h4>h4</h4><h5>h5#</h5><h6>h6</h6><p>####### seven #no space</p><h1>three spaces</h1><p># four spaces</p><h1>##</h1><h1></h1><h1><em>em</em> <code>code</code> <a href=\"https://e.x\" rel=\"noopener noreferrer\" target=\"_blank\">l</a></h1>"
+  },
+  {
+   "name": "rules",
+   "src": "---\n***\n___\n- - -\n* * *\n--\ntext\n---\n_ _ _ _",
+   "html": "<hr><hr><hr><hr><hr><p>-- text</p><hr><hr>"
+  },
+  {
+   "name": "line-endings",
+   "src": "line one\r\nline two\r\rline three\n\n\t- tab list\n\t\tcode-ish\n nbsp start\n separator ",
+   "html": "<p>line one line two</p><p>line three</p><ul><li>tab list code-ish nbsp start separator</li></ul>"
+  },
+  {
+   "name": "empty",
+   "src": "",
+   "html": ""
+  },
+  {
+   "name": "blank-only",
+   "src": "   \n\n  \n",
+   "html": ""
+  },
+  {
+   "name": "chinese",
+   "src": "中文段落，**加粗**和*斜体*，链接[课程](https://example.org/课程)以及 https://example.org/路径。",
+   "html": "<p>中文段落，<strong>加粗</strong>和<em>斜体</em>，链接<a href=\"https://example.org/课程\" rel=\"noopener noreferrer\" target=\"_blank\">课程</a>以及 <a href=\"https://example.org/路径。\" rel=\"noopener noreferrer\" target=\"_blank\">https://example.org/路径。</a></p>"
+  },
+  {
+   "name": "hostile-html",
+   "src": "<script>alert(1)</script>\n<img src=x onerror=alert(1)>\n<iframe src=\"https://e.x\"></iframe>\n<svg onload=alert(1)>\n<a href=\"https://e.x\" onclick=\"x()\">a</a>",
+   "html": "<p>&lt;script&gt;alert(1)&lt;/script&gt; &lt;img src=x onerror=alert(1)&gt; &lt;iframe src=\"<a href=\"https://e.x\" rel=\"noopener noreferrer\" target=\"_blank\">https://e.x</a>\"&gt;&lt;/iframe&gt; &lt;svg onload=alert(1)&gt; &lt;a href=\"<a href=\"https://e.x\" rel=\"noopener noreferrer\" target=\"_blank\">https://e.x</a>\" onclick=\"x()\"&gt;a&lt;/a&gt;</p>"
+  },
+  {
+   "name": "hostile-protocols",
+   "src": "[a](javascript:alert(1)) [b](JaVaScRiPt:alert(1)) [c](data:text/html;base64,PHNjcmlwdD4=) [d](vbscript:msgbox) [e](file:///etc/passwd) [f]( javascript:x) [g](java\nscript:x) [h](//e.x/p) [i](#frag)",
+   "html": "<p>a b c d e f [g](java script:x) h i</p>"
+  },
+  {
+   "name": "hostile-entities",
+   "src": "[a](&#106;avascript:alert(1)) [b](&#x6A;avascript:x) [c](javascript&colon;x) <&#106;avascript:x> &lt;script&gt;alert(1)&lt;/script&gt;",
+   "html": "<p>a b c &lt;javascript:x&gt; &lt;script&gt;alert(1)&lt;/script&gt;</p>"
+  },
+  {
+   "name": "hostile-quotes",
+   "src": "[a](https://e.x\" onmouseover=\"alert(1)) [b](https://e.x'onerror='x) [c](<https://e.x\" x=\"y>) <https://e.x\"onclick=\"x>",
+   "html": "<p>[a](<a href=\"https://e.x\" rel=\"noopener noreferrer\" target=\"_blank\">https://e.x</a>\" onmouseover=\"alert(1)) <a href=\"https://e.x'onerror='x\" rel=\"noopener noreferrer\" target=\"_blank\">b</a> c <a href=\"https://e.x&quot;onclick=&quot;x\" rel=\"noopener noreferrer\" target=\"_blank\">https://e.x\"onclick=\"x</a></p>"
+  },
+  {
+   "name": "hostile-in-blocks",
+   "src": "| <b>x</b> | [j](javascript:x) |\n|---|---|\n| <script>y</script> | ![i](https://e.x/i.png) |\n\n```\n<script>z</script>\n```\n\n> <img src=x>\n\n- <a href=\"javascript:x\">l</a>\n- `<script>`",
+   "html": "<div class=\"md-table-wrap\"><table><thead><tr><th>&lt;b&gt;x&lt;/b&gt;</th><th>j</th></tr></thead><tbody><tr><td>&lt;script&gt;y&lt;/script&gt;</td><td>i</td></tr></tbody></table></div><pre class=\"md-pre\"><code>&lt;script&gt;z&lt;/script&gt;</code></pre><blockquote><p>&lt;img src=x&gt;</p></blockquote><ul><li>&lt;a href=\"javascript:x\"&gt;l&lt;/a&gt;</li><li><code>&lt;script&gt;</code></li></ul>"
+  },
+  {
+   "name": "hostile-images",
+   "src": "![x](https://e.x/track.png) ![y](javascript:alert(1)) [![z](https://e.x/i.png)](https://e.x) ![<b>alt</b>](x)",
+   "html": "<p>x y <a href=\"https://e.x\" rel=\"noopener noreferrer\" target=\"_blank\">z</a> &lt;b&gt;alt&lt;/b&gt;</p>"
+  },
+  {
+   "name": "hostile-styles",
+   "src": "| a | b |\n|:-:|--:|\n| x | y |\n\n<div style=\"background:url(javascript:x)\">s</div> <span class=\"md-pre\">c</span>",
+   "html": "<div class=\"md-table-wrap\"><table><thead><tr><th style=\"textAlign:center\">a</th><th style=\"textAlign:right\">b</th></tr></thead><tbody><tr><td style=\"textAlign:center\">x</td><td style=\"textAlign:right\">y</td></tr></tbody></table></div><p>&lt;div style=\"background:url(javascript:x)\"&gt;s&lt;/div&gt; &lt;span class=\"md-pre\"&gt;c&lt;/span&gt;</p>"
+  }
+ ]
+}

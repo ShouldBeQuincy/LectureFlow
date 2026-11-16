@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildCandidates, mergeCandidates, collapseSegmentRuns, sizeFromHeaders, contentRangeTotal, urlTemplate } from '../../src/lib/merge.js';
+import { buildCandidates, mergeCandidates, collapseSegmentRuns, sizeFromHeaders, contentRangeTotal, urlTemplate, longestDuration } from '../../src/lib/merge.js';
 import { detectTracks, summarize, LIMITS } from '../../src/lib/detect.js';
 import * as S from '../support/synth.mjs';
 
@@ -181,4 +181,25 @@ test('an io that throws is a failed fetch, not a failed detection', async () => 
   );
   assert.equal(r.tracks.length, 2);
   assert.ok(r.fetches.every((f) => f.ok === false && f.error === 'boom'));
+});
+
+test('the page duration is the longest of any number of media elements: 200,000 do not throw (SEC23b 信息-9)', async () => {
+  const N = 200000;
+  // the longest first (any cap on elements keeps it), the rest shorter
+  const durations = Array.from({ length: N }, (_, i) => (i === 0 ? 5400 : 1 + (i % 3600)));
+  assert.equal(longestDuration(durations), 5400);
+  assert.equal(longestDuration([...durations].reverse()), 5400);
+  assert.equal(longestDuration([]), null);
+  assert.equal(longestDuration([], 0), 0);
+  assert.equal(longestDuration([60]), 60);
+
+  // through detection: a page with that many media elements, one of them an HLS manifest
+  const elements = durations.map((duration) => ({ tag: 'video', duration }));
+  elements.push(el({ src: 'https://h.example.org/m.m3u8', currentSrc: 'https://h.example.org/m.m3u8', duration: 60 }));
+  const r = await detectTracks(
+    { frames: [frame({ elements })], webRequests: [] },
+    { async fetchText() { return { ok: false, status: 404, contentType: '', text: '' }; }, async probeFile() { return { ok: false, status: 404, contentType: '', size: -1 }; } },
+  );
+  assert.equal(r.tracks.length, 1);
+  assert.equal(r.tracks[0].durationSec, 5400, 'the unreadable manifest takes the page duration');
 });

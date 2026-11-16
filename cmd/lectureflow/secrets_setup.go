@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"lectureflow/internal/api"
 	"lectureflow/internal/db"
 	"lectureflow/internal/relocate"
 	"lectureflow/internal/secrets"
@@ -122,7 +123,7 @@ func setupSecretsWith(ctx context.Context, dataDir string, shellKey []byte, shel
 	case err != nil:
 		slog.Error("credentials: no data key; API keys and the Colab authorisation entered now are stored without encryption until this is fixed", "err", err)
 	case st.Replaced != "":
-		slog.Warn("credentials: the data key file cannot be opened on this computer or account (the data directory came from another one?); a new key was made and the old file kept. Saved API keys and the Colab authorisation have to be entered again",
+		slog.Warn("credentials: the data key file cannot be opened on this computer or account (damaged, or the data directory came from another one); a new key was made and the old file kept. Saved API keys and the Colab authorisation have to be entered again, unless a working copy of the original file is put back as secrets.key.unreadable-<anything> and LectureFlow restarted",
 			"kept", st.Replaced)
 	case st.Created:
 		slog.Info("credentials: a new data key was made", "protection", string(st.Protection))
@@ -131,6 +132,10 @@ func setupSecretsWith(ctx context.Context, dataDir string, shellKey []byte, shel
 	}
 	if st.PlainKeyFile {
 		slog.Warn("credentials: the data key file was not protected by the system (copied from a Mac, or put there); it is protected from now on", "file", st.KeyFile)
+	}
+	if st.PlainKeptFile != "" {
+		slog.Warn("credentials: an earlier key file kept in the data directory is not protected by the system (copied from a Mac, or put there); its key still opens older stored values, which are sealed again with the data key. LectureFlow leaves that file as it is: delete it once nothing needs it",
+			"file", st.PlainKeptFile)
 	}
 	if st.Recovered > 0 {
 		slog.Info("credentials: earlier key files open again; their values are sealed with the data key", "count", st.Recovered)
@@ -161,7 +166,8 @@ func setupSecretsWith(ctx context.Context, dataDir string, shellKey []byte, shel
 			slog.Warn("credentials: sealing the stored credentials failed; tried again at the next start", "err", err)
 		default:
 			if res.Changed() {
-				slog.Info("credentials: stored credentials sealed with the data key", "sealed", res.Sealed, "resealed", res.Resealed)
+				// bound: 3.2.0's values sealed again bound to their rows (sec3 L3)
+				slog.Info("credentials: stored credentials sealed with the data key", "sealed", res.Sealed, "resealed", res.Resealed, "bound", res.Bound)
 			}
 			if res.Scrubbed {
 				slog.Info("credentials: finished the clean-up of freed credentials an earlier start left unfinished")
@@ -169,9 +175,51 @@ func setupSecretsWith(ctx context.Context, dataDir string, shellKey []byte, shel
 			if res.Unreadable > 0 {
 				slog.Warn("credentials: stored credentials that cannot be decrypted here have to be entered again", "count", res.Unreadable)
 			}
+			recordKeyNotice(ctx, store, st, res.Unreadable)
 		}
 	}
 	scrubImportBackupsOnce(ctx, store, dataDir, prog)
+}
+
+// recordKeyNotice keeps, for the diagnostics of later starts, why stored
+// credentials cannot be decrypted when this start made a new key file
+// (api.KVCredentialKeyNotice, test-upgrade F6): the file was missing, or
+// it could not be opened and was kept under another name. Cleared once no
+// credential is left that cannot be decrypted (restored, or entered
+// again). Only the reason and the kept file's path are written; the data
+// key's handling is not touched. A start without the data key (the
+// system's credential store not available now, or no key) cannot tell
+// which credentials open: it changes nothing (security review SEC3 L1).
+func recordKeyNotice(ctx context.Context, store db.Store, st secrets.Status, unreadable int) {
+	if st.Unavailable || st.Protection == secrets.ProtectionNone {
+		return
+	}
+	if unreadable == 0 {
+		if v, ok, err := store.GetKV(ctx, api.KVCredentialKeyNotice); err == nil && ok && v != "" {
+			if err := store.SetKV(ctx, api.KVCredentialKeyNotice, ""); err != nil {
+				slog.Warn("credentials: clearing the note about the replaced key file", "err", err)
+			}
+		}
+		return
+	}
+	var note api.CredentialKeyNotice
+	switch {
+	case st.Replaced != "":
+		note = api.CredentialKeyNotice{Kind: api.KeyNoticeReplaced, Kept: st.Replaced}
+	case st.Created && st.KeyFile != "":
+		note = api.CredentialKeyNotice{Kind: api.KeyNoticeMissing}
+		slog.Warn("credentials: the data key file was missing (deleted, or not copied with the data directory); a new one was made. Stored credentials sealed with the old key stay as they are: putting the old file back as secrets.key.unreadable-<anything> and restarting opens them again",
+			"count", unreadable)
+	default:
+		return // nothing new: an earlier note stays
+	}
+	b, err := json.Marshal(note)
+	if err != nil {
+		return
+	}
+	if err := store.SetKV(ctx, api.KVCredentialKeyNotice, string(b)); err != nil {
+		slog.Warn("credentials: recording why stored credentials cannot be decrypted", "err", err)
+	}
 }
 
 // scrubImportBackupsOnce removes the credentials from the databases earlier

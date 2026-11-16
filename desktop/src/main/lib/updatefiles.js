@@ -32,6 +32,14 @@ const BACKUP_MARK = 'backup.json'; // written once a backup is complete
 // user's profile folder (%APPDATA%\LectureFlow\electron, ~/Library/…),
 // which only this account can change, also when the data folder was moved.
 const TRUST_FILE = 'selfupdate-trust.json';
+// On Windows the record lives outside the data folder instead (security
+// review SEC17 中-B: a profile in the data folder could have been written
+// by another account that once could write there): trust.json in
+// trustDirFor(), which the service program checks (-selfupdate-trust-dir).
+// migrated.json there says the record of an older version's profile was
+// looked at once (selfupdate.js _migrateTrust) and is never looked at again.
+const TRUST_DIR_FILE = 'trust.json';
+const TRUST_MIGRATED_FILE = 'migrated.json';
 const DB_FILES = ['lectureflow.db', 'lectureflow.db-wal', 'lectureflow.db-shm'];
 const PLATFORMS = { windows: 'windows-x64', darwin: 'darwin-arm64' };
 const KINDS = { installer: 'installer', portable: 'portable', zip: 'zip', dmg: 'dmg' };
@@ -120,7 +128,7 @@ async function readJson(file) {
   }
   if (text.length > 1 << 20) return { exists: true, error: `${path.basename(file)}: too large` };
   try {
-    const value = JSON.parse(text.replace(/^﻿/, ''));
+    const value = JSON.parse(text.replace(/^\ufeff/, ''));
     if (!value || typeof value !== 'object' || Array.isArray(value)) return { exists: true, error: `${path.basename(file)}: not an object` };
     return { exists: true, value };
   } catch {
@@ -242,6 +250,43 @@ async function treeHash(root) {
   return { sha256: crypto.createHash('sha256').update(lines.join('\n'), 'utf8').digest('hex'), files, bytes };
 }
 
+/**
+ * treeStat(root, { maxFiles, maxBytes, maxEntries, maxDepth }) →
+ * { files, bytes, entries } of a file or a directory tree without reading
+ * any file (lstat only, links not followed). It throws as soon as the tree
+ * has more regular files, more bytes, more entries (files, folders, links)
+ * or more levels than the bounds: a tree someone filled up is refused
+ * before it is copied or hashed, at a cost that does not grow with what
+ * was added.
+ */
+async function treeStat(root, { maxFiles = 200000, maxBytes = 16 * 1024 * 1024 * 1024, maxEntries = 400000, maxDepth = 64 } = {}) {
+  let files = 0;
+  let bytes = 0;
+  let entries = 0;
+  const stack = [{ abs: root, depth: 0 }];
+  while (stack.length) {
+    const { abs, depth } = stack.pop();
+    const st = await fsp.lstat(abs);
+    entries += 1;
+    if (entries > maxEntries) throw new Error(`more than ${maxEntries} entries`);
+    if (st.isSymbolicLink()) continue;
+    if (st.isFile()) {
+      files += 1;
+      bytes += st.size;
+      if (files > maxFiles) throw new Error(`more than ${maxFiles} files`);
+      if (bytes > maxBytes) throw new Error(`more than ${maxBytes} bytes`);
+    } else if (st.isDirectory()) {
+      if (depth >= maxDepth) throw new Error(`deeper than ${maxDepth} levels`);
+      const names = await fsp.readdir(abs);
+      if (entries + stack.length + names.length > maxEntries) throw new Error(`more than ${maxEntries} entries`);
+      for (const n of names) stack.push({ abs: path.join(abs, n), depth: depth + 1 });
+    } else {
+      throw new Error(`${path.basename(abs)} is not a file, folder or link`);
+    }
+  }
+  return { files, bytes, entries };
+}
+
 async function exists(p) {
   try {
     await fsp.lstat(p);
@@ -259,7 +304,76 @@ async function isDir(p) {
   }
 }
 
+// ---- the trust directory ----
+
+/**
+ * trustDirFor({ platform, env, home }) → where the shell keeps its update
+ * record (trust.json) outside the data folder, or null where it stays in
+ * the profile (macOS: no Mac to test a move on, so it keeps the place it
+ * had; Linux has no in-app update).
+ *   Windows  %LOCALAPPDATA%\LectureFlow\selfupdate (installed and portable
+ *            alike; like %LOCALAPPDATA%\LectureFlow\nmhost). Electron's
+ *            getPath has no Local AppData, so it comes from the
+ *            environment, else <home>\AppData\Local; null when neither is
+ *            an absolute path. Not moved with the data folder, not
+ *            affected by LECTUREFLOW_DATA_DIR; the service program refuses
+ *            it when it lies in the data folder (-selfupdate-trust-dir).
+ */
+function trustDirFor({ platform, env = {}, home = '' }) {
+  if (platform !== 'win32') return null;
+  const local = typeof env.LOCALAPPDATA === 'string' ? env.LOCALAPPDATA.trim() : '';
+  let base = null;
+  if (local && path.win32.isAbsolute(local) && !local.includes('\0')) base = local;
+  else if (typeof home === 'string' && home && path.win32.isAbsolute(home) && !home.includes('\0')) base = path.win32.join(home, 'AppData', 'Local');
+  return base ? path.win32.join(base, 'LectureFlow', 'selfupdate') : null;
+}
+
+/**
+ * roamingAppDataFor({ platform, env }) → this account's %APPDATA% (Roaming)
+ * as the system sets it, or null: only on Windows, and only an absolute
+ * path with a drive letter (not relative, not a network path). It serves
+ * one decision: whether the data folder is the default one,
+ * %APPDATA%\LectureFlow (selfupdate.js _migrateTrust); unknown counts as
+ * "not the default".
+ */
+function roamingAppDataFor({ platform, env = {} }) {
+  if (platform !== 'win32') return null;
+  const v = typeof env.APPDATA === 'string' ? env.APPDATA.trim() : '';
+  return v && /^[A-Za-z]:[\\/]/.test(v) && !v.includes('\0') ? v : null;
+}
+
 // ---- this installation ----
+
+/** isUninstaller(name): the NSIS uninstaller electron-builder puts next to the installed exe. */
+function isUninstaller(name) {
+  return /^Uninstall .+\.exe$/i.test(String(name));
+}
+
+/**
+ * portableExecutable({ isPackaged, platform, execPath, env, readdirSync }) →
+ * the portable executable (PORTABLE_EXECUTABLE_FILE, set by
+ * electron-builder's portable launcher, trimmed) or '' when this is not the
+ * portable build. The variable counts only for the packaged Windows app and
+ * only when no installer's uninstaller lies next to the running executable
+ * (security audit FB1 L-13): the portable build runs from a folder it
+ * unpacked itself, an installation always has the uninstaller, so the
+ * variable cannot turn an installation into a "portable build" and skip
+ * what only an installation gets (installDirOf's permission check). A
+ * folder that cannot be read does not count as portable either.
+ */
+function portableExecutable({ isPackaged, platform, execPath, env = {}, readdirSync = fs.readdirSync }) {
+  if (!isPackaged || platform !== 'win32' || typeof execPath !== 'string' || !execPath) return '';
+  const v = env && typeof env.PORTABLE_EXECUTABLE_FILE === 'string' ? env.PORTABLE_EXECUTABLE_FILE.trim() : '';
+  if (!v) return '';
+  let names;
+  try {
+    names = readdirSync(path.dirname(execPath));
+  } catch {
+    return '';
+  }
+  if (!Array.isArray(names) || names.some(isUninstaller)) return '';
+  return v;
+}
 
 /**
  * describeInstallation → what an update replaces here:
@@ -271,7 +385,8 @@ async function isDir(p) {
  *                         (only with the NSIS uninstaller next to the exe: an
  *                         unpacked or copied folder is not an installation)
  *     Windows portable    kind portable, target = the portable executable
- *                         (PORTABLE_EXECUTABLE_FILE, set by electron-builder)
+ *                         (PORTABLE_EXECUTABLE_FILE, set by electron-builder;
+ *                         ignored next to an uninstaller: portableExecutable)
  *     macOS               kind zip (an offline update may bring the dmg),
  *                         target = LectureFlow.app
  */
@@ -280,7 +395,7 @@ function describeInstallation({ isPackaged, platform, arch, execPath, env = {}, 
   const exe = path.basename(execPath);
   const byHand = 'this copy of LectureFlow cannot update itself; install the new version by hand';
   if (platform === 'win32' && arch === 'x64') {
-    const portable = typeof env.PORTABLE_EXECUTABLE_FILE === 'string' ? env.PORTABLE_EXECUTABLE_FILE.trim() : '';
+    const portable = portableExecutable({ isPackaged, platform, execPath, env, readdirSync });
     if (portable) {
       if (!path.win32.isAbsolute(portable) || !/\.exe$/i.test(portable)) return { unsupported: byHand };
       return { platform: PLATFORMS.windows, kind: KINDS.portable, kinds: [KINDS.portable], target: path.win32.normalize(portable), exe };
@@ -292,7 +407,7 @@ function describeInstallation({ isPackaged, platform, arch, execPath, env = {}, 
     } catch {
       return { unsupported: byHand };
     }
-    if (!names.some((n) => /^Uninstall .+\.exe$/i.test(n)) || !existsSync(path.join(dir, 'resources'))) {
+    if (!names.some(isUninstaller) || !existsSync(path.join(dir, 'resources'))) {
       return { unsupported: 'this copy of LectureFlow was not set up by its installer; install the new version by hand' };
     }
     return { platform: PLATFORMS.windows, kind: KINDS.installer, kinds: [KINDS.installer], target: dir, exe };
@@ -303,6 +418,21 @@ function describeInstallation({ isPackaged, platform, arch, execPath, env = {}, 
     return { platform: PLATFORMS.darwin, kind: KINDS.zip, kinds: [KINDS.zip, KINDS.dmg], target: app, exe };
   }
   return { unsupported: `in-app updates are not available on ${platform}-${arch}` };
+}
+
+/**
+ * installDirOf(install) → the installation directory whose permissions the
+ * service program checks (security audit M-4: -install-dir for the
+ * diagnostics and the update's downloads, -selfupdate-install-dir before
+ * anything is installed or rolled back), or null when nothing is checked:
+ * only the Windows installation set up by the installer (kind installer,
+ * describeInstallation's target) has one. Development (install null), the
+ * portable build (its executable lies wherever the user keeps it) and
+ * macOS (no Mac to test on: a known limitation) have none.
+ */
+function installDirOf(install) {
+  if (!install || install.unsupported || install.platform !== PLATFORMS.windows || install.kind !== KINDS.installer) return null;
+  return typeof install.target === 'string' && install.target ? install.target : null;
 }
 
 /**
@@ -334,6 +464,8 @@ module.exports = {
   BACKUP_DIR,
   BACKUP_MARK,
   TRUST_FILE,
+  TRUST_DIR_FILE,
+  TRUST_MIGRATED_FILE,
   DB_FILES,
   PLATFORMS,
   KINDS,
@@ -351,9 +483,14 @@ module.exports = {
   hashFile,
   checkFile,
   treeHash,
+  treeStat,
   exists,
   isDir,
+  trustDirFor,
+  roamingAppDataFor,
   describeInstallation,
+  portableExecutable,
+  installDirOf,
   nsisArguments,
   shortError,
 };

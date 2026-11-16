@@ -107,7 +107,7 @@ func TestSetupSecretsSealsStoredCredentials(t *testing.T) {
 		t.Fatalf("credential %q", v)
 	}
 	out := logs.String()
-	for _, needle := range []string{setupFakeKey, setupFakeRefresh, secrets.Prefix, hex.EncodeToString(testDataKey)} {
+	for _, needle := range []string{setupFakeKey, setupFakeRefresh, secrets.Prefix, secrets.PrefixV2, hex.EncodeToString(testDataKey)} {
 		if strings.Contains(out, needle) {
 			t.Errorf("the log holds %q:\n%s", needle, out)
 		}
@@ -123,6 +123,66 @@ func TestSetupSecretsSealsStoredCredentials(t *testing.T) {
 	}
 	if p, _ := st.GetProvider(ctx, "p1"); p.APIKey != setupFakeKey {
 		t.Fatal("the second start lost the key")
+	}
+}
+
+// sec3 L3: the first start of this version on a 3.2.0 data directory seals
+// its credentials (enc:v1:, no binding) again bound to their rows, on the
+// secure path; the log says how many, and nothing secret.
+func TestSetupSecretsBindsUnboundCredentials(t *testing.T) {
+	secrets.ResetForTest()
+	t.Cleanup(secrets.ResetForTest)
+	ctx := context.Background()
+	dir := t.TempDir()
+	setupSecrets(ctx, dir, nil, false) // 3.2.0's first start: the key file
+	path := filepath.Join(dir, "lectureflow.db")
+	st, err := db.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, _ := secrets.Seal([]byte(setupFakeKey)) // what 3.2.0 stored
+	c, _ := secrets.Seal([]byte(`{"refresh_token":"` + setupFakeRefresh + `"}`))
+	if err := st.InsertProvider(ctx, model.Provider{ID: "p1", Name: "DeepSeek", Type: model.ProviderOpenAI, BaseURL: "https://api.deepseek.com",
+		APIKey: k, MaxConcurrency: 4, RPM: 60, BalanceAPI: model.BalanceDeepSeek}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetKV(ctx, colab.KVCredential, c); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	needle := k[len(secrets.Prefix) : len(secrets.Prefix)+24]
+	if !fileHolds(t, path, needle) {
+		t.Fatal("control: the enc:v1: value is not in the file")
+	}
+
+	var logs syncBuf
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	secrets.ResetForTest()
+	setupSecrets(ctx, dir, nil, false) // this version's first start
+	out := logs.String()
+	if !strings.Contains(out, "bound=2") {
+		t.Errorf("the binding is not logged:\n%s", out)
+	}
+	for _, n := range []string{setupFakeKey, setupFakeRefresh, secrets.Prefix, secrets.PrefixV2} {
+		if strings.Contains(out, n) {
+			t.Errorf("the log holds %q", n)
+		}
+	}
+	if fileHolds(t, path, needle) {
+		t.Error("the enc:v1: ciphertext is still in the database files")
+	}
+	st, err = db.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if p, err := st.GetProvider(ctx, "p1"); err != nil || p.APIKey != setupFakeKey {
+		t.Fatalf("provider %q %v", p.APIKey, err)
+	}
+	if v, ok, _ := st.GetKV(ctx, colab.KVCredential); !ok || !strings.Contains(v, setupFakeRefresh) {
+		t.Fatalf("credential %q", v)
 	}
 }
 

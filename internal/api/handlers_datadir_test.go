@@ -53,6 +53,13 @@ func newDDEnv(t *testing.T) *ddEnv {
 	return de
 }
 
+// pick grants the folders as the desktop main process does for the folder
+// dialog's pick (every path the data directory endpoints take; r4
+// path-grants). One pick per request that may use it up.
+func (e *ddEnv) pick(paths ...string) {
+	e.srv.grants.addFolders(paths)
+}
+
 // asWeb runs fn with the server in web mode (the env helpers send no token).
 func (e *ddEnv) asWeb(fn func()) {
 	e.srv.desktop = nil
@@ -142,13 +149,19 @@ func TestDataDirBusy(t *testing.T) {
 			e.moveJob(model.ScopeLecture, l.ID, model.StagePrep, model.StatusQueued)
 		}
 	})
-	res, b := e.req("POST", "/api/app/data-dir", map[string]string{"path": filepath.Join(t.TempDir(), "new")})
+	newDir, impDir := filepath.Join(t.TempDir(), "new"), t.TempDir()
+	e.pick(newDir, impDir)
+	res, b := e.req("POST", "/api/app/data-dir", map[string]string{"path": newDir})
 	if res.StatusCode != http.StatusConflict || errCode(t, b) != "data_dir.busy" {
 		t.Fatalf("move: %d %s", res.StatusCode, b)
 	}
-	res, b = e.req("POST", "/api/app/import", map[string]string{"path": t.TempDir()})
+	res, b = e.req("POST", "/api/app/import", map[string]string{"path": impDir})
 	if res.StatusCode != http.StatusConflict || errCode(t, b) != "data_dir.busy" {
 		t.Fatalf("import: %d %s", res.StatusCode, b)
+	}
+	// a 409 is a failure: both folder grants are given back (grantScope)
+	if !e.srv.grants.hasFolder(newDir) || !e.srv.grants.hasFolder(impDir) {
+		t.Fatalf("a busy refusal kept the grant: move %v, import %v", e.srv.grants.hasFolder(newDir), e.srv.grants.hasFolder(impDir))
 	}
 	if e.restarts.Load() != 0 || e.status().State != ddIdle {
 		t.Fatal("state changed")
@@ -170,6 +183,7 @@ func TestDataDirChecksBeforeCopy(t *testing.T) {
 		{filepath.Join(e.cfg.DataDir, "inner"), "data_dir.target_inside_source", http.StatusBadRequest},
 		{busy, "data_dir.target_not_empty", http.StatusBadRequest},
 	} {
+		e.pick(c.path) // "relative": path_invalid all the same (no grant can name it)
 		res, b := e.req("POST", "/api/app/data-dir", map[string]string{"path": c.path})
 		if res.StatusCode != c.want || errCode(t, b) != c.code {
 			t.Errorf("%s: %d %s", c.path, res.StatusCode, b)
@@ -204,6 +218,7 @@ func TestDataDirMoveFlow(t *testing.T) {
 		o.Progress(relocate.Progress{Phase: relocate.PhaseVerifying, CopiedBytes: 100, TotalBytes: 100})
 		return o.BeforeCommit()
 	}
+	e.pick(dst)
 	res, b := e.req("POST", "/api/app/data-dir", map[string]string{"path": dst})
 	if res.StatusCode != http.StatusAccepted {
 		t.Fatalf("%d %s", res.StatusCode, b)
@@ -213,7 +228,8 @@ func TestDataDirMoveFlow(t *testing.T) {
 	if st.Kind != "move" || st.State != ddCopying || st.CopiedBytes != 40 || st.TotalBytes != 100 || st.Path != dst || !st.CanMove {
 		t.Fatalf("status %+v", st)
 	}
-	// One run at a time.
+	// One run at a time (the folder picked again: the move used its grant up).
+	e.pick(dst)
 	res, b = e.req("POST", "/api/app/data-dir", map[string]string{"path": dst})
 	if res.StatusCode != http.StatusConflict || errCode(t, b) != "data_dir.in_progress" {
 		t.Fatalf("second POST: %d %s", res.StatusCode, b)
@@ -231,7 +247,9 @@ func TestDataDirMoveFlow(t *testing.T) {
 		t.Fatalf("options %+v", got)
 	}
 	// Waiting for the restart: no new run.
-	res, _ = e.req("POST", "/api/app/import", map[string]string{"path": t.TempDir()})
+	imp := t.TempDir()
+	e.pick(imp)
+	res, _ = e.req("POST", "/api/app/import", map[string]string{"path": imp})
 	if res.StatusCode != http.StatusConflict {
 		t.Fatalf("POST after done: %d", res.StatusCode)
 	}
@@ -255,6 +273,7 @@ func TestDataDirMoveFailureAndHooks(t *testing.T) {
 		return model.Errorf(relocate.CodeVerifyFailed, map[string]any{"what": "rows:lecture"}, errors.New("2 rows, the source has 3"))
 	}
 	dst := filepath.Join(t.TempDir(), "new")
+	e.pick(dst)
 	res, b := e.req("POST", "/api/app/data-dir", map[string]string{"path": dst})
 	if res.StatusCode != http.StatusAccepted {
 		t.Fatalf("%d %s", res.StatusCode, b)
@@ -268,6 +287,7 @@ func TestDataDirMoveFailureAndHooks(t *testing.T) {
 		t.Fatalf("restarts %d paused %d resumed %d fixer %v", e.restarts.Load(), paused.Load(), resumed.Load(), fixer)
 	}
 	e.srv.dataDirRun().move = func(context.Context, relocate.MoveOptions) error { return nil }
+	e.pick(dst) // the retry is a new pick: the move that started used the grant up
 	res, b = e.req("POST", "/api/app/data-dir", map[string]string{"path": dst})
 	if res.StatusCode != http.StatusAccepted {
 		t.Fatalf("retry: %d %s", res.StatusCode, b)
@@ -306,11 +326,14 @@ func devDataDir(t *testing.T) string {
 // Import: refusals, then a real staging run and the restart.
 func TestDataImportFlow(t *testing.T) {
 	e := newDDEnv(t)
-	res, b := e.req("POST", "/api/app/import", map[string]string{"path": t.TempDir()})
+	empty := t.TempDir()
+	e.pick(empty)
+	res, b := e.req("POST", "/api/app/import", map[string]string{"path": empty})
 	if res.StatusCode != http.StatusBadRequest || errCode(t, b) != "data_import.not_lectureflow" {
 		t.Fatalf("empty dir: %d %s", res.StatusCode, b)
 	}
 	src := devDataDir(t)
+	e.pick(src)
 	res, b = e.req("POST", "/api/app/import", map[string]string{"path": src})
 	if res.StatusCode != http.StatusAccepted {
 		t.Fatalf("%d %s", res.StatusCode, b)
@@ -338,7 +361,9 @@ func TestDataImportNotFresh(t *testing.T) {
 		return nil
 	}
 	e.asWeb(func() { e.course("Mine") })
-	res, b := e.req("POST", "/api/app/import", map[string]string{"path": devDataDir(t)})
+	src := devDataDir(t)
+	e.pick(src)
+	res, b := e.req("POST", "/api/app/import", map[string]string{"path": src})
 	if res.StatusCode != http.StatusConflict || errCode(t, b) != "data_import.not_fresh" {
 		t.Fatalf("%d %s", res.StatusCode, b)
 	}
@@ -484,6 +509,7 @@ func TestDataDirCheck(t *testing.T) {
 		return nil
 	}
 	dst := filepath.Join(t.TempDir(), "Big Disk", "LectureFlow")
+	e.pick(dst) // the check does not use it up: it serves every check below
 	c := e.check(dst + string(filepath.Separator))
 	if !c.OK || c.Error != nil || !samePathOS(c.Path, dst) || c.FreeBytes <= 0 {
 		t.Fatalf("good target: %+v", c)
@@ -506,6 +532,9 @@ func TestDataDirCheck(t *testing.T) {
 		{filepath.Dir(e.cfg.DataDir), "data_dir.target_contains_source", true},
 		{full, "data_dir.target_not_empty", true},
 	} {
+		if tc.path != "" {
+			e.pick(tc.path)
+		}
 		c := e.check(tc.path)
 		if c.OK || c.Error == nil || c.Error.Code != tc.code || (c.FreeBytes > 0) != tc.free {
 			t.Errorf("%q: %+v / %+v", tc.path, c, c.Error)

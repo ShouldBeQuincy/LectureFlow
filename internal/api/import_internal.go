@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"lectureflow/internal/calendar"
 	"lectureflow/internal/db"
 	"lectureflow/internal/fetch"
+	"lectureflow/internal/media"
 	"lectureflow/internal/model"
 	"lectureflow/internal/stages"
 )
@@ -59,7 +61,7 @@ func (s *Server) importLocal(ctx context.Context, src importSource, dir, base st
 		if !info.Mode().IsRegular() {
 			return res, apiErr(http.StatusBadRequest, "upload.path_not_file", map[string]any{"path": src.path})
 		}
-	} else if resolved, info, err = s.checkSourcePath(src.path); err != nil {
+	} else if resolved, info, err = s.checkSourcePath(ctx, src.path); err != nil {
 		return res, err
 	}
 	name := src.name
@@ -160,9 +162,12 @@ func (s *Server) ImportDownload(ctx context.Context, req fetch.ImportRequest) (f
 	if err != nil {
 		return out, err
 	}
+	if err := checkRecordIDs(c.ID); err != nil { // record_dir.go: the file is not moved
+		return out, err
+	}
 	l := model.Lecture{ID: db.NewID(), CourseID: c.ID, CreatedAt: db.Now(), TitleSource: model.TitleSourceFilename}
 	dir := s.lectureDir(l)
-	up, err := s.importLocal(ctx, importSource{path: req.Path, own: true, name: req.Filename}, dir, "media", nil)
+	up, err := s.importLocal(ctx, importSource{path: req.Path, own: true, name: downloadMediaName(req.Filename)}, dir, "media", nil)
 	if err != nil {
 		os.RemoveAll(dir)
 		return out, err
@@ -178,11 +183,11 @@ func (s *Server) ImportDownload(ctx context.Context, req fetch.ImportRequest) (f
 	}
 	// security review 2 M3 (upload_media.go): a downloaded "recording" that
 	// is a playlist would make prep's ffmpeg read other files. The file
-	// name is the platform's title plus the URL's extension, so only the
-	// content is checked here, not the extension.
+	// name is the platform's title plus a media extension
+	// (downloadMediaName), so what decides is the content.
 	if err := s.checkMediaContent(ctx, up.path, up.filename); err != nil {
 		giveBack()
-		return out, err
+		return out, importRefused(err)
 	}
 	// the second camera angle (handlers_angles.go): next to the media
 	for _, a := range req.Angles {
@@ -198,14 +203,14 @@ func (s *Server) ImportDownload(ctx context.Context, req fetch.ImportRequest) (f
 		moved = append(moved, [2]string{au.path, a.Path})
 		if err := s.checkMediaContent(ctx, au.path, au.filename); err != nil {
 			giveBack()
-			return out, err
+			return out, importRefused(err)
 		}
 	}
 	l.Title = cleanLectureTitle(req.Title)
 	if l.Title == "" {
 		l.Title = titleFromFilename(up.filename)
 	}
-	l.OriginalFilename = up.filename
+	l.OriginalFilename = media.StripBidi(up.filename) // shown: no bidi controls (test-media I8)
 	l.MediaPath, _ = filepath.Abs(up.path)
 	if req.RecordedAt != nil {
 		if t, err := calendar.ParseRecordedAt(*req.RecordedAt, time.Local); err == nil {
@@ -242,4 +247,42 @@ func (s *Server) ImportDownload(ctx context.Context, req fetch.ImportRequest) (f
 		out.LaunchError = &info
 	}
 	return out, nil
+}
+
+// downloadMediaName is the file name of a finished download as the lecture
+// keeps it (original_filename, and the extension of media{ext} in the
+// lecture's directory): an upload's name must have a media extension
+// (acceptMediaName), and so does this one (AUD3 low-3). The queue names a
+// file track by its URL's extension only when it is one (internal/fetch
+// fileTrackExt), so this is the second line, for a file of an older
+// version's naming say: another extension (.exe, .html, .part) is replaced
+// by the neutral .mp4, a name without one gets it. The content was probed
+// (checkMediaContent) and ffmpeg reads the file by what it is, not by its
+// name.
+func downloadMediaName(name string) string {
+	if media.AllowedName(name) {
+		return name
+	}
+	if ext := filepath.Ext(name); downloadExt.MatchString(ext) {
+		name = strings.TrimSuffix(name, ext)
+	}
+	return name + ".mp4"
+}
+
+// downloadExt is what downloadMediaName takes for an extension to replace
+// (the queue's extOf: a dot and one to five letters or digits); "Lecture
+// 3.5 notes" has none.
+var downloadExt = regexp.MustCompile(`^\.[A-Za-z0-9]{1,5}$`)
+
+// importRefused turns checkMediaContent's refusal of a downloaded file (an
+// upload.media_* httpError: empty, a web page, a playlist, another format)
+// into fetch.ImportRefused, so that the download task shows that reason
+// instead of downloads.import_failed (review R10 M1). Other errors (ffprobe
+// could not run, say) are returned as they are.
+func importRefused(err error) error {
+	var he *httpError
+	if errors.As(err, &he) && fetch.RefusedFile(he.info.Code) {
+		return &fetch.ImportRefused{Code: he.info.Code, Params: he.info.Params}
+	}
+	return err
 }

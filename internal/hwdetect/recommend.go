@@ -110,13 +110,10 @@ func Recommend(hw HW) Recommendation {
 			reason(ReasonNVIDIAVRAMUnknown, map[string]any{"name": g.Name})
 			note(NoteVRAMUnknown, nil)
 		case g.VRAMMB >= vramLargeMB:
-			name, precision = "large-v3", config.ResolveComputeType("auto", "cuda", g.VRAMMB)
+			name, precision = NVIDIAModel(g.VRAMMB), config.ResolveComputeType("auto", "cuda", g.VRAMMB)
 			reason(ReasonNVIDIA, map[string]any{"name": g.Name, "vram_gb": gb(g.VRAMMB)})
 		default:
-			name = "medium"
-			if g.VRAMMB >= vramTurboMB {
-				name = "large-v3-turbo"
-			}
+			name = NVIDIAModel(g.VRAMMB)
 			precision = config.ResolveComputeType("auto", "cuda", g.VRAMMB)
 			reason(ReasonNVIDIA, map[string]any{"name": g.Name, "vram_gb": gb(g.VRAMMB)})
 			reason(ReasonNVIDIASmallVRAM, map[string]any{"vram_gb": gb(g.VRAMMB), "model": name})
@@ -166,6 +163,110 @@ func Recommend(hw HW) Recommendation {
 		note(NoteLowRAM, map[string]any{"ram_gb": gb(hw.RAMMB)})
 	}
 	return r
+}
+
+// NVIDIAModel is the Whisper model the NVIDIA rule of Recommend picks for
+// a card with vramMB of known VRAM (> 0): large-v3 from vramLargeMB,
+// large-v3-turbo from vramTurboMB, else medium.
+func NVIDIAModel(vramMB int) string {
+	switch {
+	case vramMB >= vramLargeMB:
+		return "large-v3"
+	case vramMB >= vramTurboMB:
+		return "large-v3-turbo"
+	}
+	return "medium"
+}
+
+// NVIDIAModelNeedMB is the least VRAM at which the NVIDIA rule recommends a
+// model of mdl's size (the tiers of NVIDIAModel): vramLargeMB for the large
+// models, vramTurboMB for large-v3-turbo, 0 for medium and smaller (the
+// rule's choice for any card). ok is false for a name the rule does not
+// know (e.g. a distil model or a local path): no claim is made about it.
+func NVIDIAModelNeedMB(mdl string) (needMB int, ok bool) {
+	switch strings.TrimSuffix(strings.ToLower(strings.TrimSpace(mdl)), ".en") {
+	case "large-v3", "large-v2", "large-v1", "large":
+		return vramLargeMB, true
+	case "large-v3-turbo", "turbo":
+		return vramTurboMB, true
+	case "medium", "small", "base", "tiny":
+		return 0, true
+	}
+	return 0, false
+}
+
+// Diagnostics hints of an NVIDIA transcription device whose model does not
+// suit the card (translated by web/i18n: system.devices.*).
+const (
+	// HintVRAMLow: the model needs more VRAM than the setup guide's tier
+	// for the card {vram_gb, model, need_gb, suggest}.
+	HintVRAMLow = "system.devices.vram_low"
+	// HintVRAMModelMissing: the model's files are missing and the card's
+	// recommendation, another model, is installed {vram_gb, model, suggest}.
+	HintVRAMModelMissing = "system.devices.vram_model_missing"
+	// HintVRAMQueueOnly: the hint when the model suits the card (or is
+	// not known) but the sentences below apply {vram_gb}.
+	HintVRAMQueueOnly = "system.devices.vram_queue_only"
+	// HintVRAMQueue: an extra sentence of a hint (params.extra) when the
+	// scheduler's per-task estimate fits the VRAM transcription can have
+	// on the card now (avail_mb: what other programs leave, R37 M1) but
+	// with the reserve added does not: lowering the reserve or
+	// closing other programs helps {per_job_mb, reserve_mb, avail_mb}. The
+	// API adds it (it knows the values).
+	HintVRAMQueue = "system.devices.vram_queue"
+	// HintVRAMQueueEstimate: the extra sentence when the per-task estimate
+	// alone is more than avail_mb and even the card's recommended model and
+	// precision do not fit with the reserve: closing other programs or
+	// another device is the way out {per_job_mb, reserve_mb, avail_mb}.
+	HintVRAMQueueEstimate = "system.devices.vram_queue_estimate"
+	// HintVRAMQueueSwitch: the extra sentence when the per-task estimate
+	// alone is more than avail_mb and the card's recommended model and
+	// precision fit with the reserve (r2 T-PERF-02: the estimate follows the
+	// model) {per_job_mb, reserve_mb, avail_mb, suggest, suggest_precision,
+	// suggest_mb}.
+	HintVRAMQueueSwitch = "system.devices.vram_queue_switch"
+)
+
+// VRAMGB is a VRAM size in whole GB as the hints show it.
+func VRAMGB(mb int) int { return gb(mb) }
+
+// NVIDIAModelHint is the diagnostics hint of an NVIDIA device running mdl
+// on a card with vramMB of VRAM; modelMissing: the model's files are not
+// installed (devices.WorkerNoModel); installed reports whether a model's
+// files are (nil: none is). It only advises, nothing is changed:
+//   - VRAM unknown (<= 0) or no model: none (no claim without the card's
+//     size).
+//   - mdl needs more than vramMB (NVIDIAModelNeedMB): HintVRAMLow, with
+//     NVIDIAModel(vramMB) as the suggestion.
+//   - else, modelMissing, the card's recommendation is another model and
+//     it is installed: HintVRAMModelMissing. When the recommendation is not
+//     installed either: none (the component checks and
+//     waiting.model_missing say to install the model, which the user may
+//     have chosen on purpose, e.g. large-v2).
+//   - else none.
+//
+// Sizes are whole GB as the setup guide shows them (hw.reason.*: gb); in
+// HintVRAMLow a card that would round up to the needed size (e.g. 5632-5999
+// MB against 6000) is rounded down instead, so the two never read equal.
+func NVIDIAModelHint(vramMB int, mdl string, modelMissing bool, installed func(name string) bool) *model.ErrorInfo {
+	mdl = strings.TrimSpace(mdl)
+	if vramMB <= 0 || mdl == "" {
+		return nil
+	}
+	suggest := NVIDIAModel(vramMB)
+	if need, ok := NVIDIAModelNeedMB(mdl); ok && need > vramMB {
+		vramGB := gb(vramMB)
+		if vramGB >= gb(need) {
+			vramGB = vramMB / 1024
+		}
+		return &model.ErrorInfo{Code: HintVRAMLow, Params: map[string]any{
+			"vram_gb": vramGB, "model": mdl, "need_gb": gb(need), "suggest": suggest}}
+	}
+	if modelMissing && !strings.EqualFold(mdl, suggest) && installed != nil && installed(suggest) {
+		return &model.ErrorInfo{Code: HintVRAMModelMissing, Params: map[string]any{
+			"vram_gb": gb(vramMB), "model": mdl, "suggest": suggest}}
+	}
+	return nil
 }
 
 // bestGPU is the NVIDIA GPU with the most known VRAM (the first one on ties).

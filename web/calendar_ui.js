@@ -406,17 +406,95 @@ export async function withRenumber(send) {
   }
 }
 
+// ---------- course name and code (the new-course wizard, the course settings) ----------
+
+// The limits of the server (POST / PATCH /api/courses: course.name_too_long,
+// course.code_too_long, course.code_has_space).
+export const COURSE_NAME_MAX = 200;
+export const COURSE_CODE_MAX = 32;
+
+/** What is wrong with a course code (trimmed; "" is no code), or "". */
+export function courseCodeError(code) {
+  if (!code) return '';
+  if ([...code].length > COURSE_CODE_MAX) return t('wizard.basics.code_too_long', { max: COURSE_CODE_MAX });
+  if (/\s/.test(code)) return t('wizard.basics.code_has_space');
+  return '';
+}
+
+/** What is wrong with a course name (trimmed), or "". The wizard says "required" beside the field. */
+export function courseNameError(name) {
+  if ([...name].length > COURSE_NAME_MAX) return t('wizard.basics.name_too_long', { max: COURSE_NAME_MAX });
+  return '';
+}
+
 // ---------- course settings (P13.4: the course page's menu → course settings) ----------
 
 /**
- * opts: {lectures, onSaved(course), openFilenameRule(), regenerate()}.
+ * opts: {lectures, onSaved(course), recordingSection(close, busy) → Node,
+ * focus: 'name' (T22 B1: "rename…" opens the dialog on the name, selected)
+ * or 'term' (the header's term start link)}.
  * The filename-rule part only links to its own dialog (filename_rule.js).
  */
 export function openCourseSettings(course, opts = {}) {
   return openDialog(
     t('course.settings.title'),
-    (close) => {
+    (close, busy) => {
+      // T22 B1: the name and the code of a course made earlier (a typo, a
+      // code added later); the same PATCH as the calendar
+      const name0 = course.name || '';
+      const code0 = course.code || '';
+      const nameErr = h('span', { class: 'field-error', id: 'cset-name-err', role: 'alert' });
+      const codeErr = h('span', { class: 'field-error', id: 'cset-code-err', role: 'alert' });
+      const nameIn = h('input', {
+        class: 'input',
+        id: 'cset-name',
+        value: name0,
+        maxlength: String(COURSE_NAME_MAX + 20),
+        autocomplete: 'off',
+        'aria-required': 'true',
+        'aria-describedby': 'cset-name-err',
+        autofocus: opts.focus === 'name',
+        dataset: { fkey: 'cset:name' },
+      });
+      const codeIn = h('input', {
+        class: 'input input-code',
+        id: 'cset-code',
+        value: code0,
+        maxlength: String(COURSE_CODE_MAX + 8),
+        autocomplete: 'off',
+        spellcheck: 'false',
+        placeholder: t('wizard.basics.code_placeholder'),
+        'aria-describedby': 'cset-code-note cset-code-err',
+        dataset: { fkey: 'cset:code' },
+      });
+      // the dialog is shown (showModal) right after this build: the name, which
+      // has the focus then, is selected to be typed over
+      if (opts.focus === 'name') queueMicrotask(() => nameIn.isConnected && nameIn.select());
+      for (const x of [nameIn, codeIn]) x.addEventListener('input', () => sync());
+      // R74 low 8: a code from before codes could not hold spaces is not
+      // judged while it is left as it is (the rest can still be saved)
+      const basicsError = () => {
+        const n = nameIn.value.trim();
+        const c = codeIn.value.trim();
+        return { name: n ? courseNameError(n) : t('errors.course.name_empty'), code: c === code0 ? '' : courseCodeError(c) };
+      };
+      const basicsEl = h(
+        'div',
+        { class: 'cset-basics' },
+        h('div', { class: 'dlg-field' }, h('label', { class: 'dlg-label', for: 'cset-name' }, t('wizard.basics.name')), nameIn, nameErr),
+        h(
+          'div',
+          { class: 'dlg-field' },
+          h('label', { class: 'dlg-label', for: 'cset-code' }, t('wizard.basics.code'), ' ', h('span', { class: 'dlg-hint' }, t('calendar.optional'))),
+          codeIn,
+          h('span', { class: 'dlg-hint', id: 'cset-code-note' }, t('course.settings.code_note')),
+          codeErr,
+        ),
+      );
       const cal = calendarFields({ termStart: course.term_start || '', skipWeeks: course.skip_weeks || [], lectures: opts.lectures || [], idPrefix: 'cset', onChange: sync });
+      // R74 low 6: the header's "term start" link opens the settings on it
+      const termIn = opts.focus === 'term' ? cal.el.querySelector('[data-fkey="cset:term"]') : null;
+      if (termIn) termIn.setAttribute('autofocus', '');
       // lecture kinds: when the list shows "No. n" under the kind
       const numbering0 = course.numbering || 'auto';
       let numbering = numbering0;
@@ -445,12 +523,21 @@ export function openCourseSettings(course, opts = {}) {
       const patchFor = () => {
         const p = cal.patchFor(course);
         if (numbering !== numbering0) p.numbering = numbering;
+        const n = nameIn.value.trim();
+        const c = codeIn.value.trim();
+        if (n !== name0) p.name = n;
+        if (c !== code0) p.code = c; // "" clears the code
         return p;
       };
       const err = h('p', { class: 'dlg-field-error', role: 'alert' });
       const save = h('button', { type: 'submit', class: 'btn btn-primary', dataset: { fkey: 'cset:save' } }, t('course.settings.save'));
       function sync() {
-        save.disabled = !Object.keys(patchFor()).length;
+        const bad = basicsError();
+        nameErr.textContent = bad.name;
+        codeErr.textContent = bad.code;
+        nameIn.setAttribute('aria-invalid', String(!!bad.name));
+        codeIn.setAttribute('aria-invalid', String(!!bad.code));
+        save.disabled = !!(bad.name || bad.code) || !Object.keys(patchFor()).length;
         err.textContent = '';
       }
       sync();
@@ -461,7 +548,8 @@ export function openCourseSettings(course, opts = {}) {
         save.disabled = true;
         save.textContent = t('course.settings.saving');
         try {
-          const c = await withRenumber((confirm) => api.patchCourse(course.id, confirm ? { ...p, confirm: true } : p, { quiet: true }));
+          // busy: a route change while it runs lets it finish (R62 N4)
+          const c = await busy(withRenumber((confirm) => api.patchCourse(course.id, confirm ? { ...p, confirm: true } : p, { quiet: true })));
           if (!c) {
             save.disabled = false;
             save.textContent = t('course.settings.save');
@@ -477,9 +565,10 @@ export function openCourseSettings(course, opts = {}) {
       return h(
         'form',
         { class: 'cset', onsubmit: onSubmit, novalidate: true },
+        h('section', { class: 'cset-sec' }, h('h3', { class: 'cset-h' }, icon('pencil', { size: 15 }), t('course.settings.basics')), basicsEl),
         h('section', { class: 'cset-sec' }, h('h3', { class: 'cset-h' }, icon('calendar', { size: 15 }), t('course.settings.calendar')), h('p', { class: 'cset-intro' }, t('course.settings.calendar_intro')), cal.el),
         h('section', { class: 'cset-sec' }, h('h3', { class: 'cset-h' }, icon('hash', { size: 15 }), t('course.settings.numbering')), h('p', { class: 'cset-intro' }, t('course.settings.numbering_intro')), numberingEl),
-        opts.recordingSection ? h('section', { class: 'cset-sec' }, h('h3', { class: 'cset-h' }, icon('clock', { size: 15 }), t('course.settings.recording')), opts.recordingSection(close)) : null,
+        opts.recordingSection ? h('section', { class: 'cset-sec' }, h('h3', { class: 'cset-h' }, icon('clock', { size: 15 }), t('course.settings.recording')), opts.recordingSection(close, busy)) : null,
         err,
         h('div', { class: 'dlg-actions' }, h('button', { type: 'button', class: 'btn', onclick: () => close(null) }, t('common.cancel')), save),
       );
@@ -501,7 +590,7 @@ export function openRecordedAtDialog(lec, opts = {}) {
   const cur = splitRecordedAt(lec.recorded_at, lec.recorded_has_time);
   return openDialog(
     t('calendar.recorded.title'),
-    (close) => {
+    (close, busy) => {
       const date = h('input', { type: 'date', class: 'input', value: cur.date ? ymd(cur.date) : '', 'aria-label': t('calendar.recorded.date'), autofocus: true, required: true });
       const time = h('input', { type: 'time', class: 'input', value: cur.time, 'aria-label': t('calendar.recorded.time'), step: '60' });
       const err = h('p', { class: 'dlg-field-error', role: 'alert' });
@@ -516,7 +605,8 @@ export function openRecordedAtDialog(lec, opts = {}) {
       const send = async (value) => {
         save.disabled = true;
         try {
-          const l = await withRenumber((confirm) => api.patchLecture(lec.id, confirm ? { recorded_at: value, confirm: true } : { recorded_at: value }, { quiet: true }));
+          // busy: a route change while it runs lets it finish (R62 N4)
+          const l = await busy(withRenumber((confirm) => api.patchLecture(lec.id, confirm ? { recorded_at: value, confirm: true } : { recorded_at: value }, { quiet: true })));
           if (l) close(l);
           else sync();
         } catch (ex) {

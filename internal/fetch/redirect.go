@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+
+	"lectureflow/internal/db"
 )
 
 // Redirects and cookies (lead's ruling 5). aria2c sends the headers of
@@ -138,23 +140,47 @@ func (r *resolver) needed(rawURL string) bool {
 }
 
 // checkHost refuses a URL for aria2c whose host is local (by name or by
-// address, local.go).
+// address, local.go) or on the do-not-handle list. The URL itself is
+// judged every time (the list's path entries, the proxy by scheme and
+// port); only the check of a name's addresses is kept, per host (SEC10
+// info-3: the first URL's answer stood for every later one on its host).
+//
+// Whether the URL goes through a proxy of the user's, which skips the
+// address check, is upstream's answer, the guard proxy's too (guard.go:
+// aria2c's own proxy is always the guard, which judges the URL again,
+// and every redirect after it, when aria2c asks for it). A proxy that
+// cannot be used (SOCKS, https://) refuses the URL first, before any
+// look-up: downloads.proxy_unsupported (local.go upstream).
 func (r *resolver) checkHost(ctx context.Context, rawURL string) error {
-	host := ""
+	addr := r.q.netOf(r.s).addr
 	if u, err := url.Parse(rawURL); err == nil {
-		host = strings.ToLower(u.Hostname())
+		if _, err := addr.p.upstream(u); err != nil {
+			return asFailure(err)
+		}
 	}
-	r.mu.Lock()
-	err, ok := r.hosts[host]
-	r.mu.Unlock()
-	if !ok {
-		err = r.q.netOf(r.s).addr.checkURL(ctx, rawURL, true)
+	ariaProxied := addr.p.viaUpstream
+	err := addr.checkURLWith(ctx, rawURL, true, func(host string) error {
+		key, _ := db.HostKey(host) // (sameHost's rule: a look-alike host is checked itself)
+		r.mu.Lock()
+		err, ok := r.hosts[key]
+		r.mu.Unlock()
+		if ok {
+			return err
+		}
+		// a name Go cannot look up is refused when aria2c would look it
+		// up with the same resolver (SEC16 R2); with aria2c's features
+		// unknown, left to aria2c as before (engine.features logs it)
+		err = addr.checkAddrsWith(ctx, host, r.q.eng.systemResolver())
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return ctx.Err() // (not kept)
 		}
 		r.mu.Lock()
-		r.hosts[host] = err
+		r.hosts[key] = err
 		r.mu.Unlock()
+		return err
+	}, ariaProxied)
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	if f := localFailure(err); f != nil {
 		return f

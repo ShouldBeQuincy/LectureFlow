@@ -714,10 +714,14 @@ func CleanText(s string, max int) string {
 	return strings.TrimSpace(b.String())
 }
 
-// isFormatRune: bidi controls and other invisible format characters.
+// isFormatRune: bidi controls and other invisible format characters. The
+// bidi controls are those of Unicode's Bidi_Control property: U+061C
+// (ARABIC LETTER MARK), U+200E–U+200F, U+202A–U+202E and U+2066–U+2069
+// (within U+2060–U+206F). The text of sentences and words keeps ZWNJ and
+// ZWJ (isTextFormatRune); identifier-like strings (CleanText) drop them.
 func isFormatRune(r rune) bool {
 	switch {
-	case r >= 0x200b && r <= 0x200f, r >= 0x202a && r <= 0x202e, r >= 0x2060 && r <= 0x206f, r == 0xfeff:
+	case r == 0x061c, r >= 0x200b && r <= 0x200f, r >= 0x202a && r <= 0x202e, r >= 0x2060 && r <= 0x206f, r == 0xfeff:
 		return true
 	}
 	return false

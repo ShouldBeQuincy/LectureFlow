@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -296,6 +297,245 @@ func TestNewerDatabaseRefused(t *testing.T) {
 	}
 }
 
+// Security review M1: a database from a newer LectureFlow whose schema
+// this SQLite cannot parse (a newer table option) fails to be read, which
+// SQLite reports as malformed. It is still refused as from a newer version
+// (startup.data_dir_newer), by checkNotNewer and by prepareDatabase, never
+// as a damaged database to replace or move away; the file is not changed.
+func TestNewerDatabaseUnparseableSchemaRefused(t *testing.T) {
+	t.Cleanup(secrets.ResetForTest)
+	dataDir := t.TempDir()
+	path := dbFile(dataDir)
+	d, err := db.OpenDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Close()
+	newer := db.SchemaVersion() + 5
+	abs, _ := filepath.Abs(path)
+	raw, err := sql.Open("sqlite", "file:"+(&url.URL{Path: filepath.ToSlash(abs)}).EscapedPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw.SetMaxOpenConns(1)
+	for _, q := range []string{
+		"CREATE TABLE future(x)",
+		"PRAGMA writable_schema = ON",
+		"UPDATE sqlite_master SET sql = 'CREATE TABLE future(x) WITH FUTURE_OPTION' WHERE name = 'future'",
+		"PRAGMA writable_schema = OFF",
+		fmt.Sprintf("PRAGMA user_version = %d", newer),
+	} {
+		if _, err := raw.Exec(q); err != nil {
+			raw.Close()
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	raw.Close()
+	if _, err := db.InspectFile(context.Background(), path); err == nil {
+		t.Fatal("the schema was parsed: the test does not reach the case")
+	}
+	if v, ok := db.HeaderUserVersion(path); !ok || v != newer {
+		t.Fatalf("header user_version %d %v, want %d", v, ok, newer)
+	}
+	before := fileSum(t, path)
+
+	check := func(name string, err error) {
+		t.Helper()
+		var sf *startFailure
+		if !errors.As(err, &sf) || sf.Code != failDataDirNewer {
+			t.Fatalf("%s: %v, want %s", name, err, failDataDirNewer)
+		}
+		if sf.Params["found"] != newer || sf.Params["known"] != db.SchemaVersion() || sf.Params["backups"] != backupsDir(dataDir) {
+			t.Fatalf("%s: %v", name, sf.Params)
+		}
+		if strings.Contains(sf.Msg, "不是可用的数据库文件") || strings.Contains(sf.Msg, "not a usable database") {
+			t.Fatalf("%s: %s", name, sf.Msg)
+		}
+	}
+	check("checkNotNewer", checkNotNewer(context.Background(), dataDir, nil))
+	check("prepareDatabase", prepareDatabase(context.Background(), dataDir, "3.2.0", nil))
+	if fileSum(t, path) != before {
+		t.Fatal("the database file changed")
+	}
+}
+
+// D15 (R9 suggestion 1): as above, but the newer LectureFlow was stopped
+// hard after its migrations, before a checkpoint: the newer version and
+// schema are only in the -wal, the file header still has the version
+// this one knows. It is refused as from a newer version all the same,
+// not called "not a usable database" (whose text says to move it away).
+func TestNewerDatabaseOnlyInWALRefused(t *testing.T) {
+	t.Cleanup(secrets.ResetForTest)
+	src := filepath.Join(t.TempDir(), "lectureflow.db")
+	d, err := db.OpenDB(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Close()
+	newer := db.SchemaVersion() + 5
+	abs, _ := filepath.Abs(src)
+	raw, err := sql.Open("sqlite", "file:"+(&url.URL{Path: filepath.ToSlash(abs)}).EscapedPath()+"?_pragma=journal_mode(WAL)&_pragma=wal_autocheckpoint(0)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw.SetMaxOpenConns(1)
+	defer raw.Close()
+	for _, q := range []string{
+		"CREATE TABLE future(x)",
+		"PRAGMA writable_schema = ON",
+		"UPDATE sqlite_master SET sql = 'CREATE TABLE future(x) WITH FUTURE_OPTION' WHERE name = 'future'",
+		"PRAGMA writable_schema = OFF",
+		fmt.Sprintf("PRAGMA user_version = %d", newer),
+	} {
+		if _, err := raw.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	// the files as a process killed now leaves them
+	dataDir := t.TempDir()
+	path := dbFile(dataDir)
+	for _, s := range []string{"", "-wal", "-shm"} {
+		b, err := os.ReadFile(src + s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path+s, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if v, ok := db.HeaderUserVersion(path); !ok || v != db.SchemaVersion() {
+		t.Fatalf("header user_version %d %v: the test does not reach the case", v, ok)
+	}
+	if _, err := db.InspectFile(context.Background(), path); err == nil {
+		t.Fatal("the schema was parsed: the test does not reach the case")
+	}
+	before := fileSum(t, path)
+	beforeWAL := fileSum(t, path+"-wal")
+	for name, f := range map[string]func() error{
+		"checkNotNewer":   func() error { return checkNotNewer(context.Background(), dataDir, nil) },
+		"prepareDatabase": func() error { return prepareDatabase(context.Background(), dataDir, "3.2.0", nil) },
+	} {
+		err := f()
+		var sf *startFailure
+		if !errors.As(err, &sf) || sf.Code != failDataDirNewer || sf.Params["found"] != newer {
+			t.Errorf("%s: %v, want %s (found %d)", name, err, failDataDirNewer, newer)
+		}
+	}
+	if fileSum(t, path) != before || fileSum(t, path+"-wal") != beforeWAL {
+		t.Fatal("the database or its -wal changed")
+	}
+}
+
+// walUserVersion takes the version of the last committed page 1 whose
+// frames check out, as SQLite does: a damaged last frame drops that
+// transaction, a damaged WAL header the whole log.
+func TestWALUserVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "w.db")
+	abs, _ := filepath.Abs(path)
+	raw, err := sql.Open("sqlite", "file:"+(&url.URL{Path: filepath.ToSlash(abs)}).EscapedPath()+"?_pragma=journal_mode(WAL)&_pragma=wal_autocheckpoint(0)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw.SetMaxOpenConns(1)
+	defer raw.Close()
+	known := db.SchemaVersion()
+	for _, q := range []string{
+		"CREATE TABLE a(x)",
+		fmt.Sprintf("PRAGMA user_version = %d", known),
+		"INSERT INTO a VALUES (1)",
+		fmt.Sprintf("PRAGMA user_version = %d", known+3),
+	} {
+		if _, err := raw.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	wal, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	try := func(name string, b []byte) (int, bool) {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), name+"-wal")
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return walUserVersion(p)
+	}
+	if v, ok := try("whole", wal); !ok || v != known+3 {
+		t.Fatalf("whole log: %d %v", v, ok)
+	}
+	torn := append([]byte(nil), wal...)
+	torn[len(torn)-1] ^= 0xff // the last transaction's commit frame
+	if v, ok := try("torn", torn); !ok || v != known {
+		t.Fatalf("torn last frame: %d %v", v, ok)
+	}
+	if v, ok := try("cut", wal[:len(wal)-10]); !ok || v != known {
+		t.Fatalf("cut last frame: %d %v", v, ok)
+	}
+	badHeader := append([]byte(nil), wal...)
+	badHeader[17] ^= 0xff // salt-1
+	if v, ok := try("salt", badHeader); ok {
+		t.Fatalf("damaged header: %d", v)
+	}
+	if _, ok := try("empty", nil); ok {
+		t.Fatal("a version from an empty log")
+	}
+	if _, ok := walUserVersion(filepath.Join(t.TempDir(), "none-wal")); ok {
+		t.Fatal("a version from no log")
+	}
+}
+
+// Not an SQLite file, or no file: no version from the header.
+func TestHeaderUserVersionNotSQLite(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "x.db")
+	os.WriteFile(p, []byte(strings.Repeat("not a database ", 20)), 0o644)
+	if _, ok := db.HeaderUserVersion(p); ok {
+		t.Fatal("a version from a file that is not a database")
+	}
+	if _, ok := db.HeaderUserVersion(filepath.Join(dir, "none.db")); ok {
+		t.Fatal("a version from no file")
+	}
+}
+
+// A damaged database whose header kept the magic but nothing else (bytes
+// 16-99 overwritten, user_version reading as 1094795585) is a damaged
+// database, not one from a newer version (R9 suggestion 2).
+func TestDamagedHeaderNotNewer(t *testing.T) {
+	t.Cleanup(secrets.ResetForTest)
+	dataDir := t.TempDir()
+	path := dbFile(dataDir)
+	d, err := db.OpenDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Close()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 16; i < 100; i++ {
+		b[i] = 'A'
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.InspectFile(context.Background(), path); err == nil {
+		t.Fatal("the damaged database was read: the test does not reach the case")
+	}
+	if nf := checkNotNewer(context.Background(), dataDir, nil); nf != nil {
+		t.Fatalf("checkNotNewer: %v", nf)
+	}
+	var sf *startFailure
+	err = prepareDatabase(context.Background(), dataDir, "3.2.0", nil)
+	if !errors.As(err, &sf) || sf.Code == failDataDirNewer {
+		t.Fatalf("prepareDatabase: %v, want a database failure, not %s", err, failDataDirNewer)
+	}
+	if sf.Code != failDBNotDB {
+		t.Fatalf("prepareDatabase: %s, want %s", sf.Code, failDBNotDB)
+	}
+}
+
 // F1: a migration that failed after the backup was made: the next start
 // finds the backup recorded and makes no other one (the oldest state is
 // the one worth keeping).
@@ -367,6 +607,257 @@ func TestRotateUpgradeBackups(t *testing.T) {
 	sort.Strings(left)
 	if strings.Join(left, ",") != strings.Join(want, ",") {
 		t.Fatalf("left %v\nwant %v", left, want)
+	}
+}
+
+// SEC12 L-1: a read-only database (the record of the backup cannot be
+// written, the migrations fail): "Try again" three times makes one backup,
+// not one per start; a database changed since gets a new one.
+func TestUpgradeBackupOnceWhenReadOnly(t *testing.T) {
+	t.Cleanup(secrets.ResetForTest)
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	path := dbFile(dataDir)
+	buildOldDB(t, path, 9)
+	// an older upgrade's backup (the way back to an older LectureFlow)
+	bdir := backupsDir(dataDir)
+	os.MkdirAll(bdir, 0o700)
+	older := filepath.Join(bdir, upgradeBackupPrefix+"schema8-to-3.1.0-20261001-120000.db")
+	os.WriteFile(older, []byte("x"), 0o600)
+	past := time.Now().Add(-48 * time.Hour)
+	os.Chtimes(older, past, past)
+	os.Chtimes(path, past.Add(time.Hour), past.Add(time.Hour))
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(path, 0o644) })
+	clock := time.Date(2026, 11, 11, 9, 0, 0, 0, time.Local)
+	saved := upgradeNow
+	upgradeNow = func() time.Time { clock = clock.Add(time.Minute); return clock }
+	t.Cleanup(func() { upgradeNow = saved })
+
+	for i := 1; i <= 3; i++ {
+		err := prepareDatabase(ctx, dataDir, "3.2.0", nil)
+		asFailure(t, err, failDBReadOnly)
+		got := upgradeBackups(t, dataDir)
+		if len(got) != 2 { // the older one and one of this upgrade
+			t.Fatalf("start %d: backups %v", i, got)
+		}
+	}
+	if _, err := os.Stat(older); err != nil {
+		t.Fatal("the older upgrade's backup was removed")
+	}
+
+	// the database changed since that backup: a new one
+	os.Chmod(path, 0o644)
+	later := time.Now().Add(time.Hour)
+	if err := os.Chtimes(path, later, later); err != nil {
+		t.Fatal(err)
+	}
+	os.Chmod(path, 0o444)
+	asFailure(t, prepareDatabase(ctx, dataDir, "3.2.0", nil), failDBReadOnly)
+	if got := upgradeBackups(t, dataDir); len(got) != 3 {
+		t.Fatalf("after a change: backups %v", got)
+	}
+}
+
+// A backup of the same upgrade that is not a database of that schema, or
+// of another upgrade, does not count as made.
+func TestUpgradeBackupUnrecordedOnlySameUpgrade(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lectureflow.db")
+	buildOldDB(t, path, 9)
+	past := time.Now().Add(-time.Hour)
+	os.Chtimes(path, past, past)
+	bdir := filepath.Join(dir, "backups")
+	os.MkdirAll(bdir, 0o700)
+	put := func(name string, src string) {
+		b, _ := os.ReadFile(src)
+		os.WriteFile(filepath.Join(bdir, name), b, 0o600)
+	}
+	put(upgradeBackupPrefix+"schema9-to-3.3.0-20261111-090000.db", path) // another version
+	put(upgradeBackupPrefix+"schema8-to-3.2.0-20261111-090000.db", path) // another schema in the name
+	os.WriteFile(filepath.Join(bdir, upgradeBackupPrefix+"schema9-to-3.2.0-20261111-090100.db"), []byte("not a database"), 0o600)
+	if name, ok := upgradeBackupUnrecorded(path, bdir, 9, "3.2.0"); ok {
+		t.Fatalf("taken: %s", name)
+	}
+	put(upgradeBackupPrefix+"schema9-to-3.2.0-20261111-090200.db", path)
+	if name, ok := upgradeBackupUnrecorded(path, bdir, 9, "3.2.0"); !ok || name != upgradeBackupPrefix+"schema9-to-3.2.0-20261111-090200.db" {
+		t.Fatalf("%q %v", name, ok)
+	}
+}
+
+// SEC12 review L-4: a backup an unrecorded attempt left is not taken for
+// the backup of another copy of the database put in its place afterwards,
+// although that copy keeps an older modification time (a copy in Explorer,
+// a restore from a sync folder) and has no -wal (journal_mode DELETE, as
+// a copy taken out of backups/ can be).
+//
+// Overwritten in place, the file keeps its creation time, and its
+// modification time is set back to the old one: only the change time
+// (ctime) tells (SEC31 L4). Deleted and written again under the same name
+// at once, NTFS may give it the old creation time back (file name
+// tunneling), and then again only the change time tells; where that does
+// not happen, the case shows only that a new file is not taken for the
+// old one.
+func TestUpgradeBackupNotReusedForAReplacedCopy(t *testing.T) {
+	t.Run("overwritten in place", func(t *testing.T) {
+		dataDir, path, past, first, copyBytes := replacedCopySetup(t)
+		created, haveCreated := testCreationTime(path)
+		for _, s := range []string{"-wal", "-shm", "-journal"} {
+			if err := os.Remove(path + s); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(path, copyBytes, 0o644); err != nil { // truncates the same file
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, past, past); err != nil {
+			t.Fatal(err)
+		}
+		// the case: neither the creation nor the modification time changed
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d := fi.ModTime().Sub(past); d < -time.Microsecond || d > time.Microsecond {
+			t.Fatalf("modification time %v, set to %v: the test does not reach the case", fi.ModTime(), past)
+		}
+		if haveCreated {
+			if now, ok := testCreationTime(path); !ok || !now.Equal(created) {
+				t.Fatalf("creation time %v, was %v: the test does not reach the case", now, created)
+			}
+		} else {
+			t.Logf("creation time not read on %s; the modification time is the old one", runtime.GOOS)
+		}
+		checkReplacedCopyBackedUp(t, dataDir, first)
+	})
+	t.Run("deleted and written again", func(t *testing.T) {
+		dataDir, path, past, first, copyBytes := replacedCopySetup(t)
+		created, haveCreated := testCreationTime(path)
+		if err := db.RemoveDBFiles(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, copyBytes, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		older := past.Add(time.Hour)
+		if err := os.Chtimes(path, older, older); err != nil {
+			t.Fatal(err)
+		}
+		if now, ok := testCreationTime(path); haveCreated && ok && now.Equal(created) {
+			t.Logf("file name tunneling: the new file has the old creation time; only the change time tells")
+		} else {
+			t.Logf("no file name tunneling here (creation time %v, was %v): this case does not reach the change time", now, created)
+		}
+		checkReplacedCopyBackedUp(t, dataDir, first)
+	})
+}
+
+// replacedCopySetup: a schema-9 database whose upgrade backup was made but
+// not recorded (read-only), and the bytes of another copy of a schema-9
+// database with a course only it has (journal_mode DELETE, no -wal).
+func replacedCopySetup(t *testing.T) (dataDir, path string, past time.Time, first []string, copyBytes []byte) {
+	t.Helper()
+	t.Cleanup(secrets.ResetForTest)
+	ctx := context.Background()
+	dataDir = t.TempDir()
+	path = dbFile(dataDir)
+	buildOldDB(t, path, 9)
+	past = time.Now().Add(-48 * time.Hour)
+	os.Chtimes(path, past, past)
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(path, 0o644) })
+	asFailure(t, prepareDatabase(ctx, dataDir, "3.2.0", nil), failDBReadOnly)
+	first = upgradeBackups(t, dataDir)
+	if len(first) != 1 {
+		t.Fatalf("backups %v", first)
+	}
+	os.Chmod(path, 0o644)
+
+	other := filepath.Join(t.TempDir(), "copy.db")
+	buildOldDB(t, other, 9)
+	d, err := sql.Open("sqlite", "file:"+(&url.URL{Path: filepath.ToSlash(other)}).EscapedPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.SetMaxOpenConns(1)
+	for _, q := range []string{
+		`INSERT INTO course (id, name, created_at) VALUES ('c2','ONLY-IN-THE-COPY','2026-10-02T00:00:00Z')`,
+		`PRAGMA journal_mode = DELETE`,
+	} {
+		if _, err := d.Exec(q); err != nil {
+			d.Close()
+			t.Fatal(err)
+		}
+	}
+	d.Close()
+	if _, err := os.Stat(other + "-wal"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the copy has a -wal: %v", err)
+	}
+	if copyBytes, err = os.ReadFile(other); err != nil {
+		t.Fatal(err)
+	}
+	return dataDir, path, past, first, copyBytes
+}
+
+// checkReplacedCopyBackedUp: the start migrates the copy now in place
+// after a backup of its own, holding its course.
+func checkReplacedCopyBackedUp(t *testing.T, dataDir string, first []string) {
+	t.Helper()
+	if err := prepareDatabase(context.Background(), dataDir, "3.2.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	got := upgradeBackups(t, dataDir)
+	if len(got) != 2 {
+		t.Fatalf("the earlier backup was taken for this copy's: backups %v", got)
+	}
+	for _, n := range got {
+		if n == first[0] {
+			continue
+		}
+		bd, err := sql.Open("sqlite", "file:"+(&url.URL{Path: filepath.ToSlash(filepath.Join(backupsDir(dataDir), n))}).EscapedPath()+"?mode=ro")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var c int
+		err = bd.QueryRow(`SELECT COUNT(*) FROM course WHERE name = 'ONLY-IN-THE-COPY'`).Scan(&c)
+		bd.Close()
+		if err != nil || c != 1 {
+			t.Fatalf("the new backup %s does not hold the copy's course: %d %v", n, c, err)
+		}
+	}
+}
+
+// SEC12 L-1: the rotation keeps the newest backup of every source schema.
+func TestRotateKeepsTheNewestOfEverySchema(t *testing.T) {
+	bdir := t.TempDir()
+	base := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	mk := func(schema, i int) string {
+		n := fmt.Sprintf("%sschema%d-to-3.2.0-2026100%d-120000.db", upgradeBackupPrefix, schema, i)
+		p := filepath.Join(bdir, n)
+		os.WriteFile(p, []byte("x"), 0o600)
+		ts := base.Add(time.Duration(i) * time.Hour)
+		os.Chtimes(p, ts, ts)
+		return n
+	}
+	old8a, old8b := mk(8, 1), mk(8, 2)
+	var nine []string
+	for i := 3; i <= 7; i++ {
+		nine = append(nine, mk(9, i))
+	}
+	rotateUpgradeBackups(bdir, nine[4])
+	var left []string
+	ents, _ := os.ReadDir(bdir)
+	for _, e := range ents {
+		left = append(left, e.Name())
+	}
+	want := []string{old8b, nine[2], nine[3], nine[4]}
+	sort.Strings(want)
+	if strings.Join(left, ",") != strings.Join(want, ",") {
+		t.Fatalf("left %v\nwant %v (removed %s)", left, want, old8a)
 	}
 }
 
@@ -482,5 +973,61 @@ func TestSlowTimeoutGrowsWithSize(t *testing.T) {
 	}
 	if humanBytes(3<<30+(1<<29)) != "3.5 GB" || humanBytes(5<<20) != "5 MB" || humanBytes(1) != "1 MB" {
 		t.Fatal(humanBytes(3<<30+(1<<29)), humanBytes(5<<20))
+	}
+}
+
+// N33: a schema-14 database (as 3.2.0 left it) started with this version:
+// one backup without any credential is made first (schema 14, its rows),
+// then it is migrated past 14 (migration 015, the schema marker) and its
+// credentials are sealed in the bound format 3.2.0 does not know; its rows
+// are kept.
+func TestUpgradeFrom14BacksUpThenMarks(t *testing.T) {
+	t.Cleanup(secrets.ResetForTest)
+	cfgPath, dataDir := writeTestConfig(t)
+	path := filepath.Join(dataDir, "lectureflow.db")
+	buildOldDB(t, path, 14)
+	if fi := schemaOf(t, path); fi.Version != 14 || !fi.HasSecrets {
+		t.Fatalf("built %+v", fi)
+	}
+
+	p := startProc(t, []string{"-config", cfgPath, "-listen", "127.0.0.1:0", "-app-version", "3.2.1"}, "", AppOptions{})
+	p.ready()
+	<-p.app
+	baks := upgradeBackups(t, dataDir)
+	if len(baks) != 1 || !strings.HasPrefix(baks[0], upgradeBackupPrefix+"schema14-to-3.2.1-") {
+		t.Fatalf("backups %v", baks)
+	}
+	bak := filepath.Join(dataDir, "backups", baks[0])
+	for _, needle := range []string{upgKey, upgRefresh, "enc:v1:", secrets.PrefixV2} {
+		if fileHolds(t, bak, needle) {
+			t.Fatalf("the backup holds %q", needle)
+		}
+	}
+	if bi := schemaOf(t, bak); bi.Version != 14 || bi.HasSecrets {
+		t.Fatalf("backup %+v", bi)
+	}
+	p.sigc <- os.Interrupt
+	if c := p.wait(15 * time.Second); c != exitOK {
+		t.Fatalf("exit %d", c)
+	}
+	if mi := schemaOf(t, path); mi.Version < 15 || mi.Version != db.SchemaVersion() {
+		t.Fatalf("main %+v", mi)
+	}
+	if fileHolds(t, path, upgKey) || !fileHolds(t, path, secrets.PrefixV2) {
+		t.Fatal("the credentials are not sealed in the bound format")
+	}
+	for _, f := range []string{path, bak} {
+		d, err := sql.Open("sqlite", "file:"+(&url.URL{Path: filepath.ToSlash(f)}).EscapedPath()+"?mode=ro")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var name string
+		var providers int
+		d.QueryRow(`SELECT name FROM course WHERE id = 'c1'`).Scan(&name)
+		d.QueryRow(`SELECT COUNT(*) FROM provider`).Scan(&providers)
+		d.Close()
+		if name != "CSC3631" || providers != 1 {
+			t.Fatalf("%s: course %q, %d providers", filepath.Base(f), name, providers)
+		}
 	}
 }

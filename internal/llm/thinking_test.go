@@ -158,6 +158,33 @@ func offBodies(t *testing.T, thinking *string) []string {
 // file was written from offBodies on the unchanged client of commit 064f675
 // (the commit before the option; 230 requests, sha256 d9f9a8c9…19f0) and is
 // not regenerated: a difference is a regression, never a golden update.
+//
+// Amendments the user approved (NOTES.md, 用户决定 v3.2.x), each made by
+// editing only the lines it concerns, the others staying byte for byte:
+//   - v3.2.x P1 (Q4a): the 36 requests of anthropic-current (claude-opus-5-5,
+//     whose thinking runs without a thinking field) end with
+//     "output_config":{"effort":"low"} (sha256 f6a6aeb7…98ad).
+//   - v3.2.x D1 (Q6a): the same 36 requests have the max_tokens of a
+//     current Claude model: the role's base + 4000 of thinking headroom
+//     for claude-opus-5-5's level off (maxtokens.go; sha256 6b9cea08…3ea6).
+//     DeepSeek and older Claude models are unchanged.
+//   - v3.2.x P1-c (Q7a): the same 36 requests are streamed and end with
+//     "stream":true (stream.go: current Claude models only). Their thinking
+//     fields are unchanged (claude-opus-5-5's off sends no thinking field,
+//     so no display either; sha256 f1f1c1e7…462e).
+//   - C91 (round 2, real acceptance T9; approved by the user 2026-11-11):
+//     the same 36 requests hold 12000 instead of 4000 tokens of thinking
+//     headroom (max_tokens + 8000): claude-opus-5-5's thinking cannot be
+//     switched off and at effort low thought 9,965 tokens on one repair
+//     chunk (maxtokens.go, ThinkingHeadroomOffAlwaysThinking). Their
+//     thinking fields are unchanged. The same headroom for the level low of
+//     these models (also approved by the user 2026-11-11) does not reach
+//     this file: it holds the level off only.
+//
+// claude-sonnet-5-5 is not among the golden providers; its level off
+// ({"type":"between_tools"}) is tested in llmtest (p1_test.go), as is
+// {"type":"disabled"} of claude-opus-5, claude-sonnet-5 and claude-haiku-5-5
+// (C91; also TestAnthropicRequestThinkingByModelAndLevel).
 func TestThinkingOffBodiesUnchanged(t *testing.T) {
 	golden := filepath.Join("testdata", "thinking_off_bodies.golden")
 	want := offBodies(t, nil)

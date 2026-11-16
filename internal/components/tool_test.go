@@ -23,7 +23,7 @@ import (
 // zip whose bin/gcloud.cmd (Windows) and bin/gcloud (sh) behave like
 // "gcloud --version". Switches (inherited environment variables):
 //
-//	LF_FAKE_GCLOUD_LOG=file    append the arguments and the CLOUDSDK_* / PYTHONPATH values
+//	LF_FAKE_GCLOUD_LOG=file    append the arguments and the CLOUDSDK_* / PYTHONPATH values, the working directory (cwd) and whether it is empty (cwdempty)
 //	LF_FAKE_GCLOUD_FAIL=1      exit 1 with "ERROR: gcloud crashed"
 //	LF_FAKE_GCLOUD_GATE=file   wait until the file exists (pause / cancel / close during the check)
 //
@@ -37,6 +37,10 @@ const fakeGcloudCmd = "@echo off\r\n" +
 	">>\"%LF_FAKE_GCLOUD_LOG%\" echo config=%CLOUDSDK_CONFIG%\r\n" +
 	">>\"%LF_FAKE_GCLOUD_LOG%\" echo update=%CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK%\r\n" +
 	">>\"%LF_FAKE_GCLOUD_LOG%\" echo pythonpath=%PYTHONPATH%\r\n" +
+	">>\"%LF_FAKE_GCLOUD_LOG%\" echo cwd=%CD%\r\n" +
+	"set LFCWDEMPTY=yes\r\n" +
+	"for /f \"delims=\" %%f in ('dir /b /a 2^>nul') do set LFCWDEMPTY=no\r\n" +
+	">>\"%LF_FAKE_GCLOUD_LOG%\" echo cwdempty=%LFCWDEMPTY%\r\n" +
 	":nolog\r\n" +
 	"if not defined CLOUDSDK_CONFIG goto noconfig\r\n" +
 	">\"%CLOUDSDK_CONFIG%\\created.txt\" echo created\r\n" +
@@ -62,6 +66,8 @@ if [ -n "$LF_FAKE_GCLOUD_LOG" ]; then
     echo "config=$CLOUDSDK_CONFIG"
     echo "update=$CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK"
     echo "pythonpath=$PYTHONPATH"
+    echo "cwd=$(pwd -P)"
+    if [ -z "$(ls -A)" ]; then echo "cwdempty=yes"; else echo "cwdempty=no"; fi
   } >> "$LF_FAKE_GCLOUD_LOG"
 fi
 if [ -n "$CLOUDSDK_CONFIG" ]; then echo created > "$CLOUDSDK_CONFIG/created.txt"; fi

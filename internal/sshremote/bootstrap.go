@@ -81,12 +81,15 @@ func (b agentBuild) id() string { return b.sum[:16] }
 // (dir/<platform>/lf-agent).
 func findAgent(dir, platform string) (agentBuild, error) {
 	if dir == "" {
-		return agentBuild{}, errors.New("no agent directory")
+		return agentBuild{}, fmt.Errorf("%w (no agent directory)", errAgentMissing)
 	}
 	p := filepath.Join(dir, platform, "lf-agent")
 	f, err := os.Open(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return agentBuild{}, fmt.Errorf("%w for %s", errAgentMissing, platform)
+	}
 	if err != nil {
-		return agentBuild{}, fmt.Errorf("the lf-agent build for %s is missing: %w", platform, err)
+		return agentBuild{}, fmt.Errorf("the lf-agent build for %s cannot be read: %w", platform, err)
 	}
 	defer f.Close()
 	h := sha256.New()

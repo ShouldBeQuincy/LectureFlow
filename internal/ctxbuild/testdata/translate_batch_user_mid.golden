@@ -1,0 +1,19 @@
+[BEFORE]
+Today we talk about the cache hierarchy in modern processors.
+A write-back cache only writes a line to memory on eviction.
+Each cache line is 64 bytes on most x86 machines.
+[TARGET #4]
+So the first question is how we find a line in the cache.
+[ASR]
+(Raw speech recognition output; may contain errors. For reference only.)
+So the the first question is how we find a line in the cache.
+[TARGET #5]
+We split the address into a tag, an index and an offset.
+[TARGET #6]
+The index selects a set, and the tag tells us whether we have a hit.
+[TARGET #7]
+With a direct mapped cache, every set has exactly one line.
+[AFTER]
+That gives us conflict misses when two addresses map to the same set.
+A two-way set associative cache halves the number of sets.
+The miss rate drops from 5 percent to about 3 percent.

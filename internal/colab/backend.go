@@ -86,6 +86,15 @@ type Options struct {
 	// Enabled (nil = always) says whether Colab is switched on: Run reads
 	// the account every five minutes only then.
 	Enabled func(ctx context.Context) bool
+	// Retry: probing and retrying in place after a transient failure on the
+	// runtime (retry.go; zero = 3 probes after 5 s, 15 s and 30 s, each up
+	// to 20 % longer, 10 s per probe, 60 s in all). Its clock and waits are
+	// Now and Sleep. Not a setting.
+	Retry RetryOptions
+	// RuntimeTimeout of a small request to the runtime (0 = 60 s; an audio
+	// chunk and the result's download get three times as long). Tests
+	// shorten it.
+	RuntimeTimeout time.Duration
 }
 
 // Backoff is the exponential back-off of the accelerator queue.
@@ -124,6 +133,11 @@ type Event struct {
 	WaitingFor   string  `json:"waiting_for,omitempty"`
 	ETASec       float64 `json:"eta_sec"` // -1 unknown
 	SessionState string  `json:"session_state"`
+	// Reconnect: the runtime did not answer and the lecture is trying again
+	// in place (retry.go); nil otherwise. An event with it repeats the
+	// lecture's last step; one without it follows when the runtime answers
+	// again.
+	Reconnect *remote.Reconnect `json:"reconnect,omitempty"`
 }
 
 // Job is one lecture to transcribe remotely.
@@ -175,21 +189,45 @@ type Backend struct {
 	log     *slog.Logger
 
 	relMu sync.Mutex // one release at a time
+	// recMu orders the writes of the session record and of the lost
+	// runtimes (persist, dropSession, saveLost); lostMu: one retryLost at a
+	// time. Order: relMu, recMu, mu.
+	recMu  sync.Mutex
+	lostMu sync.Mutex
 
-	mu            sync.Mutex
-	settings      Settings
-	sess          *liveSession
-	jobs          []*jobState // running lectures, oldest first
-	queue         []float64
-	drained       bool
-	afterCurrent  bool
-	lastRelease   *ReleaseInfo
-	leftover      *LeftoverInfo
+	mu           sync.Mutex
+	settings     Settings
+	sess         *liveSession
+	jobs         []*jobState // running lectures, oldest first
+	queue        []float64
+	drained      bool
+	afterCurrent bool
+	lastRelease  *ReleaseInfo
+	leftover     *LeftoverInfo
+	// lost: runtimes to release that no session stands for (lost.go);
+	// lostCode the leftover's code while one is there.
+	lost          []lostRuntime
+	lostCode      string
 	ccu           *ccuSnapshot
 	rates         map[string]Rate
 	cooldownUntil time.Time
 	lastErr       *model.ErrorInfo
 	lastErrAt     time.Time
+	// lastErrAcct: lastErr came from reading the account while no session
+	// existed; the next reading that works clears it (v3.2.x).
+	lastErrAcct bool
+	// reach: whether the session's runtime answered lately (retry.go;
+	// forgotten with the session). handbackWG counts the hand-backs being
+	// released in the background.
+	reach      reachState
+	handbackWG sync.WaitGroup
+	// handBackHook (tests) runs in a background hand-back right before its
+	// release: a test holds it there to order the release against others.
+	handBackHook func()
+	// cancelWait: how long a cancelled lecture's Transcribe waits for the
+	// release of its runtime (releaseCancelled; cancelReleaseWait, shorter
+	// in tests).
+	cancelWait time.Duration
 
 	// colab-obs-core (account.go, samples.go): the last attempt to read the
 	// account and its error; a background reading runs; the runtime's
@@ -260,8 +298,17 @@ func New(o Options) (*Backend, error) {
 			}
 		}
 	}
-	if o.UploadClient == nil {
+	if o.Logger == nil {
+		o.Logger = slog.Default()
+	}
+	// The redirect policy (redirect.go) on every client: copies, so a
+	// caller's client is left as it is.
+	shared := o.UploadClient == nil || o.UploadClient == o.HTTPClient
+	o.HTTPClient = withRedirectPolicy(o.HTTPClient, o.Logger)
+	if shared {
 		o.UploadClient = o.HTTPClient
+	} else {
+		o.UploadClient = withRedirectPolicy(o.UploadClient, o.Logger)
 	}
 	if o.Dial == nil {
 		o.Dial = DialWebSocket(nil)
@@ -317,7 +364,12 @@ func New(o Options) (*Backend, error) {
 	if o.RemoteBase == "" {
 		o.RemoteBase = "content/lectureflow"
 	}
-	b := &Backend{o: o, secrets: &secretSet{}, log: o.Logger, settings: DefaultSettings(), rates: map[string]Rate{}}
+	o.Retry = o.Retry.normalized()
+	if o.RuntimeTimeout <= 0 {
+		o.RuntimeTimeout = runtimeTimeout
+	}
+	b := &Backend{o: o, secrets: &secretSet{}, log: o.Logger, settings: DefaultSettings(), rates: map[string]Rate{},
+		cancelWait: cancelReleaseWait}
 	b.bg, b.bgCancel = context.WithCancel(context.Background())
 	b.auth = &authManager{kv: o.KV, hc: o.HTTPClient, tokenURL: o.TokenURL, revokeURL: o.RevokeURL, now: o.Now,
 		runID: o.RunID, secrets: b.secrets, log: o.Logger}
@@ -348,6 +400,8 @@ func (b *Backend) Startup(ctx context.Context) error {
 	b.mu.Lock()
 	b.settings, b.rates, b.cooldownUntil = set, rates, cooldown
 	b.mu.Unlock()
+	b.loadLost(ctx)
+	b.retryLost(ctx) // runtimes an earlier run could not release (lost.go)
 	rec, err := b.loadRecord(ctx)
 	if err != nil {
 		return err
@@ -406,6 +460,7 @@ func (b *Backend) ImportADCFile(ctx context.Context, path string, lc Lifecycle, 
 			_ = b.cleanupLeftover(ctx, rec)
 		}
 	}
+	b.retryLost(ctx)
 	return info, nil
 }
 
@@ -460,11 +515,18 @@ func (b *Backend) Disconnect(ctx context.Context) (DisconnectResult, error) {
 // Close is called when the app quits: a running in-app sign-in is
 // cancelled, the runtime is released, and a credential with the "session"
 // lifecycle is deleted (its run ends).
+//
+// A hand-back being released in the background (handBack) is covered: the
+// release here waits for it (relMu) and is then a no-op, or runs first and
+// releases the runtime itself. When neither succeeds before the app is
+// gone, the session record (state stopping) stays and the next Startup
+// releases the runtime (cleanupLeftover).
 func (b *Backend) Close(ctx context.Context) error {
 	b.closeLogin() // a running gcloud sign-in ends with the app (login.go)
 	b.stopJobs(errShutdownNow, 10*time.Second)
 	err := b.release(ctx, ReleaseAppExit)
 	defer b.bgCancel()
+	b.retryLost(ctx) // what fails stays in kv colab.lost for the next start
 	if v, ok, _ := getKV(ctx, b.o.KV, KVCredential); ok {
 		var c storedCredential
 		if json.Unmarshal([]byte(v), &c) == nil && c.Lifecycle.Kind == LifecycleSession {
@@ -574,18 +636,21 @@ func (b *Backend) Run(ctx context.Context) {
 }
 
 // Tick does the time-driven work: releases an idle runtime (queue drained,
-// after-current, idle limit, window used up, credential about to end),
+// after-current, idle limit, window used up, credential about to end, a
+// finished lecture's file left on it),
 // stops a lecture whose credential is about to end (back to the queue),
 // and retries a failed release.
 func (b *Backend) Tick(ctx context.Context) {
+	b.adoptRecord(ctx) // a leftover session record joins them
+	b.retryLost(ctx)   // runtimes no session stands for (lost.go)
 	b.mu.Lock()
 	s, js := b.sess, append([]*jobState(nil), b.jobs...)
 	set := b.settings
 	drained, after := b.drained && len(b.queue) == 0, b.afterCurrent
-	var state string
+	var state, left string
 	var idleSince, requested time.Time
 	if s != nil {
-		state, idleSince, requested = s.rec.State, s.lastJobEnd, s.rec.RequestedAt
+		state, idleSince, requested, left = s.rec.State, s.lastJobEnd, s.rec.RequestedAt, s.leftFile
 		if idleSince.IsZero() {
 			idleSince = s.rec.ReadyAt
 		}
@@ -605,8 +670,9 @@ func (b *Backend) Tick(ctx context.Context) {
 		}
 		return
 	}
-	reason := ""
+	reason, file := "", ""
 	now := b.now()
+	windowUp := now.Sub(requested) >= FairWindow-time.Duration(b.o.Defaults.OverheadSec)*time.Second
 	switch {
 	case state == StateStopping:
 		reason = ReleaseFailed // retry
@@ -614,17 +680,29 @@ func (b *Backend) Tick(ctx context.Context) {
 		return
 	case authEnding:
 		reason = ReleaseAuthEnding
+	case left != "" && !windowUp:
+		// A finished lecture's file stayed and the lectures that kept the
+		// runtime are over (one that left before its end never released
+		// it: review R52 L1). The window's own release keeps its cooldown.
+		reason, file = ReleaseCleanupFailed, left
 	case after:
 		reason = ReleaseAfterCurrent
 	case drained:
 		reason = ReleaseQueueEmpty
-	case now.Sub(requested) >= FairWindow-time.Duration(b.o.Defaults.OverheadSec)*time.Second:
+	case windowUp:
 		reason = ReleaseWindow
 	case !idleSince.IsZero() && now.Sub(idleSince) >= time.Duration(set.IdleReleaseMin)*time.Minute:
 		reason = ReleaseIdle
 	}
 	if reason != "" {
-		_ = b.release(ctx, reason)
+		// A lecture dispatched to the runtime since the snapshot above keeps
+		// it (SEC2 T3): the idle-type reasons release only while no lecture
+		// is on it (ifIdle), and the next Tick asks again once none is. The
+		// retry of a failed release (stopping: nothing is dispatched to it)
+		// and the credential's end (later it could not be released at all)
+		// go as before.
+		idle := state != StateStopping && reason != ReleaseAuthEnding
+		_ = b.releaseWith(ctx, reason, releaseOpts{file: file, expect: s, ifIdle: idle}) // a stopping hand-back's own reason wins (releaseWith)
 	}
 }
 
@@ -695,6 +773,7 @@ func (b *Backend) CanDispatch(ctx context.Context, lectureDurationSec float64) (
 	if err := b.refreshCCU(ctx); blockingRead(err) {
 		b.mu.Lock()
 		b.noteErrLocked(infoOf(b.secrets.scrubErr(err)))
+		b.lastErrAcct = b.sess == nil
 		b.mu.Unlock()
 		if WaitingFor(err) != "" {
 			return false, WaitingFor(err)
@@ -744,6 +823,14 @@ type Status struct {
 	Leftover      *LeftoverInfo    `json:"leftover,omitempty"`
 	LastError     *model.ErrorInfo `json:"last_error,omitempty"`
 	LastErrorAt   *time.Time       `json:"last_error_at,omitempty"`
+	// SessionStartedAt: when the current session was requested (absent
+	// without one). LastError is cleared when a session starts; a front end
+	// may also hide an error older than this.
+	SessionStartedAt *time.Time `json:"session_started_at,omitempty"`
+	// Runtime: whether the session's runtime is held, answers and is billed
+	// (retry.go; absent without a session). A hint only: nothing is released
+	// because of it.
+	Runtime *RuntimeInfo `json:"runtime,omitempty"`
 
 	// colab-obs-core (account.go): the account (always present; level free
 	// until it was read), the accelerators it allows (T4 first), the one
@@ -779,6 +866,9 @@ type JobInfo struct {
 	// directory's name); Split the parts of "极速模式" (0 = whole).
 	JobID string `json:"job_id,omitempty"`
 	Split int    `json:"split,omitempty"`
+	// Reconnect: the runtime does not answer and the lecture is trying
+	// again in place (retry.go); nil otherwise.
+	Reconnect *remote.Reconnect `json:"reconnect,omitempty"`
 }
 
 // Status returns the backend's state without contacting Colab (the balance
@@ -801,7 +891,7 @@ func (b *Backend) Status(ctx context.Context) Status {
 	st := Status{
 		Service: "colab", Configured: auth.Present, Auth: auth, Accelerator: sel.effective, Tier: sel.tier(),
 		State: StateNone, WindowTotalSec: int64(FairWindow.Seconds()), CUPerHour: in.CUPerHour, ShutdownAfter: b.afterCurrent,
-		LastRelease: b.lastRelease, Leftover: b.leftover, LastError: b.lastErr, Planned: len(b.queue),
+		LastRelease: b.lastRelease, Leftover: b.leftoverLocked(), LastError: b.lastErr, Planned: len(b.queue),
 		Slots: b.slotsLocked(), Account: b.accountLocked(), SelectableAccelerators: sel.selectable,
 		EffectiveAccelerator: sel.effective, LockedReason: sel.locked, PreferredAccelerator: sel.preferred,
 	}
@@ -824,6 +914,9 @@ func (b *Backend) Status(ctx context.Context) Status {
 			st.SessionSpentCU = round2(b.now().Sub(s.rec.AssignedAt).Hours() * in.CUPerHour)
 		}
 		st.Machine, st.Usage = b.machineLocked(s), b.samples.Usage(b.now())
+		started := s.rec.RequestedAt.UTC()
+		st.SessionStartedAt = &started
+		st.Runtime = b.runtimeInfoLocked(s, sel.tier() == TierPaid)
 	}
 	if b.ccu != nil {
 		v := round2(b.ccu.info.Balance)
@@ -841,7 +934,7 @@ func (b *Backend) Status(ctx context.Context) Status {
 	}
 	for _, j := range b.jobs {
 		st.Jobs = append(st.Jobs, JobInfo{ID: j.id, Step: j.ev.Step, Stage: j.ev.Stage, Fraction: j.ev.Fraction, Overall: j.ev.Overall,
-			ETASec: j.ev.ETASec, StartedAt: j.started, JobID: j.key, Split: j.split})
+			ETASec: j.ev.ETASec, StartedAt: j.started, JobID: j.key, Split: j.split, Reconnect: j.reconnect})
 	}
 	if len(st.Jobs) > 0 {
 		c := st.Jobs[0]
@@ -852,7 +945,28 @@ func (b *Backend) Status(ctx context.Context) Status {
 
 // noteErrLocked records the last error (Status.LastError, LastErrorAt).
 func (b *Backend) noteErrLocked(info *model.ErrorInfo) {
-	b.lastErr, b.lastErrAt = info, b.now()
+	b.lastErr, b.lastErrAt, b.lastErrAcct = info, b.now(), false
+}
+
+// clearErrLocked forgets the last error (a new session begins; the account
+// can be read again).
+func (b *Backend) clearErrLocked() {
+	b.lastErr, b.lastErrAt, b.lastErrAcct = nil, time.Time{}, false
+}
+
+// accountReadOK: the account was read. An error recorded when it could not
+// be read while no session existed is over (v3.2.x: it used to stay on the
+// card until the app quit).
+func (b *Backend) accountReadOK() {
+	b.mu.Lock()
+	cleared := b.lastErrAcct
+	if cleared {
+		b.clearErrLocked()
+	}
+	b.mu.Unlock()
+	if cleared {
+		b.changed()
+	}
 }
 
 func infoOf(err error) *model.ErrorInfo {
@@ -889,8 +1003,11 @@ func remoteJobID(id string) string {
 // to the queue), IsBusy (the runtime is being released or started, or
 // another lecture still runs on it: back to the queue, Colab may take it
 // later; nothing is released), a cancelled ctx (the runtime is released, the error wraps
-// context.Canceled), or a local problem (missing audio). Any failure on
-// the runtime releases it at once (V14.3 step 5).
+// context.Canceled), or a local problem (missing audio). A transient
+// failure on the runtime is probed and retried in place first (retry.go);
+// any other failure, or the probe window used up, hands the lecture back at
+// once and releases the runtime in the background (V14.3 step 5; v3.2.x:
+// Transcribe no longer waits for the release).
 func (b *Backend) Transcribe(ctx context.Context, job Job, progress func(Event)) (string, error) {
 	path, err := b.transcribe(ctx, job, progress)
 	return path, b.secrets.scrubErr(err)
@@ -967,7 +1084,18 @@ func (b *Backend) transcribe(ctx context.Context, job Job, progress func(Event))
 	b.mu.Unlock()
 	if !hasSess {
 		if err := b.refreshCCU(jctx); blockingRead(err) {
-			return "", b.jobErr(ctx, jctx, err, false)
+			b.mu.Lock()
+			prev := b.lastErr
+			b.mu.Unlock()
+			err = b.jobErr(ctx, jctx, nil, err) // no session of this lecture's
+			b.mu.Lock()
+			if b.lastErr != prev {
+				// recorded just now (a cancel records nothing: an earlier
+				// lecture's error stays a lecture's error, review R3)
+				b.lastErrAcct = b.sess == nil // over once the account can be read
+			}
+			b.mu.Unlock()
+			return "", err
 		}
 	}
 	set = b.liveSettings()
@@ -985,16 +1113,16 @@ func (b *Backend) transcribe(ctx context.Context, job Job, progress func(Event))
 		return "", err
 	}
 	if err != nil {
-		return "", b.jobErr(ctx, jctx, err, false)
+		return "", b.jobErr(ctx, jctx, s, err) // s: the session whose boot failed, or nil
 	}
 	// With the real session: check again (queue wait and boot count).
 	if set.Tier == TierPaid {
 		if err := b.refreshCCU(jctx); blockingRead(err) {
-			return "", b.jobErr(ctx, jctx, err, true)
+			return "", b.jobErr(ctx, jctx, s, err)
 		}
 	}
 	if authLeft, err = b.auth.remaining(jctx); err != nil {
-		return "", b.jobErr(ctx, jctx, err, true)
+		return "", b.jobErr(ctx, jctx, s, err)
 	}
 	if d := Decide(b.dispatchInput(job.DurationSec, authLeft, true)); !d.Dispatch {
 		return "", decisionErr(d) // the runtime stays for a lecture that fits; Tick releases it when idle
@@ -1044,10 +1172,21 @@ func (b *Backend) lectureFailed(ctx, jctx context.Context, s *liveSession, j *jo
 	cause := context.Cause(jctx)
 	stopped := errors.Is(cause, errShutdownNow) || errors.Is(cause, errAuthEnding)
 	if !stopped && (ctx.Err() != nil || jobOnlyFailure(err)) && b.keepFor(s, j) {
-		if out.jobDir != "" {
+		switch {
+		case out.jobDir == "":
+		case ctx.Err() != nil:
 			// retried (the runtime stays): a file that still cannot go
 			// releases the runtime once no other lecture runs on it
 			b.cleanupKept(context.WithoutCancel(jctx), s, out.jobDir)
+		default:
+			// a failure: the same, in the background (the lecture goes back
+			// now, v3.2.x)
+			b.markBusyDir(s, out.jobDir) // before the lecture can come back (T051)
+			b.handbackWG.Add(1)
+			go func() {
+				defer b.handbackWG.Done()
+				b.cleanupKept(b.bg, s, out.jobDir) // ends with the app (Close)
+			}()
 		}
 		if ctx.Err() != nil {
 			b.log.Info("colab: lecture cancelled; its files on the runtime were deleted, the runtime stays for the other lectures")
@@ -1063,13 +1202,46 @@ func (b *Backend) lectureFailed(ctx, jctx context.Context, s *liveSession, j *jo
 			"code", Code(err))
 		return err
 	}
-	if out.jobDir != "" && jctx.Err() == nil {
-		// The runtime is released next; its files go first all the same
-		// (one attempt each). A stopped lecture skips this: the release
-		// follows at once and removes everything faster.
-		b.cleanupRemote(jctx, s, out.jobDir, false)
+	if stopped || ctx.Err() != nil {
+		// 立即关机, an ending credential: released here, as before (their
+		// callers rely on the runtime being gone). The user's cancel: the
+		// release begins here and is waited for a few seconds at most
+		// (releaseCancelled).
+		return b.jobErr(ctx, jctx, s, err)
 	}
-	return b.jobErr(ctx, jctx, err, true)
+	// A failure: the lecture goes back now; its files (one attempt each)
+	// and the runtime go in the background (handBack).
+	return b.failedErr(s, out.jobDir, err)
+}
+
+// failedErr classifies a failure of a lecture on Colab, records it as the
+// last error and hands the lecture's runtime back in the background when
+// it held one (V14.3 step 5: released at once — begun at once, not waited
+// for; v3.2.x). s nil: no session of this lecture's — nothing is released
+// (the session the backend has now is another lecture's: SEC2 H1, L3);
+// jobDir ("" = none) has its files deleted before the release.
+func (b *Backend) failedErr(s *liveSession, jobDir string, err error) error {
+	if st := statusOf(err); Code(err) == "" && (st == 401 || st == 403 || st == 404 || st == 410) && isRuntimeErr(err) {
+		err = fallbackErr(CodeSessionReclaimed, nil, err) // the runtime's Jupyter server is gone or refuses us
+	}
+	if Code(err) == "" {
+		err = codedHTTP("colab", err)
+		if Code(err) == "" {
+			err = fallbackErr(CodeUnavailable, map[string]any{"endpoint": "runtime"}, err)
+		}
+	}
+	reason := ReleaseFailed
+	if Code(err) == CodeSessionReclaimed {
+		reason = ReleaseReclaimed
+	}
+	b.mu.Lock()
+	b.noteErrLocked(infoOf(b.secrets.scrubErr(err)))
+	b.mu.Unlock()
+	b.log.Info("colab: lecture failed on Colab; back to the local devices", "code", Code(err), "release", s != nil)
+	if s != nil {
+		b.handBack(s, jobDir, reason)
+	}
+	return err
 }
 
 // defaultsFor is the estimate's defaults with the accelerator's own
@@ -1098,40 +1270,28 @@ func decisionErr(d Decision) error {
 		kindFallback, model.WaitRemoteWindow, errors.New("the lecture does not fit the remaining fair-use window"))
 }
 
-// jobErr classifies a failure of the lecture and releases the runtime when
-// one was held (V14.3 step 5: "任务失败、用户取消时立即释放").
-func (b *Backend) jobErr(ctx, jctx context.Context, err error, held bool) error {
+// jobErr classifies a failure of the lecture and releases the runtime
+// (V14.3 step 5: "任务失败、用户取消时立即释放"): after 立即关机 or an ending
+// credential the backend's runtime, here and now (they end every lecture);
+// after the user's cancel the lecture's own session s, begun now and waited
+// for a few seconds at most (releaseCancelled); after a failure s in the
+// background (failedErr). s nil: the lecture had no
+// session of its own (before or while borrowing): a cancel or a failure
+// releases nothing, since the session there may be another lecture's,
+// being borrowed (SEC2 L3).
+func (b *Backend) jobErr(ctx, jctx context.Context, s *liveSession, err error) error {
 	cause := context.Cause(jctx)
 	switch {
 	case errors.Is(cause, errShutdownNow), errors.Is(cause, errAuthEnding):
 		_ = b.release(ctx, stopReason(jctx))
 		return newErr(CodeShutdownRequeue, nil, kindRequeue, "", errors.New("the remote runtime was shut down; the lecture goes back to the queue"))
 	case ctx.Err() != nil:
-		_ = b.release(ctx, ReleaseCancelled)
+		if s != nil {
+			b.releaseCancelled(s) // returns within seconds (retry.go)
+		}
 		return newErr(CodeCancelled, nil, kindFallback, "", ctx.Err())
 	}
-	if st := statusOf(err); Code(err) == "" && (st == 401 || st == 403 || st == 404 || st == 410) && isRuntimeErr(err) {
-		err = fallbackErr(CodeSessionReclaimed, nil, err) // the runtime's Jupyter server is gone or refuses us
-	}
-	if Code(err) == "" {
-		err = codedHTTP("colab", err)
-		if Code(err) == "" {
-			err = fallbackErr(CodeUnavailable, map[string]any{"endpoint": "runtime"}, err)
-		}
-	}
-	reason := ReleaseFailed
-	if Code(err) == CodeSessionReclaimed {
-		reason = ReleaseReclaimed
-	}
-	b.mu.Lock()
-	b.noteErrLocked(infoOf(b.secrets.scrubErr(err)))
-	hasSess := b.sess != nil
-	b.mu.Unlock()
-	if held || hasSess {
-		_ = b.release(ctx, reason)
-	}
-	b.log.Info("colab: lecture failed on Colab; back to the local devices", "code", Code(err))
-	return err
+	return b.failedErr(s, "", err)
 }
 
 // stopReason is the release reason of a lecture whose context jctx was

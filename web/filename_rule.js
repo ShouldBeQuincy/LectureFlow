@@ -109,6 +109,15 @@ export async function regenerateFilenameRule(course) {
   }
 }
 
+// regenerateFilenameRule for a dialog's busy() (dom.js openDialog): the
+// reason it could not start is a rejection, which busy tells as a toast
+// when the dialog has left the page meanwhile (R62 N4, N5).
+function regenerateOrThrow(course) {
+  return regenerateFilenameRule(course).then((why) => {
+    if (why) throw new Error(why);
+  });
+}
+
 /**
  * The notice above the lecture list, or null. handlers: {onChanged(course),
  * onOpen()} — onOpen opens the preview dialog.
@@ -193,7 +202,7 @@ export function filenameNotice(course, handlers) {
 export function openFilenameRuleDialog(course, opts = {}) {
   return openDialog(
     t('course.filename.title'),
-    (close) => {
+    (close, busy) => {
       let view = null; // FilenameRuleView
       let preview = null; // the table currently shown: {preview, matched, total, ok, problems, problems_info}
       let regex = '';
@@ -441,10 +450,11 @@ export function openFilenameRuleDialog(course, opts = {}) {
           fkey: 'fn:regen',
           onclick: async () => {
             regen.disabled = true;
-            const why = await regenerateFilenameRule(course);
-            if (why) {
+            try {
+              await busy(regenerateOrThrow(course));
+            } catch (e) {
               regen.disabled = false;
-              err.textContent = why;
+              err.textContent = e.message;
               return;
             }
             close('regenerate');
@@ -460,7 +470,9 @@ export function openFilenameRuleDialog(course, opts = {}) {
       async function apply() {
         err.textContent = '';
         try {
-          const c = await withRenumber((confirm) => api.applyFilenameRule(course.id, regex.trim(), kindMap, confirm, { quiet: true }));
+          // busy (here and in ignore): a route change while it runs lets it
+          // finish (R62 N4)
+          const c = await busy(withRenumber((confirm) => api.applyFilenameRule(course.id, regex.trim(), kindMap, confirm, { quiet: true })));
           if (!c) return;
           toast(t('course.filename.applied'), 'success');
           close(c);
@@ -472,7 +484,7 @@ export function openFilenameRuleDialog(course, opts = {}) {
       async function ignore() {
         err.textContent = '';
         try {
-          await api.dismissFilenameProposal(course.id, { quiet: true });
+          await busy(api.dismissFilenameProposal(course.id, { quiet: true }));
           toast(t('course.filename.ignored'), 'info');
           close('ignored');
         } catch (e) {
@@ -493,7 +505,7 @@ export function openFilenameRuleDialog(course, opts = {}) {
 /**
  * The "recording times" section of the course settings dialog: the saved rule, its
  * buttons, and whether the organizer role can generate one.
- * opts: {onOpenRule(), onChanged(course), close (of the settings dialog)}
+ * opts: {onOpenRule(), onChanged(course), close, busy (of the settings dialog)}
  */
 export function recordingSection(course, opts = {}) {
   const rule = course.filename_rule;
@@ -505,7 +517,12 @@ export function recordingSection(course, opts = {}) {
     fkey: 'cset:fn-regen',
     onclick: async () => {
       regen.disabled = true;
-      why.textContent = await regenerateFilenameRule(course);
+      // busy (the settings dialog's): as in the rule's own dialog
+      const sending = regenerateOrThrow(course);
+      why.textContent = await (opts.busy ? opts.busy(sending) : sending).then(
+        () => '',
+        (e) => e.message,
+      );
       regen.disabled = false;
       if (!why.textContent && opts.onChanged) opts.onChanged(null);
     },

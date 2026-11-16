@@ -43,6 +43,27 @@ func (g *fakeGPU) set(free, total, used int) {
 	g.mu.Unlock()
 }
 
+// waitSampledPeak is for a fake GPU stage's run: it returns once the VRAM
+// sampler recorded at least mb over the baseline for the running GPU job of
+// scopeID. A fixed sleep inside the run could see no sample at all on a
+// loaded machine. An error after 5 s (the caller's run returns it).
+func (e *env) waitSampledPeak(scopeID string, mb int) error {
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		e.s.mu.Lock()
+		got := false
+		for _, r := range e.s.running {
+			if r.job.ScopeID == scopeID && r.res == ResourceGPU && r.peakMB >= mb {
+				got = true
+			}
+		}
+		e.s.mu.Unlock()
+		if got {
+			return nil
+		}
+	}
+	return fmt.Errorf("no VRAM sample of %d MB for %s", mb, scopeID)
+}
+
 type recEvents struct {
 	mu      sync.Mutex
 	jobs    []model.Job
@@ -450,9 +471,9 @@ func TestVRAMCalibration(t *testing.T) {
 	var e *env
 	asr := &fakeStage{name: model.StageASR, res: ResourceGPU, run: func(ctx context.Context, id string, p func(float64)) error {
 		e.gpu.set(14000, 24000, 7000) // +6000 MB over the 1000 MB baseline
-		time.Sleep(80 * time.Millisecond)
+		err := e.waitSampledPeak(id, 6000)
 		e.gpu.set(20000, 24000, 1000)
-		return nil
+		return err
 	}}
 	e = newEnv(t, nil, instant(model.StagePrep, ResourceCPU), asr)
 	l := e.lecture()
@@ -962,18 +983,38 @@ func TestDependenciesAdvanceAutomatically(t *testing.T) {
 }
 
 func TestProgressThrottled(t *testing.T) {
+	var e *env
+	// progressSeen: a running event with progress was emitted for the
+	// lecture's prep (the fixed sleeps alone may see no flush under load).
+	progressSeen := func(id string) bool {
+		e.ev.mu.Lock()
+		defer e.ev.mu.Unlock()
+		for _, ej := range e.ev.jobs {
+			if ej.ScopeID == id && ej.Stage == model.StagePrep && ej.Status == model.StatusRunning && ej.Progress > 0 {
+				return true
+			}
+		}
+		return false
+	}
 	prep := &fakeStage{name: model.StagePrep, res: ResourceCPU, run: func(ctx context.Context, id string, p func(float64)) error {
 		for i := 0; i <= 10000; i++ {
 			p(float64(i) / 10000)
 			if i%500 == 0 {
 				time.Sleep(4 * time.Millisecond) // let a few flushes happen
 			}
+			if i == 5000 {
+				for deadline := time.Now().Add(5 * time.Second); !progressSeen(id); time.Sleep(time.Millisecond) {
+					if time.Now().After(deadline) {
+						return errors.New("no progress flushed within 5 s")
+					}
+				}
+			}
 		}
 		p(2) // clamped
 		time.Sleep(15 * time.Millisecond)
 		return nil
 	}}
-	e := newEnv(t, nil, prep)
+	e = newEnv(t, nil, prep)
 	l := e.lecture()
 	e.start()
 	j := e.waitStatus(l.ID, model.StagePrep, model.StatusDone)

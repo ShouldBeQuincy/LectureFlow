@@ -25,6 +25,21 @@
 // the caller sets it), like the e2e tests: the service would otherwise
 // register the browsers' native messaging host for this temporary build,
 // over the registration of an installed LectureFlow.
+// Every run gets its own temporary root (smokeDirs): the data directory
+// (LECTUREFLOW_DATA_DIR) and the account's per-user folders the app would
+// otherwise take from the environment (LOCALAPPDATA, APPDATA, TEMP, TMP:
+// the in-app update's trust folder %LOCALAPPDATA%\LectureFlow\selfupdate
+// and its private copies in %TEMP% are shared by every LectureFlow of the
+// account and not moved by LECTUREFLOW_DATA_DIR; packaged smoke test T14)
+// lie below it, and it is removed at the end. On Windows the update's
+// trust folder and private copies are thereby off the real account's
+// folders. On macOS they are not: TMPDIR is left alone (userDirsUnder) and
+// the packaged app counts as an installation that can update itself, so
+// its start removes private copies (lectureflow-update-*, older than ten
+// minutes) from the real temporary folder; the release workflow runs it
+// on a throwaway runner. Folders the app takes from elsewhere (the home
+// folder, Electron's known folders) are not redirected; the three checks
+// do not write there (packaged smoke test T14, security review SEC29).
 //
 // Usage: node scripts/smoke.js [--dist DIR] [--expect-updates selfupdate|electron-updater]
 'use strict';
@@ -104,12 +119,67 @@ function updateMechanism(log, { updatesOn, expect } = {}) {
   return { mechanism, problem: problems.join('; ') };
 }
 
-/** smokeEnv(dataDir) → the app's environment: own data dir, no extension endpoint unless the caller set one. */
-function smokeEnv(dataDir) {
-  const env = { ...process.env, LECTUREFLOW_DATA_DIR: dataDir };
+/**
+ * userDirsUnder(userRoot) → the per-user folders of the app's environment,
+ * below userRoot: LOCALAPPDATA (Local), APPDATA (Roaming), TEMP and TMP
+ * (Temp). On macOS none of them takes effect: TMPDIR, which macOS sets,
+ * comes first and is left alone (a longer one could make Chromium's
+ * socket paths too long; not tried, no Mac to test on), so the app there
+ * still uses the real temporary folder.
+ */
+function userDirsUnder(userRoot) {
+  const temp = path.join(userRoot, 'Temp');
+  return { LOCALAPPDATA: path.join(userRoot, 'Local'), APPDATA: path.join(userRoot, 'Roaming'), TEMP: temp, TMP: temp };
+}
+
+/**
+ * smokeEnv(dataDir, userRoot) → the app's environment: own data dir, the
+ * per-user folders below userRoot (userDirsUnder; required, an absolute
+ * path), no extension endpoint unless the caller set one, and no variable
+ * whose name ends in _API_KEY (any case: DEEPSEEK_API_KEY, GEMINI_API_KEY,
+ * ZHIPUAI_API_KEY, which the app offers to import, and OPENAI_API_KEY,
+ * ANTHROPIC_API_KEY and the like). The packaged app under test never needs
+ * a model service key; that the desktop app does not import one from the
+ * environment by itself should not be what keeps the caller's key out of
+ * a throwaway data directory (T27 P4). Their values are never read.
+ */
+function smokeEnv(dataDir, userRoot) {
+  if (typeof userRoot !== 'string' || !path.isAbsolute(userRoot)) throw new Error('smokeEnv: userRoot must be an absolute path');
+  const env = { ...process.env, LECTUREFLOW_DATA_DIR: dataDir, ...userDirsUnder(userRoot) };
   for (const k of ['LECTUREFLOW_SERVER', 'LECTUREFLOW_RESOURCES', 'ELECTRON_RUN_AS_NODE', 'LECTUREFLOW_E2E_ALLOW_DEBUG']) delete env[k];
+  for (const k of Object.keys(env)) if (/_API_KEY$/i.test(k)) delete env[k];
   if (!env.LECTUREFLOW_NM_ENDPOINT) env.LECTUREFLOW_NM_ENDPOINT = 'off';
   return env;
+}
+
+/**
+ * smokeDirs(prefix, tmp) → { root, dataDir, userRoot }: a new temporary
+ * root in tmp (default the system's) holding the data directory (data)
+ * and the per-user folders (user/Local, user/Roaming, user/Temp), all
+ * created like the root (only this account may use them on macOS; on
+ * Windows they inherit the temporary folder's access, as the root does).
+ * Removing root removes everything a run left.
+ */
+function smokeDirs(prefix, tmp = os.tmpdir()) {
+  const root = fs.mkdtempSync(path.join(tmp, prefix));
+  const dataDir = path.join(root, 'data');
+  const userRoot = path.join(root, 'user');
+  for (const d of new Set([dataDir, ...Object.values(userDirsUnder(userRoot))])) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+  return { root, dataDir, userRoot };
+}
+
+/**
+ * removeRoot(root, rm, warn): remove a run's temporary root (smokeDirs).
+ * A failure (a process left over from the run still holding a file: EBUSY
+ * once the retries are used up) is only a warning: it neither hides the
+ * error the run failed with nor fails a run that passed.
+ */
+function removeRoot(root, rm = fs.rmSync, warn = console.warn) {
+  try {
+    rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+  } catch (err) {
+    warn(`warning: could not remove the temporary folder ${root}: ${err && err.message ? err.message : err}`);
+  }
 }
 
 function appExe() {
@@ -170,8 +240,8 @@ function killTree(child) {
 
 async function debugSwitchCheck(exe) {
   for (const allow of [false, true]) {
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lf-smoke-debug-'));
-    const env = smokeEnv(dataDir);
+    const { root, dataDir, userRoot } = smokeDirs('lf-smoke-debug-');
+    const env = smokeEnv(dataDir, userRoot);
     if (allow) env.LECTUREFLOW_E2E_ALLOW_DEBUG = '1';
     const cdpPort = await freePort();
     const child = spawn(exe, [`--remote-debugging-port=${cdpPort}`], { env, stdio: 'ignore' });
@@ -193,7 +263,7 @@ async function debugSwitchCheck(exe) {
     } finally {
       killTree(child);
       await Promise.race([exited, new Promise((r) => setTimeout(r, 10000))]);
-      fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+      removeRoot(root);
     }
   }
 }
@@ -204,8 +274,8 @@ async function main() {
   // Before the app starts: a bad --expect-updates or an unreadable keys.go.
   const expect = expectedUpdates(argValue('--expect-updates'));
   console.log(`expected update mechanism: ${expect === 'selfupdate' ? 'in-app updates' : 'electron-updater'}${argValue('--expect-updates') ? ' (--expect-updates)' : ' (internal/selfupdate/keys.go)'}`);
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lf-smoke-'));
-  const env = smokeEnv(dataDir);
+  const { root, dataDir, userRoot } = smokeDirs('lf-smoke-');
+  const env = smokeEnv(dataDir, userRoot);
   env.ELECTRON_RUN_AS_NODE = '1'; // must be ignored: the RunAsNode fuse is off
   const t0 = Date.now();
   const app = spawn(exe, [], { env, stdio: 'ignore' });
@@ -247,11 +317,11 @@ async function main() {
     console.log('smoke test passed');
   } finally {
     if (alive(app.pid)) app.kill();
-    fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+    removeRoot(root);
   }
 }
 
-module.exports = { updateMechanism, expectedUpdates, smokeEnv, UPDATE_LINES };
+module.exports = { updateMechanism, expectedUpdates, smokeEnv, smokeDirs, userDirsUnder, removeRoot, UPDATE_LINES };
 
 if (require.main === module) {
   main().catch((err) => {

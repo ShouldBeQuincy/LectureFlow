@@ -129,7 +129,7 @@ var reservedStem = regexp.MustCompile(`(?i)^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|CO
 // an extension), no trailing dot or space, at most 121 characters.
 func FuzzFileStem(f *testing.F) {
 	for _, s := range []string{"Lecture 3: Graphs / Trees", "  CON ", "CON.mp4", "aux .x", "nul..", "COM¹", "lpt0.tar.gz", "...", "",
-		"Week 1.", "讲座 第三讲：图论", "a\x00b c", "\xff\xfe", "CONIN$", strings.Repeat("长", 300)} {
+		"Week 1.", "讲座 第三讲：图论", "a\x00b\u2028c", "\xff\xfe", "CONIN$", strings.Repeat("长", 300)} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, title string) {

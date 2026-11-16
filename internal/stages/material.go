@@ -6,6 +6,7 @@ package stages
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -16,6 +17,7 @@ import (
 
 	"lectureflow/internal/config"
 	"lectureflow/internal/ctxbuild"
+	"lectureflow/internal/llm"
 	"lectureflow/internal/model"
 	"lectureflow/internal/sched"
 	"lectureflow/internal/state"
@@ -130,16 +132,32 @@ func (s *materialTermsStage) Run(ctx context.Context, materialID string, progres
 	var (
 		mu     sync.Mutex
 		failed []int
-		capped = map[int]int{} // chunk → distinct terms returned, when over the limit
+		// refused: chunks the provider declined (llm.ErrRefusal), skipped
+		// like unusable ones (review fix of v3.2.x P1).
+		refused      []int
+		firstRefusal error
+		capped       = map[int]int{} // chunk → distinct terms returned, when over the limit
 	)
 	pc := &progressCounter{total: len(reqs), report: func(p float64) { progress(p * 0.9) }}
 	err = parallel(ctx, len(reqs), d.concurrency(config.RoleGlossary, ""), func(ctx context.Context, i int) (bool, error) {
-		a, err := askJSON(ctx, d.LLM, config.RoleGlossary, reqs[i].System, reqs[i].User, checkTermsAnswer)
+		a, err := askJSON(llm.WithJSONSchema(ctx, ctxbuild.SchemaTerms), d.LLM, config.RoleGlossary, reqs[i].System, reqs[i].User, checkTermsAnswer)
 		if err != nil {
 			if isUnusable(err) {
-				slog.Warn("material_terms chunk unusable", "material", materialID, "chunk", i, "err", err)
+				// No error text: it quotes the model's answer (course content).
+				slog.Warn("material_terms chunk unusable", "material", materialID, "chunk", i, "problem", unusableKind(err))
 				mu.Lock()
 				failed = append(failed, i)
+				mu.Unlock()
+				pc.inc()
+				return false, nil
+			}
+			if errors.Is(err, llm.ErrRefusal) && ctx.Err() == nil {
+				slog.Warn("material_terms chunk refused by the provider", "material", materialID, "chunk", i, "category", refusalCategory(err))
+				mu.Lock()
+				refused = append(refused, i)
+				if firstRefusal == nil {
+					firstRefusal = err
+				}
 				mu.Unlock()
 				pc.inc()
 				return false, nil
@@ -162,7 +180,10 @@ func (s *materialTermsStage) Run(ctx context.Context, materialID string, progres
 	if err != nil {
 		return err
 	}
-	if len(reqs) > 0 && len(failed) == len(reqs) {
+	if len(reqs) > 0 && len(refused) == len(reqs) {
+		return firstRefusal // llm.refusal, permanent: every chunk was declined
+	}
+	if len(reqs) > 0 && len(failed) > 0 && len(failed)+len(refused) == len(reqs) {
 		return model.Errorf(CodeMaterialTermsUnparsable, map[string]any{"filename": m.Filename, "n": len(reqs), "attempts": businessRetries + 1},
 			fmt.Errorf("课件 %s 的 %d 块术语提取结果都无法解析（模型输出连续 %d 次无法使用）", m.Filename, len(reqs), businessRetries+1))
 	}
@@ -217,6 +238,26 @@ func (s *materialTermsStage) Run(ctx context.Context, materialID string, progres
 			m.Filename, len(reqs), strings.Join(texts, "、"), businessRetries+1)
 		warningInfo = &model.ErrorInfo{Code: WarnMaterialTermsLost, Params: map[string]any{
 			"filename": m.Filename, "total": len(reqs), "chunks": numList(chunks), "attempts": businessRetries + 1}}
+	}
+	if len(refused) > 0 {
+		sort.Ints(refused)
+		texts := make([]string, len(refused))
+		chunks := make([]int, len(refused))
+		for k, i := range refused {
+			texts[k] = fmt.Sprintf("第 %d 块", i+1)
+			chunks[k] = i + 1
+		}
+		note += fmt.Sprintf("；共 %d 块，其中%s被服务商的安全策略拒绝，已跳过", len(reqs), strings.Join(texts, "、"))
+		parts = append(parts, part(NoteMaterialRefused, map[string]any{"total": len(reqs), "chunks": numList(chunks)}))
+		rwarn := fmt.Sprintf("课件 %s 共 %d 块，其中%s的术语提取请求被服务商的安全策略拒绝，这些页的术语没有加入术语表",
+			m.Filename, len(reqs), strings.Join(texts, "、"))
+		rinfo := model.ErrorInfo{Code: WarnMaterialTermsRefused, Params: map[string]any{
+			"filename": m.Filename, "total": len(reqs), "chunks": numList(chunks)}}
+		if warningInfo == nil {
+			warning, warningInfo = rwarn, noteInfo(rinfo)
+		} else {
+			warning, warningInfo = warning+"；"+rwarn, noteInfo(*warningInfo, rinfo)
+		}
 	}
 	sched.UpdateStats(ctx, func(st *model.JobStats) {
 		st.Note, st.NoteInfo = note, noteInfo(parts...)

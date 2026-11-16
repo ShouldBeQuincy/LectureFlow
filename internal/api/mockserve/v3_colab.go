@@ -53,6 +53,21 @@ package main
 //	colab_locked     the paid balance used up (0, no free quota): the A100
 //	                 picked is kept, a T4 is borrowed (locked: no_balance)
 //
+// v3.2.x (retry in place, still billed, releasing; internal/colab retry.go):
+//
+//	colab_reconnect        as colab_running, but the runtime does not answer:
+//	                       the running lecture retries in place
+//	                       (reconnect attempt 1–3 of 3, the next try every
+//	                       15 s); an error of before the session (hidden by
+//	                       the front end: last_error_at < session_started_at)
+//	colab_unreachable      a paid L4 session whose runtime does not answer,
+//	                       no lecture on it: "仍在计费" with the CU spent
+//	colab_unreachable_free the same on a free account (T4): "仍在占用本次使用窗口"
+//	colab_releasing        a paid L4 session being released (stopping, the
+//	                       release keeps failing: the runtime does not
+//	                       answer), plus a runtime lost earlier with no
+//	                       accelerator known (leftover colab.release_failed)
+//
 // The resource snapshot ("remote", "remotes"), the lecture views
 // (stats.remote and the Colab snapshot of the remote asr stage), the device
 // list (the colab:remote row) and the SSE "resources" events get the Colab
@@ -146,6 +161,16 @@ type colabMock struct {
 	acctFail *model.ErrorInfo
 	two      bool // colab_active: the first queued asr lecture runs remotely too
 	split    bool // colab_active: the first done lecture was transcribed in speed mode
+	// v3.2.x: the runtime does not answer (Status.Runtime unreachable);
+	// reconnect: the running lecture retries in place; noJobs: no lecture
+	// on the runtime; stuckStop: a stopping session stays stopping;
+	// staleErr: an error of before the session; leftover: Status.Leftover
+	unreachable bool
+	reconnect   bool
+	noJobs      bool
+	stuckStop   bool
+	staleErr    bool
+	leftover    *colab.LeftoverInfo
 }
 
 var colabStates sync.Map // *mock + scenario → *colabMock
@@ -204,7 +229,8 @@ func colabUnread() colab.Account {
 func newColabMock(sc string, now time.Time) *colabMock {
 	c := &colabMock{settings: colab.DefaultSettings(), pinned: map[string]bool{}, acct: colabUnread()}
 	switch sc {
-	case "colab_none", "colab_queued", "colab_running", "colab_exhausted", "colab_active", "colab_idle", "colab_unknown", "colab_free", "colab_locked":
+	case "colab_none", "colab_queued", "colab_running", "colab_exhausted", "colab_active", "colab_idle", "colab_unknown", "colab_free", "colab_locked",
+		"colab_reconnect", "colab_unreachable", "colab_unreachable_free", "colab_releasing":
 		c.enabled, c.adcFound = true, true
 		// signed in in the app a few hours ago with the default 7 days
 		c.auth = colabAuth("7d", 7, now.Add(-4*time.Hour-12*time.Minute), colab.SourceApp)
@@ -246,8 +272,54 @@ func newColabMock(sc string, now time.Time) *colabMock {
 	case "colab_locked":
 		pick("A100")
 		c.acct = colabAccount(now.Add(-1*time.Minute), 0, []string{"G4", "A100", "L4", "T4"}, []string{"H100"}, nil, nil)
+	case "colab_reconnect":
+		pick("T4")
+		c.sess = &colabSession{start: now.Add(-38 * time.Minute), queuedUntil: now.Add(-36 * time.Minute), bootUntil: now.Add(-35 * time.Minute)}
+		c.planned, c.unreachable, c.reconnect, c.staleErr = 1, true, true, true
+	case "colab_unreachable":
+		pick("L4")
+		c.acct = colabPaid(now.Add(-3*time.Minute), 286.40)
+		c.sess = &colabSession{start: now.Add(-52 * time.Minute), queuedUntil: now.Add(-51 * time.Minute), bootUntil: now.Add(-50 * time.Minute)}
+		c.unreachable, c.noJobs = true, true
+	case "colab_unreachable_free":
+		quota, refill := 2.1, now.Add(7*time.Hour).Truncate(time.Hour)
+		c.acct = colabAccount(now.Add(-3*time.Minute), 0, []string{"T4"}, []string{"L4", "A100", "G4", "H100"}, &quota, &refill)
+		c.sess = &colabSession{start: now.Add(-44 * time.Minute), queuedUntil: now.Add(-43 * time.Minute), bootUntil: now.Add(-42 * time.Minute)}
+		c.unreachable, c.noJobs = true, true
+	case "colab_releasing":
+		pick("L4")
+		c.acct = colabPaid(now.Add(-3*time.Minute), 286.40)
+		c.sess = &colabSession{start: now.Add(-61 * time.Minute), queuedUntil: now.Add(-60 * time.Minute), bootUntil: now.Add(-59 * time.Minute),
+			stopAt: now.Add(-40 * time.Second), stopReason: colab.ReleaseFailed}
+		c.unreachable, c.stuckStop, c.held = true, true, true
+		c.leftover = &colab.LeftoverInfo{Since: now.Add(-3 * time.Hour), Code: colab.CodeReleaseFailed}
 	}
 	return c
+}
+
+// runtimeInfo is Status.Runtime of a session (nil without one): held from
+// the boot on, unreachable in the v3.2.x scenarios, billed on a paid account.
+func (c *colabMock) runtimeInfo(now time.Time) *colab.RuntimeInfo {
+	st := c.sessionState(now)
+	if c.sess == nil || st == colab.StateQueued || st == colab.StateBooting {
+		if c.sess == nil {
+			return nil
+		}
+		return &colab.RuntimeInfo{Reachable: colab.ReachUnknown}
+	}
+	ri := &colab.RuntimeInfo{Held: true, Reachable: colab.ReachOK, Billing: c.tier() == colab.TierPaid}
+	if c.unreachable {
+		since := now.Add(-25 * time.Second).Truncate(time.Second)
+		ri.Reachable, ri.UnreachableSince = colab.ReachUnreachable, &since
+	}
+	return ri
+}
+
+// reconnectOf is a retrying lecture's reconnect: attempt 1–3 of 3, the
+// next try at the next quarter minute.
+func reconnectOf(now time.Time) *remote.Reconnect {
+	next := now.Truncate(15 * time.Second).Add(15 * time.Second)
+	return &remote.Reconnect{Attempt: 1 + int(now.Unix()/15%3), Of: 3, NextAt: next.UTC()}
 }
 
 // on: the overlays add Colab (the real server: enabled; the resource
@@ -256,7 +328,7 @@ func (c *colabMock) on() bool { return c.enabled }
 
 // advance ends a stopping session (3 s after the button).
 func (c *colabMock) advance(now time.Time) {
-	if s := c.sess; s != nil && !s.stopAt.IsZero() && now.After(s.stopAt.Add(3*time.Second)) {
+	if s := c.sess; s != nil && !s.stopAt.IsZero() && !c.stuckStop && now.After(s.stopAt.Add(3*time.Second)) {
 		c.lastRelease = &colab.ReleaseInfo{Reason: s.stopReason, At: s.stopAt.Add(3 * time.Second)}
 		c.sess = nil
 		c.afterCurrent = false
@@ -369,7 +441,7 @@ type remoteLecture struct {
 
 func (c *colabMock) remoteLectures(s *store, now time.Time) []remoteLecture {
 	st := c.sessionState(now)
-	if st != colab.StateQueued && st != colab.StateBooting && st != colab.StateRunning {
+	if st != colab.StateQueued && st != colab.StateBooting && st != colab.StateRunning || c.noJobs {
 		return nil
 	}
 	s.mu.Lock()
@@ -566,7 +638,15 @@ func (c *colabMock) status(rls []remoteLecture, now time.Time) colab.Status {
 		left = int((colab.FairWindow - used).Minutes() / 50)
 		st.UploadedAhead = c.ahead
 		st.Machine, st.Usage = c.machine(now), c.usage(now, len(rls))
+		started := s.start.UTC().Truncate(time.Second)
+		st.SessionStartedAt = &started
+		st.Runtime = c.runtimeInfo(now)
+		if c.staleErr { // an error of the session before (the front end hides it)
+			at := started.Add(-12 * time.Minute)
+			st.LastError, st.LastErrorAt = &model.ErrorInfo{Code: colab.CodeConnectionLost}, &at
+		}
 	}
+	st.Leftover = c.leftover
 	if c.exhausted {
 		left = 0
 	}
@@ -582,8 +662,12 @@ func (c *colabMock) status(rls []remoteLecture, now time.Time) colab.Status {
 		if rs.Step == model.RemoteStepWaitAccelerator {
 			overall = 0
 		}
-		st.Jobs = append(st.Jobs, colab.JobInfo{ID: asrJobID(rl.id), Step: rs.Step, Stage: rs.Stage, Fraction: -1, Overall: overall,
-			ETASec: float64(rs.EtaSec), StartedAt: rl.started})
+		j := colab.JobInfo{ID: asrJobID(rl.id), Step: rs.Step, Stage: rs.Stage, Fraction: -1, Overall: overall,
+			ETASec: float64(rs.EtaSec), StartedAt: rl.started}
+		if c.reconnect && st.State == colab.StateRunning {
+			j.Reconnect = reconnectOf(now)
+		}
+		st.Jobs = append(st.Jobs, j)
 	}
 	if len(st.Jobs) > 0 {
 		st.Current = &st.Jobs[0]
@@ -601,10 +685,13 @@ func (c *colabMock) card(st colab.Status, rls []remoteLecture) any {
 		j := st.Jobs[i]
 		p := j.Overall
 		eta := int(j.ETASec)
-		card.Jobs = append(card.Jobs, remote.CardJob{LectureID: rl.id, Stage: colabCardStage(j), Progress: &p, ETASec: &eta})
+		card.Jobs = append(card.Jobs, remote.CardJob{LectureID: rl.id, Stage: colabCardStage(j), Progress: &p, ETASec: &eta, Reconnect: j.Reconnect})
 	}
 	if st.LastError != nil {
 		card.LastError = &remote.CardError{Code: st.LastError.Code, Params: st.LastError.Params, At: time.Now()}
+		if st.LastErrorAt != nil {
+			card.LastError.At = *st.LastErrorAt
+		}
 	}
 	v := toJSON(card)
 	if obj, ok := v.(map[string]any); ok {
@@ -939,7 +1026,7 @@ func (m *mock) colabOverlay(mux *http.ServeMux) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		c := m.colabState(r)
 		c.mu.Lock()
-		on := c.on() || len(c.pinned) > 0
+		on := c.on() || len(c.pinned) > 0 || m.sshOn(r) // ssh-1b: the SSH servers' cards (ssh.go)
 		c.mu.Unlock()
 		if !on {
 			mux.ServeHTTP(w, innerRequest(r))
@@ -1015,6 +1102,7 @@ func (m *mock) colabFix(r *http.Request, c *colabMock, path string, body []byte)
 	default:
 		v = c.fixLectures(v, rls, c.backToLocalLecture(s), c.splitLecture(s), now)
 	}
+	v = m.sshFix(r, path, v) // ssh-1b (ssh.go)
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
@@ -1242,7 +1330,7 @@ func (m *mock) colabEvents(mux *http.ServeMux) http.HandlerFunc {
 		fw := &sseFix{ResponseWriter: w, fl: fl, fix: func(b []byte) []byte {
 			c.mu.Lock()
 			defer c.mu.Unlock()
-			if !c.on() {
+			if !c.on() && !m.sshOn(r) {
 				return b
 			}
 			return m.colabFix(r, c, "/api/resources", b)

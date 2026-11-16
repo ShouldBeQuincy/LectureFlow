@@ -13,92 +13,64 @@
 import { parseHttpUrl, hostMatches, hostPermissionPattern, withoutQuery, genericSessionId, urlKey } from './url.js';
 import { validate } from './jsonschema.js';
 import { normalizeRecordedAt, parseDurationSec } from './dates.js';
-import { parsePointer, observeIndexOf, isEmptyObserved } from './observe.js';
+import { parsePointer, observeIndexOf, isEmptyObserved, profileKey } from './observe.js';
 import { classifyUrl, C_HLS, C_DASH, FORMAT_FILE, FORMAT_HLS, FORMAT_DASH } from './classify.js';
 import { wildcardCategory, pathEntriesFor, pathPatternMayReach, normalizePath, pathCovered, isBlockedUrl } from './blocklist.js';
+import { MAX_REGEX_INPUT, regexComplexity, captureGroupCount } from './regexcost.js';
+import { guardedRegex, regexTrip } from './regexguard.js';
 
 export const GENERIC = 'generic';
 
-// The longest input a profile regex is run on (security review L7): page
-// paths, addresses without their query, and short page texts; anything
-// longer simply does not match.
-export const MAX_REGEX_INPUT = 2048;
+// MAX_REGEX_INPUT and regexComplexity live in ./regexcost.js (no imports,
+// so src/lib/blocklist.js can use them too); exported here as before.
+export { MAX_REGEX_INPUT, regexComplexity };
 
 /**
  * Compiles a profile regex: JavaScript syntax, case-insensitive. Returns
  * { source, test(s), exec(s) } that never runs on more than
- * MAX_REGEX_INPUT characters.
+ * MAX_REGEX_INPUT characters, behind the runtime guard (./regexguard.js):
+ * owner is the profile's key (profileKey), so that a match too slow stops
+ * every regex of that profile. Every match of a profile regex goes through
+ * here (test/unit/regexguard.test.mjs scans the sources for others).
  */
-export function profileRegex(source) {
-  const re = new RegExp(source, 'i');
-  const fits = (s) => String(s).length <= MAX_REGEX_INPUT;
-  return { source: re.source, test: (s) => fits(s) && re.test(String(s)), exec: (s) => (fits(s) ? re.exec(String(s)) : null) };
+export function profileRegex(source, owner = '') {
+  return guardedRegex(source, { owner });
+}
+
+/** The owner key of a profile's regexes (profileKey), '' without one. */
+export function regexOwner(profile) {
+  return profile && profile.id ? profileKey(profile) : '';
+}
+
+/** Whether the runtime guard stopped this profile's regexes in this context. */
+export function profileStopped(profile) {
+  const owner = regexOwner(profile);
+  return !!owner && !!regexTrip(owner);
 }
 
 /**
- * Why a profile regex is too costly to run on page data, or '' (security
- * review L7: ReDoS). Besides the schema's 300 characters: no
- * backreferences; no repeated group ("*", "+", "{n,}", "{n,m}" with m > 1)
- * that holds an unbounded quantifier or an alternation — "(a+)+",
- * "(a|aa)*" backtrack exponentially; at most 3 unbounded quantifiers in all
- * ("*", "+", "{n,}"). With inputs capped at MAX_REGEX_INPUT, what remains
- * is polynomial at worst.
+ * Every regex of a profile with its place in the file: [[path, source]],
+ * the places checkProfile names and the slow-profile records point to.
  */
-export function regexComplexity(src) {
-  const s = String(src);
-  if (/\\[1-9]|\\k</.test(s)) return 'backreferences are not allowed';
-  const open = []; // groups being read: { unbounded, alternation }
-  let unbounded = 0;
-  let i = 0;
-  const quantifier = (j) => {
-    const c = s[j];
-    if (c === '*' || c === '+') return { len: s[j + 1] === '?' ? 2 : 1, unbounded: true, repeats: true };
-    if (c === '?') return { len: s[j + 1] === '?' ? 2 : 1, unbounded: false, repeats: false };
-    if (c === '{') {
-      const m = /^\{(\d+)(,(\d*))?\}\??/.exec(s.slice(j));
-      if (!m) return null;
-      const max = m[2] === undefined ? Number(m[1]) : m[3] === '' ? Infinity : Number(m[3]);
-      return { len: m[0].length, unbounded: max === Infinity, repeats: max > 1 };
-    }
-    return null;
-  };
-  while (i < s.length) {
-    const c = s[i];
-    let group = null;
-    if (c === '\\') i += 2;
-    else if (c === '[') {
-      i++;
-      if (s[i] === '^') i++;
-      if (s[i] === ']') i++;
-      while (i < s.length && s[i] !== ']') i += s[i] === '\\' ? 2 : 1;
-      i++;
-    } else if (c === '(') {
-      open.push({ unbounded: false, alternation: false });
-      i++;
-      if (s[i] === '?') {
-        if (s[i + 1] === '<' && s[i + 2] !== '=' && s[i + 2] !== '!') i = Math.max(i + 1, s.indexOf('>', i)) + 1; // (?<name>
-        else i += s[i + 1] === '<' ? 3 : 2; // (?: (?= (?! (?<= (?<!
-      }
-      continue;
-    } else if (c === ')') {
-      group = open.pop() || { unbounded: false, alternation: false };
-      i++;
-    } else if (c === '|') {
-      for (const g of open) g.alternation = true;
-      i++;
-      continue;
-    } else i++;
-    const q = quantifier(i);
-    if (!q) continue;
-    if (group && q.repeats && (group.unbounded || group.alternation)) return 'a repeated group may not hold "*", "+", "{n,}" or "|" (catastrophic backtracking)';
-    if (q.unbounded) {
-      unbounded++;
-      for (const g of open) g.unbounded = true;
-    }
-    i += q.len;
+export function profileRegexes(profile) {
+  const regexes = [];
+  if (!profile || typeof profile !== 'object') return regexes;
+  if (profile.match?.pathPattern !== undefined) regexes.push(['/match/pathPattern', profile.match.pathPattern]);
+  const idFrom = profile.session?.idFrom || {};
+  if (idFrom.pathPattern !== undefined) regexes.push(['/session/idFrom/pathPattern', idFrom.pathPattern]);
+  if (idFrom.pattern !== undefined) regexes.push(['/session/idFrom/pattern', idFrom.pattern]);
+  for (const [field, specs] of Object.entries(profile.lecture || {})) {
+    asList(specs).forEach((s, i) => s && s.pattern !== undefined && regexes.push([`/lecture/${field}/${i}/pattern`, s.pattern]));
   }
-  if (unbounded > 3) return 'too many "*", "+" or "{n,}" (at most 3)';
-  return '';
+  asList(profile.downloadPolicy?.disabledWhen).forEach((s, i) => s && s.pattern !== undefined && regexes.push([`/downloadPolicy/disabledWhen/${i}/pattern`, s.pattern]));
+  (profile.tracks || []).forEach((t, i) => t?.detect?.urlPattern !== undefined && regexes.push([`/tracks/${i}/detect/urlPattern`, t.detect.urlPattern]));
+  (profile.observe || []).forEach((o, i) => o && regexes.push([`/observe/${i}/urlPattern`, o.urlPattern]));
+  const list = profile.inpage?.list;
+  if (list) {
+    regexes.push(['/inpage/list/pathPattern', list.pathPattern]);
+    if (list.idPattern !== undefined) regexes.push(['/inpage/list/idPattern', list.idPattern]);
+  }
+  return regexes;
 }
 
 // Second-level labels registries put under a country code ("co.uk",
@@ -187,42 +159,39 @@ export function blockedMatchErrors(profile) {
  * declared, supersedes names other roles, nothing of the do-not-handle
  * list is matched (blockedMatchErrors, reported first; such an error
  * carries `blocked`). Returns a list of { path, message[, blocked] }.
+ * `unreviewed`: a profile the user imports (not one packaged after review)
+ * may make its sessionInfo request only as a GET (FB1 L-2): the extension's
+ * import and its loading of local profiles pass it; the contribution check
+ * does not, the profile being reviewed in its pull request.
  */
-export function checkProfile(schema, profile) {
+export function checkProfile(schema, profile, { unreviewed = false } = {}) {
   const blocked = blockedMatchErrors(profile);
   const schemaErrors = validate(schema, profile);
   // the schema's own refusal of the same hosts says less
   if (schemaErrors.length) return [...blocked, ...schemaErrors.filter((e) => !(e.message === 'must not match' && blocked.some((b) => b.path === e.path)))];
   const errors = [...blocked];
-  const regexes = [];
-  if (profile.match.pathPattern !== undefined) regexes.push(['/match/pathPattern', profile.match.pathPattern]);
+  const regexes = profileRegexes(profile);
   const idFrom = profile.session.idFrom;
-  if (idFrom.pathPattern !== undefined) regexes.push(['/session/idFrom/pathPattern', idFrom.pathPattern]);
-  if (idFrom.pattern !== undefined) regexes.push(['/session/idFrom/pattern', idFrom.pattern]);
-  for (const [field, specs] of Object.entries(profile.lecture || {})) {
-    asList(specs).forEach((s, i) => s.pattern !== undefined && regexes.push([`/lecture/${field}/${i}/pattern`, s.pattern]));
-  }
-  asList(profile.downloadPolicy?.disabledWhen).forEach((s, i) => s.pattern !== undefined && regexes.push([`/downloadPolicy/disabledWhen/${i}/pattern`, s.pattern]));
-  profile.tracks.forEach((t, i) => t.detect.urlPattern !== undefined && regexes.push([`/tracks/${i}/detect/urlPattern`, t.detect.urlPattern]));
-  (profile.observe || []).forEach((o, i) => regexes.push([`/observe/${i}/urlPattern`, o.urlPattern]));
   const list = profile.inpage?.list;
-  if (list) {
-    regexes.push(['/inpage/list/pathPattern', list.pathPattern]);
-    if (list.idPattern !== undefined) regexes.push(['/inpage/list/idPattern', list.idPattern]);
-  }
+  // Every regex is checked statically first; one that does not compile or
+  // is too costly is never run below (SEC18 中-2).
+  const unsafe = new Set();
   for (const [path, src] of regexes) {
     try {
-      profileRegex(src);
+      new RegExp(src, 'i'); // compiles only
     } catch (e) {
       errors.push({ path, message: `invalid regular expression: ${e.message}` });
+      unsafe.add(path);
       continue;
     }
     const costly = regexComplexity(src);
-    if (costly) errors.push({ path, message: costly });
+    if (costly) {
+      errors.push({ path, message: costly });
+      unsafe.add(path);
+    }
   }
   if (idFrom.pathPattern !== undefined && errors.length === 0) {
-    const groups = new RegExp(`${idFrom.pathPattern}|`).exec('').length - 1;
-    if (groups !== 1) errors.push({ path: '/session/idFrom/pathPattern', message: 'needs exactly one capture group' });
+    if (captureGroupCount(idFrom.pathPattern) !== 1) errors.push({ path: '/session/idFrom/pathPattern', message: 'needs exactly one capture group' });
   }
   const roles = profile.tracks.map((t) => t.role);
   roles.forEach((r, i) => roles.indexOf(r) !== i && errors.push({ path: `/tracks/${i}/role`, message: 'duplicate role' }));
@@ -257,9 +226,10 @@ export function checkProfile(schema, profile) {
   // sessionInfo: the request of an observe entry, to the page's own origin
   const info = profile.sessionInfo;
   if (info) {
+    if (unreviewed && info.method !== 'GET') errors.push({ path: '/sessionInfo/method', message: `an unreviewed profile may request sessionInfo only with GET, not ${info.method} (a request with a body needs review)` });
     const obs = (profile.observe || [])[info.observe];
     if (!obs) errors.push({ path: '/sessionInfo/observe', message: 'no such observe entry' });
-    else {
+    else if (!unsafe.has(`/observe/${info.observe}/urlPattern`)) {
       try {
         if (!profileRegex(obs.urlPattern).test(`https://example.invalid${info.path}`)) errors.push({ path: '/sessionInfo/path', message: 'does not match the urlPattern of its observe entry' });
       } catch {
@@ -291,7 +261,7 @@ export function profileMatchesUrl(profile, rawUrl) {
   const u = parseHttpUrl(rawUrl);
   if (!u) return false;
   if (!profile.match.hosts.some((h) => hostMatches(h, u.hostname))) return false;
-  if (profile.match.pathPattern !== undefined && !profileRegex(profile.match.pathPattern).test(u.pathname)) return false;
+  if (profile.match.pathPattern !== undefined && !profileRegex(profile.match.pathPattern, regexOwner(profile)).test(u.pathname)) return false;
   return true;
 }
 
@@ -346,11 +316,11 @@ export function cleanText(s) {
   return String(s ?? '').replace(/\s+/g, ' ').trim();
 }
 
-function applyPattern(value, pattern) {
+function applyPattern(value, pattern, owner) {
   const v = cleanText(value);
   if (!v) return '';
   if (pattern === undefined) return v;
-  const m = profileRegex(pattern).exec(v);
+  const m = profileRegex(pattern, owner).exec(v);
   if (!m) return '';
   return cleanText(m.length > 1 ? m[1] ?? '' : m[0]);
 }
@@ -361,7 +331,7 @@ function applyPattern(value, pattern) {
  * text or attribute of the first matching element, "" when none);
  * `observed` is combineObserved()'s.
  */
-function readField(results, keyPrefix, specs, observed) {
+function readField(results, keyPrefix, specs, observed, owner) {
   const list = asList(specs);
   for (let i = 0; i < list.length; i++) {
     let raw;
@@ -374,7 +344,7 @@ function readField(results, keyPrefix, specs, observed) {
       if (!r || !r.count) continue;
       raw = r.value;
     }
-    const v = applyPattern(String(raw), list[i].pattern);
+    const v = applyPattern(String(raw), list[i].pattern, owner);
     if (v) return v;
   }
   return '';
@@ -387,15 +357,16 @@ function readField(results, keyPrefix, specs, observed) {
 export async function sessionIdFor(match, pageUrl, results = {}) {
   if (match) {
     const idFrom = match.profile.session.idFrom;
+    const owner = regexOwner(match.profile);
     const u = parseHttpUrl(match.url);
     let id = '';
     if (idFrom.query !== undefined && u) id = u.searchParams.get(idFrom.query) || '';
     else if (idFrom.pathPattern !== undefined && u) {
-      const m = profileRegex(idFrom.pathPattern).exec(u.pathname);
+      const m = profileRegex(idFrom.pathPattern, owner).exec(u.pathname);
       id = m && m[1] ? m[1] : '';
     } else if (idFrom.selector !== undefined) {
       const r = results['session.idFrom'];
-      id = r && r.count ? applyPattern(r.value, idFrom.pattern) : '';
+      id = r && r.count ? applyPattern(r.value, idFrom.pattern, owner) : '';
     }
     id = cleanText(id);
     if (id && id.length <= 200) return { sessionId: id, source: 'profile' };
@@ -403,17 +374,69 @@ export async function sessionIdFor(match, pageUrl, results = {}) {
   return { sessionId: await genericSessionId(pageUrl), source: GENERIC };
 }
 
+// Titles that name no lecture (compared case-insensitively, whole title).
+const PLACEHOLDER_TITLES = new Set(['recording', 'video', 'audio', 'untitled', 'media', 'player']);
+
+/** Whether a title is empty or only a placeholder such as "Recording". */
+export function isPlaceholderTitle(s) {
+  const v = cleanText(s).toLowerCase();
+  return !v || PLACEHOLDER_TITLES.has(v);
+}
+
+// The site's own name as a label of its host: "archive" for archive.org,
+// "example" for www.example.co.uk ('' for an address or a bare name).
+function siteLabel(pageUrl) {
+  let host = '';
+  try {
+    host = new URL(pageUrl).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+  if (!host || /^[0-9.]+$/.test(host) || host.includes(':')) return '';
+  const labels = host.split('.').filter(Boolean);
+  if (labels.length < 2) return '';
+  labels.pop();
+  if (labels.length > 1 && /^(ac|co|com|edu|gov|net|org)$/.test(labels[labels.length - 1])) labels.pop();
+  const label = labels[labels.length - 1];
+  return label.length >= 3 ? label : '';
+}
+
+/**
+ * The page's own title (document.title) as a lecture title, for generic
+ * detection: trailing parts that name the site ("… | Example",
+ * "… : Internet Archive" on archive.org) are dropped; '' when what is left
+ * is only the site's name or a placeholder.
+ */
+export function pageTitleFor(title, pageUrl = '') {
+  let v = cleanText(title);
+  const label = siteLabel(pageUrl);
+  const flat = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+  if (label) {
+    for (;;) {
+      const m = /^(.*\S)\s+[|:\-–—·•]\s+(.+)$/u.exec(v);
+      if (!m || !flat(m[2]).includes(label)) break;
+      v = m[1];
+    }
+    if (flat(v) === label) v = '';
+  }
+  return isPlaceholderTitle(v) ? '' : v.slice(0, 300);
+}
+
 /**
  * Lecture fields (title, recordedAt, durationSec). Only these three exist;
  * the schema rules out anything else. Duration falls back to the media
- * element's (pageDurationSec) when the profile does not read one.
+ * element's (pageDurationSec) when the profile does not read one. Without
+ * a profile the title is the page's own (page: { title, url }, see
+ * pageTitleFor); a profile reads its own title selectors only.
  */
-export function lectureFor(match, results = {}, pageDurationSec = 0, observed = null) {
+export function lectureFor(match, results = {}, pageDurationSec = 0, observed = null, page = null) {
   const lecture = { title: '', recordedAt: '', durationSec: 0 };
   const spec = match?.profile.lecture || {};
-  if (spec.title) lecture.title = readField(results, 'lecture.title', spec.title, observed).slice(0, 300);
-  if (spec.recordedAt) lecture.recordedAt = normalizeRecordedAt(readField(results, 'lecture.recordedAt', spec.recordedAt, observed));
-  if (spec.durationSec) lecture.durationSec = parseDurationSec(readField(results, 'lecture.durationSec', spec.durationSec, observed));
+  const owner = regexOwner(match?.profile);
+  if (spec.title) lecture.title = readField(results, 'lecture.title', spec.title, observed, owner).slice(0, 300);
+  if (!match && page) lecture.title = pageTitleFor(page.title, page.url);
+  if (spec.recordedAt) lecture.recordedAt = normalizeRecordedAt(readField(results, 'lecture.recordedAt', spec.recordedAt, observed, owner));
+  if (spec.durationSec) lecture.durationSec = parseDurationSec(readField(results, 'lecture.durationSec', spec.durationSec, observed, owner));
   if (!lecture.durationSec && pageDurationSec > 0 && Number.isFinite(pageDurationSec)) lecture.durationSec = Math.round(pageDurationSec);
   return lecture;
 }
@@ -427,29 +450,46 @@ export function lectureFor(match, results = {}, pageDurationSec = 0, observed = 
  * from combineObserved).
  */
 export function downloadPolicyFor(match, results = {}, observed = null) {
+  const policy = readDownloadPolicy(match, results, observed);
+  // A stopped regex answers "no match", which would read as "not
+  // restricted": when the guard stopped the profile, nothing can be said
+  // (SEC18e 低-15; the card says why: policyStopped).
+  return match && profileStopped(match.profile) ? 'unknown' : policy;
+}
+
+function readDownloadPolicy(match, results, observed) {
   const specs = asList(match?.profile.downloadPolicy?.disabledWhen);
   if (specs.length === 0) return 'unknown';
+  const owner = regexOwner(match?.profile);
   let checked = false;
+  let unseen = false;
   for (let i = 0; i < specs.length; i++) {
     const spec = specs[i];
     if (spec.observed !== undefined) {
       const idx = observeIndexOf(match.profile, spec.observed);
-      if (!observed || idx < 0 || !observed.seen.has(idx)) continue;
+      if (!observed || idx < 0 || !observed.seen.has(idx)) {
+        unseen = true;
+        continue;
+      }
       checked = true;
       const v = observed.values[spec.observed];
       if (spec.empty === true) {
         if (isEmptyObserved(v)) return 'disabled';
       } else if (spec.pattern !== undefined && !isEmptyObserved(v)) {
         const first = Array.isArray(v) ? v.find((x) => !isEmptyObserved(x)) : v;
-        if (applyPattern(String(first), spec.pattern)) return 'disabled';
+        if (applyPattern(String(first), spec.pattern, owner)) return 'disabled';
       }
       continue;
     }
     checked = true;
     const r = results[`downloadPolicy.disabledWhen.${i}`];
     if (!r || !r.count) continue;
-    if (spec.pattern === undefined || applyPattern(r.value, spec.pattern)) return 'disabled';
+    if (spec.pattern === undefined || applyPattern(r.value, spec.pattern, owner)) return 'disabled';
   }
+  // the page's observer was stopped as too slow before it saw a response
+  // a condition needs: the selector conditions alone cannot say "not
+  // restricted" (SEC22 I-4)
+  if (checked && unseen && observed && observed.stopped) return 'unknown';
   return checked ? 'enabled' : 'unknown';
 }
 
@@ -497,11 +537,11 @@ function responseWhenHolds(rule, observed) {
  * (relative ones resolved against the request they came from), each path
  * once, filtered by its urlPattern and format.
  */
-function responseUrls(rule, observed) {
+function responseUrls(rule, observed, owner) {
   const out = [];
   if (!observed || rule.detect.fromResponse === undefined || !responseWhenHolds(rule, observed)) return out;
   const seen = new Set();
-  const re = rule.detect.urlPattern !== undefined ? profileRegex(rule.detect.urlPattern) : null;
+  const re = rule.detect.urlPattern !== undefined ? profileRegex(rule.detect.urlPattern, owner) : null;
   for (const name of asList(rule.detect.fromResponse)) {
     const v = observed.values[name];
     for (const raw of Array.isArray(v) ? v : [v]) {
@@ -534,23 +574,35 @@ function responseUrls(rule, observed) {
  * instead of audio and screen).
  * Returns { tracks: [...named, in rule order], others: [...unmatched] };
  * a named track carries role, label, hint, labelIndex and recommended.
+ * opts.frameIds: the frames a track only the response named belongs to
+ * (the frame whose page observed it: the one the profile matched; [0], the
+ * top frame, by default).
  */
-export function applyProfile(profile, tracks, locale = 'en', observed = null) {
+// The most addresses one track rule tests in one call: far above a real
+// page's tracks (the request log keeps 300), a ceiling on the work.
+export const MAX_TESTS_PER_RULE = 256;
+
+export function applyProfile(profile, tracks, locale = 'en', observed = null, { frameIds = [0] } = {}) {
   const taken = new Set();
   const named = [];
+  const owner = regexOwner(profile);
   for (const rule of profile.tracks) {
     const hits = [];
     if (rule.detect.urlPattern !== undefined) {
-      const re = profileRegex(rule.detect.urlPattern);
+      const re = profileRegex(rule.detect.urlPattern, owner);
+      let tested = 0;
       for (const t of tracks) {
         if (taken.has(t.id)) continue;
         if (rule.detect.kind && t.kind !== rule.detect.kind) continue;
         if (rule.detect.format && t.format !== rule.detect.format) continue;
         const bare = withoutQuery(t.url);
-        if (bare !== null && re.test(bare)) hits.push(t);
+        if (bare === null) continue;
+        // at most MAX_TESTS_PER_RULE addresses per rule (SEC18d)
+        if (++tested > MAX_TESTS_PER_RULE) break;
+        if (re.test(bare)) hits.push(t);
       }
     }
-    for (const r of responseUrls(rule, observed)) {
+    for (const r of responseUrls(rule, observed, owner)) {
       const mine = hits.find((h) => !h.selector && withoutQuery(h.url) === r.bare);
       if (mine) {
         const i = hits.indexOf(mine);
@@ -565,7 +617,7 @@ export function applyProfile(profile, tracks, locale = 'en', observed = null) {
         hits.push({ ...generic, kind: generic.kind === 'unknown' ? rule.detect.kind : generic.kind, sources: [...generic.sources, 'response'] });
         continue;
       }
-      hits.push({ id: r.url, url: r.url, kind: rule.detect.kind, format: r.format, sizeBytes: -1, sizeEstimated: false, sources: ['response'], frameIds: [0], protected: false });
+      hits.push({ id: r.url, url: r.url, kind: rule.detect.kind, format: r.format, sizeBytes: -1, sizeEstimated: false, sources: ['response'], frameIds: [...frameIds], protected: false });
     }
     const base = localizedLabel(rule.label, locale);
     const hint = rule.hint ? localizedLabel(rule.hint, locale) : '';

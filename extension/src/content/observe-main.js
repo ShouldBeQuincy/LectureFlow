@@ -33,6 +33,52 @@
 
   const win = window;
   const doc = document;
+  // The runtime guard of the profile's regexes, as src/lib/regexguard.js (a
+  // classic script cannot import it): a match over SLOW_MS, or matches adding
+  // up to more than BUDGET_MS within WINDOW_MS, stop them for the rest of the
+  // page. The page could fake this world's clock, so nothing is reported from
+  // here: the content script is told which regex and address it was
+  // (SLOW_EVENT), runs that once more under its own clock, and reports it
+  // only if it is really slow (SEC18e 中-6).
+  const SLOW_MS = 250;
+  const BUDGET_MS = 1000;
+  const WINDOW_MS = 60000;
+  const SLOW_EVENT = 'lectureflow-observe-slow';
+  const perf = win.performance;
+  const perfNow = perf && perf.now ? perf.now.bind(perf) : Date.now;
+  let reSpent = 0;
+  let reWindow = null;
+  let reStopped = false;
+  // A regex's first match on fewer than 1000 characters runs in V8's
+  // bytecode interpreter, 5 to 8 times slower: before a spec's first match
+  // here it runs once on '', timed with that match, so a regex slow only on
+  // '' trips the guard like any other (SEC22 L-A, SEC22b M-1).
+  const guardedTest = (index, s) => {
+    if (reStopped) return false;
+    const t0 = perfNow();
+    if (reWindow === null) reWindow = t0;
+    else if (t0 - reWindow >= WINDOW_MS) {
+      reSpent = 0;
+      reWindow = t0;
+    }
+    const spec = config.specs[index];
+    if (!spec.warm) {
+      spec.warm = true;
+      spec.re.test('');
+    }
+    const ok = config.specs[index].re.test(s);
+    const ms = perfNow() - t0;
+    reSpent += ms;
+    if (ms > SLOW_MS || reSpent > BUDGET_MS) {
+      reStopped = true;
+      try {
+        doc.dispatchEvent(new CE(SLOW_EVENT, { detail: JSON.stringify({ key: config.key, index, url: s }) }));
+      } catch {
+        // stopped here anyway
+      }
+    }
+    return ok;
+  };
   const origFetch = win.fetch;
   const XHR = win.XMLHttpRequest;
   const origOpen = XHR && XHR.prototype.open;
@@ -92,7 +138,7 @@
           const seg = parsePointer(s.pointers[name]);
           if (seg) pointers.push([name, seg]);
         }
-        specs.push({ re: new RegExp(String(s.urlPattern), 'i'), hosts: (s.hosts || []).map(String), pointers });
+        specs.push({ re: new RegExp(String(s.urlPattern), 'i'), hosts: (s.hosts || []).map(String), pointers }); // run only through guardedTest
       }
       config = { key: c.key, specs };
       settle(specs.length ? 'ready' : 'none');
@@ -116,7 +162,7 @@
     const bare = `${url.protocol}//${url.host}${url.pathname}`;
     for (let i = 0; i < config.specs.length; i++) {
       const s = config.specs[i];
-      if (s.hosts.some((h) => hostMatches(h, url.hostname)) && bare.length <= 2048 && s.re.test(bare)) return i;
+      if (s.hosts.some((h) => hostMatches(h, url.hostname)) && bare.length <= 1024 && guardedTest(i, bare)) return i; // MAX_REGEX_INPUT (src/lib/regexcost.js)
     }
     return -1;
   };

@@ -444,7 +444,7 @@ func TestComponentSelfTestFallbacks(t *testing.T) {
 	var gotMods []string
 	prev := componentImportCheck
 	t.Cleanup(func() { componentImportCheck = prev })
-	componentImportCheck = func(_ context.Context, python string, modules []string) error {
+	componentImportCheck = func(_ context.Context, python, _ string, modules []string) error {
 		gotPy, gotMods = python, modules
 		return nil
 	}
@@ -454,7 +454,7 @@ func TestComponentSelfTestFallbacks(t *testing.T) {
 	if gotPy != "/c/mlx/python" || strings.Join(gotMods, ",") != "mlx_whisper,mlx.core" {
 		t.Fatalf("import check %s %v", gotPy, gotMods)
 	}
-	componentImportCheck = func(context.Context, string, []string) error { return errors.New("No module named mlx") }
+	componentImportCheck = func(context.Context, string, string, []string) error { return errors.New("No module named mlx") }
 	if err := d.ComponentSelfTest(e.ctx, ComponentCheck{ID: "asr-mlx", Backend: model.BackendMLX, Python: "/c/mlx/python"}); err == nil {
 		t.Error("failed import accepted")
 	}
@@ -481,7 +481,7 @@ func TestComponentSelfTestFallbacks(t *testing.T) {
 
 // The real import check: a missing interpreter fails at once.
 func TestComponentImportCheckMissingPython(t *testing.T) {
-	err := componentImportCheck(context.Background(), filepath.Join(t.TempDir(), "python.exe"), []string{"os"})
+	err := componentImportCheck(context.Background(), filepath.Join(t.TempDir(), "python.exe"), "", []string{"os"})
 	if err == nil {
 		t.Fatal("missing interpreter accepted")
 	}

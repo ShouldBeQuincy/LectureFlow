@@ -28,7 +28,7 @@
 
 import { h, append, clear, btn, iconBtn, preserveFocus, everySecond } from './dom.js';
 import { icon } from './icons.js';
-import { pipelineBar, streamProgress } from './pipeline.js';
+import { pipelineBar, streamProgress, cardActions } from './pipeline.js';
 import { bindContextMenu, menuButton, openMenu } from './menu.js';
 import * as A from './actions.js';
 import { api } from './api.js';
@@ -39,6 +39,7 @@ import { zh, zhOn } from './zh_display.js';
 import { zhEditNote } from './widgets.js';
 import { kindTag, isMaterial, weekOf, lectureTagText, kindSourceText } from './kinds.js';
 import { batchRerun, rerunStages, weekMenuItems, hangItems, canHang, appliedOverride, makeupTag, weekMonday, hangUnder, clearOverride } from './course_ux.js';
+import { confirmUpdate, confirmLaunchDrafts } from './update_confirm.js';
 
 const enc = encodeURIComponent;
 
@@ -70,10 +71,20 @@ export function createLectureList(opts) {
   const refs = new Map(); // id → {bar, statusEl, lec}
 
   const headCheck = h('input', { type: 'checkbox', class: 'check', 'aria-label': t('course.lectures.select_all'), dataset: { fkey: 'lt:all' }, onchange: () => toggleAll(headCheck.checked) });
+  const headCell = h('span', { class: 'lt-check', role: 'columnheader' }, headCheck);
+  // R70 low 2 (round 8 WL-12): a click on the cell around the box is one on
+  // the box (see checkCell)
+  cellClicks(headCell, headCheck, () => {
+    // as a click on the box: all when not all are selected (also when some are)
+    headCheck.checked = !(lectures.length > 0 && selected.size === lectures.length);
+    toggleAll(headCheck.checked);
+  });
   const head = h(
     'div',
     { class: 'lt-head', role: 'row' },
-    h('span', { class: 'lt-check' }, headCheck),
+    // a column header too (named by the select-all box): the rows' first
+    // cell is the check box, so without it the headers were off by one (T11)
+    headCell,
     h('span', { class: 'lt-h', role: 'columnheader' }, t('course.lectures.col.kind')),
     h('span', { class: 'lt-h', role: 'columnheader' }, t('course.lectures.col.lecture')),
     h('span', { class: 'lt-h', role: 'columnheader' }, t('course.lectures.col.progress')),
@@ -128,6 +139,27 @@ export function createLectureList(opts) {
     return lectures.filter((l) => selected.has(l.id));
   }
 
+  // R70 low 2 (round 8 WL-12): the check box's cell takes the clicks
+  // around the box as the box's own. Its wider hit area was a ::after of
+  // the box (style.css), which only Chromium draws on a native check box:
+  // Firefox and Safari kept 15 px. A click on the cell itself (not on the
+  // box, nor on a material's drag handle in it) toggles the box with the
+  // Shift of the click (a range, as onCheck does) and gives it the focus,
+  // as a click on it does; the cell stays a table cell (a <label> would
+  // also have done, but its click reaches the box with the Shift of the
+  // browser's own making, and a Shift+click on it selects text). toggle
+  // (shift) does the box's work.
+  function cellClicks(cell, box, toggle) {
+    cell.addEventListener('mousedown', (e) => {
+      if (e.target === cell && e.shiftKey) e.preventDefault(); // no text selection by Shift+click
+    });
+    cell.addEventListener('click', (e) => {
+      if (e.target !== cell || box.disabled) return;
+      box.focus();
+      toggle(!!e.shiftKey);
+    });
+  }
+
   // ---- rows ----
 
   function render(list) {
@@ -135,7 +167,9 @@ export function createLectureList(opts) {
       pendingList = list; // re-rendering would remove the dragged row
       return;
     }
-    lectures = list;
+    // its own copy: the caller's array is changed in place before it calls
+    // updateRow, which compares with the list as drawn
+    lectures = list.slice();
     for (const id of [...selected]) if (!lectures.some((l) => l.id === id)) selected.delete(id);
     preserveFocus(() => {
       clear(body);
@@ -195,12 +229,58 @@ export function createLectureList(opts) {
   // else play once the lecture is playable (SPEC-v2 P1).
   function primaryAction(lec) {
     const acts = lec.lecture_actions || [];
-    if (acts.includes('launch')) return btn(t('course.lectures.launch'), { size: 'sm', kind: 'primary', icon: 'play', fkey: `lec:${lec.id}:launch`, onclick: () => done(A.launchLectures([lec])) });
-    const failed = lec.stages.find((s) => s.status === 'failed' && (s.allowed_actions || []).includes('retry'));
-    if (failed) return btn(t('common.retry'), { size: 'sm', icon: 'rotate-cw', fkey: `lec:${lec.id}:retry`, title: t('course.lectures.retry_tip', { stage: U.stageName(failed.stage) }), onclick: () => done(A.stageAction(lec, failed.stage, 'retry', true)) });
-    if (acts.includes('update')) return btn(t('course.lectures.update'), { size: 'sm', kind: 'warn', icon: 'refresh-cw', fkey: `lec:${lec.id}:update`, title: t('course.lectures.update_tip'), onclick: () => done(A.updateLectures([lec])) });
-    if (lec.playable) return btn(t('player.entry.play'), { size: 'sm', kind: U.isAllDone(lec.stages) ? 'primary' : '', icon: 'play', fkey: `lec:${lec.id}:play`, title: t('player.entry.play_hint'), onclick: () => (location.hash = `#/play/${enc(lec.id)}`) });
+    const fnext = (x) => endNext(`lec:${lec.id}`, x);
+    if (acts.includes('launch')) return btn(t('course.lectures.launch'), { size: 'sm', kind: 'primary', icon: 'play', fkey: `lec:${lec.id}:launch`, fnext: fnext('launch'), onclick: () => done(A.launchLectures([lec])) });
+    // a retry that cannot succeed (a damaged file, U.retryFutile) is not the row's action
+    const failed = lec.stages.find((s) => s.status === 'failed' && (s.allowed_actions || []).includes('retry') && !U.retryFutile(s));
+    // T24 B1: a failure the same request cannot get past (a refusal, the
+    // total time limit: U.retryNeedsModel) fails again, and is billed again,
+    // when retried as it is: the row offers "retry with another model…"
+    // (the stage card's, actions.js) instead; without it, no retry here
+    if (failed && U.retryNeedsModel(failed)) {
+      if (cardActions(failed).includes('retry_model'))
+        return btn(t('common.action.retry_model'), { size: 'sm', icon: 'rotate-cw', fkey: `lec:${lec.id}:retry_model`, fnext: fnext('retry_model'), title: t('course.lectures.retry_model_tip', { stage: U.stageName(failed.stage) }), onclick: () => done(A.stageAction(lec, failed.stage, 'retry_model')) });
+    } else if (failed) return btn(t('common.retry'), { size: 'sm', icon: 'rotate-cw', fkey: `lec:${lec.id}:retry`, fnext: fnext('retry'), title: t('course.lectures.retry_tip', { stage: U.stageName(failed.stage) }), onclick: () => done(A.stageAction(lec, failed.stage, 'retry', true)) });
+    if (acts.includes('update')) return btn(t('course.lectures.update'), { size: 'sm', kind: 'warn', icon: 'refresh-cw', fkey: `lec:${lec.id}:update`, fnext: fnext('update'), title: t('course.lectures.update_tip'), onclick: () => done(updateConfirmed([lec])) });
+    if (lec.playable) return btn(t('player.entry.play'), { size: 'sm', kind: U.isAllDone(lec.stages) ? 'primary' : '', icon: 'play', fkey: `lec:${lec.id}:play`, fnext: fnext('play'), title: t('player.entry.play_hint'), onclick: () => (location.hash = `#/play/${enc(lec.id)}`) });
     return null;
+  }
+
+  // Where the focus goes when an action at the row's end is gone after the
+  // re-render it caused (3.2.0 L14): the row's new action in the same place
+  // ("启动" becomes "重试", "换模型重试…", "更新" or "播放"), else the next
+  // control of the row; "更多操作" is always there.
+  function endNext(fk, self) {
+    const prim = ['launch', 'retry', 'retry_model', 'update', 'play'];
+    const rest = ['review', 'dl', 'more'];
+    const keys = prim.includes(self) ? [...prim.filter((k) => k !== self), ...rest] : rest.slice(rest.indexOf(self) + 1);
+    return keys.map((k) => `${fk}:${k}`);
+  }
+
+  // T25 X1: an update says first which stages run again, why, and what
+  // they took the last time (update_confirm.js); one dialog for the same
+  // lectures at a time (a second click while it asks)
+  function updateConfirmed(list) {
+    const ls = list.filter((l) => (l.lecture_actions || []).includes('update'));
+    if (!ls.length) return Promise.resolve([]);
+    const key = ls
+      .map((l) => l.id)
+      .sort()
+      .join(',');
+    // a selection names the lectures it updates, one included (R74 low 3)
+    return A.once(`confirm_update:${key}`, async () => ((await confirmUpdate(ls, { named: list.length > 1 })) ? A.updateLectures(ls) : []));
+  }
+
+  // R74 medium 4: "start" of the selected drafts asks as "start all
+  // drafts" does (the same dialog). Round 8 (C178b): asked by
+  // launchLectures's opts.ask, after its glossary question (the glossary
+  // still being extracted), each once, not the confirmation first and the
+  // glossary's after it; launchLectures keeps it to one dialog at a time
+  // for the same lectures (once).
+  function launchConfirmed(list) {
+    const ls = list.filter((l) => (l.lecture_actions || []).includes('launch'));
+    if (!ls.length) return Promise.resolve([]);
+    return A.launchLectures(ls, { ask: (sel) => confirmLaunchDrafts(sel, sel.length) });
   }
 
   function done(p) {
@@ -351,10 +431,16 @@ export function createLectureList(opts) {
       res: ctx.resources,
       stream: lec.stream, // stream-parallel: the playback file with prep
       onAction: (stage, action) => done(A.stageAction(lec, stage, action, true)),
+      // P2 hotspot 3 (round 8 WL-02): a card's content is built when it
+      // first opens; a stage its card describes (an error, a waiting
+      // reason) has it at once (40 lectures on the test stand-in: 5093 →
+      // 2513 elements in the list)
+      lazyCards: true,
     });
     const st = statusLine(lec);
     const statusEl = h('span', { class: `lrow-status tone-${st.sum.tone}`, title: st.text }, st.text);
-    refs.set(lec.id, { bar: pipe, statusEl, lec });
+    const metaEl = st.meta.length ? h('span', { class: 'lrow-meta', title: st.meta.join(' · ') }, st.meta.join(' · ')) : null;
+    refs.set(lec.id, { bar: pipe, statusEl, metaEl, lec });
     // a retry's countdown goes on by the second (3.2.0 L12)
     if (U.backoffCounting(lec.stages))
       everySecond(statusEl, () => {
@@ -369,7 +455,7 @@ export function createLectureList(opts) {
     // the downloads live in the context menu (the export submenu).
     const dl = lec.exports.length && !(allDone && lec.playable)
       ? menuButton(
-          iconBtn('download', t('course.lectures.download_label', { title: lec.title }), { fkey: `${fk}:dl`, title: allDone ? t('course.lectures.download_tip') : t('course.lectures.download_tip_outdated') }),
+          iconBtn('download', t('course.lectures.download_label', { title: lec.title }), { fkey: `${fk}:dl`, fnext: endNext(fk, 'dl'), title: allDone ? t('course.lectures.download_tip') : t('course.lectures.download_tip_outdated') }),
           () => A.exportItems(lec.exports),
         )
       : null;
@@ -391,6 +477,11 @@ export function createLectureList(opts) {
           icon('grip-vertical', { size: 14 }),
         )
       : null;
+    const checkCell = h('span', { class: 'lt-check', role: 'cell' }, grip, check);
+    cellClicks(checkCell, check, (shiftKey) => {
+      check.checked = !selected.has(lec.id); // the box toggled, as a click on it leaves it
+      onCheck(lec, { target: check, shiftKey });
+    });
     const el = h(
       'div',
       {
@@ -398,7 +489,7 @@ export function createLectureList(opts) {
         role: 'row',
         dataset: week ? { id: lec.id, week, dropWeek: week } : { id: lec.id },
       },
-      h('span', { class: 'lt-check', role: 'cell' }, grip, check),
+      checkCell,
       h('span', { class: 'lrow-kind', role: 'cell', title: kindTitle(lec) }, kindTag(lec)),
       h(
         'div',
@@ -415,34 +506,92 @@ export function createLectureList(opts) {
         child ? h('span', { class: 'visually-hidden' }, t('course.week.child', { week })) : null,
         editing === lec.id && renamesZh(lec) ? zhEditNote(`lec-${lec.id}-zh-note`) : null, // P14.6: the editor holds the stored Simplified title
         tt.blurb ? h('div', { class: 'lrow-blurb', title: tt.blurbFull, lang: tt.blurbLang }, tt.blurb) : null,
-        h('div', { class: 'lrow-sub' }, statusEl, st.warn ? h('span', { class: 'chip chip-warn', title: t('course.lectures.warn_tip') }, st.warn) : null, st.meta.length ? h('span', { class: 'lrow-meta', title: st.meta.join(' · ') }, st.meta.join(' · ')) : null),
+        h('div', { class: 'lrow-sub' }, statusEl, st.warn ? h('span', { class: 'chip chip-warn', title: t('course.lectures.warn_tip') }, st.warn) : null, metaEl),
       ),
       h('div', { class: 'lrow-pipe', role: 'cell' }, pipe),
       h(
         'div',
         { class: 'lrow-end', role: 'cell' },
         primaryAction(lec),
-        lec.counts.patches_pending > 0
-          ? h(
-              'a',
-              { class: 'chip chip-review', href: `#/lecture/${enc(lec.id)}/review`, title: lec.reviewable ? t('course.lectures.review_tip') : t('course.lectures.review_busy_tip'), dataset: { fkey: `${fk}:review` } },
-              t('course.lectures.review', { n: lec.counts.patches_pending }),
-            )
-          : null,
-        dl,
-        more,
+        // T16 D3: the review chip, the downloads and the menu stay together
+        // on one line; at phone width, when they do not fit beside the
+        // primary action, they wrap to the second line as a whole (plain
+        // wrap, style.css 480px). Where even that line is too narrow (360
+        // wide, T18 N1) the review chip and the downloads + menu unit
+        // (.lrow-dlmenu, never split: the menu is never alone) take a line
+        // each inside the cell. Always in this DOM order (the Tab and
+        // reading order, R34b)
+        h(
+          'span',
+          { class: 'lrow-tail' },
+          lec.counts.patches_pending > 0
+            ? h(
+                'a',
+                { class: 'chip chip-review', href: `#/lecture/${enc(lec.id)}/review`, title: lec.reviewable ? t('course.lectures.review_tip') : t('course.lectures.review_busy_tip'), dataset: { fkey: `${fk}:review`, fnext: endNext(fk, 'review').join(' ') } },
+                t('course.lectures.review', { n: lec.counts.patches_pending }),
+              )
+            : null,
+          h('span', { class: 'lrow-dlmenu' }, dl, more),
+        ),
       ),
     );
     bindContextMenu(el, (e) => (editing === lec.id ? null : menuFor(lec)));
     el.addEventListener('keydown', (e) => onRowKey(e, lec, el));
     if (grip) dragSource(el, grip, lec);
+    refs.get(lec.id).el = el;
     return el;
+  }
+
+  // What the group rows show of a list (groupLectures): their titles, the
+  // lectures in each and the slide files of a week; equal keys draw the
+  // same group rows and the same rows in the same places.
+  function groupsKey(list) {
+    return JSON.stringify(
+      groupLectures(list).map((g) => [
+        g.key,
+        g.title,
+        g.hint || '',
+        g.week || 0,
+        g.lectures.map((l) => l.id),
+        (g.children || []).map((l) => l.id),
+        [...g.lectures, ...(g.children || [])].flatMap((l) => (l.materials || []).filter((m) => m.via !== 'course').map((m) => [m.id, m.filename, m.via])),
+      ]),
+    );
+  }
+
+  // P2 hotspot 3: one lecture changed (its SSE refresh, an action's answer).
+  // Rebuilding the whole list took 180–640 ms at 40 lectures with the CPU
+  // slowed 4x; its row alone is redrawn when it stays where it was (the
+  // same place in the list, the same group rows): → true. The selection,
+  // the other rows and the keyboard focus stay (preserveFocus). false: the
+  // caller renders the whole list (the lecture is not shown, it moved to
+  // another place or group, a rename or a drag is on).
+  function updateRow(lec) {
+    // a search narrows the list (the caller's filter): the lecture may show or not now
+    if (drag || editing || (opts.filtered && opts.filtered())) return false;
+    const i = lectures.findIndex((l) => l.id === lec.id);
+    const ref = refs.get(lec.id);
+    if (i < 0 || !ref || !ref.el || !ref.el.isConnected || lectures[i].seq !== lec.seq) return false;
+    const next = lectures.slice();
+    next[i] = lec;
+    if (groupsKey(next) !== groupsKey(lectures)) return false;
+    const g = groupLectures(next).find((x) => x.lectures.includes(lec) || (x.children || []).includes(lec));
+    if (!g) return false;
+    lectures = next;
+    preserveFocus(() => {
+      ref.el.replaceWith(row(lec, titleLang(), g.week, (g.children || []).includes(lec)));
+      if (selected.has(lec.id)) renderBar(); // the selection's counts (start, update, …)
+    });
+    return true;
   }
 
   function menuFor(lec) {
     const sel = selectedLectures();
     if (selected.has(lec.id) && sel.length > 1) return batchItems(sel);
     const items = A.lectureMenuItems(lec, menuHandlers);
+    // T25 X1: the menu's "update" asks first, as the row's does
+    const up = items.findIndex((x) => x && x.id === 'update');
+    if (up >= 0) items[up] = { ...items[up], onSelect: () => done(updateConfirmed([lec])) };
     // course-ux: hang under a week / make-up, after "change kind"
     const extra = weekMenuItems(lec, course(), lectures, (l) => opts.onLectures([l]));
     if (extra.length) {
@@ -556,6 +705,9 @@ export function createLectureList(opts) {
 
   // ---- inline rename (A12.2 rename; also F2) ----
 
+  // The longest title (title or title_zh) the rename input takes.
+  const TITLE_MAX = 200;
+
   // The field renamed is the one shown as the main title (title_zh when the
   // title language is Chinese and there is one).
   const renamesZh = (lec) => titleLang() === 'zh' && !!(lec.title_zh || '').trim();
@@ -578,6 +730,9 @@ export function createLectureList(opts) {
     const input = h('input', {
       class: 'input lrow-title-input',
       value: draft,
+      // the server keeps at most 200 characters (media.MaxTitleRunes);
+      // maxlength counts UTF-16 units, so it never lets through more
+      maxlength: String(TITLE_MAX),
       'aria-label': t('course.lectures.title_input'),
       'aria-describedby': zhNote ? `lec-${lec.id}-zh-note` : undefined,
       dataset: { fkey: `lec:${lec.id}:title-input` },
@@ -632,9 +787,9 @@ export function createLectureList(opts) {
   function batchItems(sel) {
     const c = counts(sel);
     return [
-      c.launch ? { label: t('course.lectures.batch.launch_n', { n: c.launch }), icon: 'play', onSelect: () => batch(() => A.launchLectures(sel)) } : null,
+      c.launch ? { label: t('course.lectures.batch.launch_n', { n: c.launch }), icon: 'play', onSelect: () => batch(() => launchConfirmed(sel)) } : null,
       c.cancel ? { label: t('course.lectures.batch.cancel_n', { n: c.cancel }), icon: 'ban', onSelect: () => batch(() => A.cancelLectures(sel)) } : null,
-      c.update ? { label: t('course.lectures.batch.update_n', { n: c.update }), icon: 'refresh-cw', onSelect: () => batch(() => A.updateLectures(sel)) } : null,
+      c.update ? { label: t('course.lectures.batch.update_n', { n: c.update }), icon: 'refresh-cw', onSelect: () => batch(() => updateConfirmed(sel)) } : null,
       rerunStages(sel).length ? { label: t('course.lectures.batch.rerun_menu'), icon: 'rotate-cw', onSelect: () => rerun(sel) } : null,
       'sep',
       { label: t('course.lectures.batch.delete_n', { n: sel.length }), icon: 'trash-2', danger: true, onSelect: () => batchDelete(sel) },
@@ -687,9 +842,9 @@ export function createLectureList(opts) {
           )
         : null,
       h('span', { class: 'batchbar-sep' }),
-      c.launch ? btn(t('course.lectures.batch.launch'), { size: 'sm', kind: 'primary', icon: 'play', count: c.launch, fkey: 'batch:launch', onclick: () => batch(() => A.launchLectures(sel)) }) : null,
+      c.launch ? btn(t('course.lectures.batch.launch'), { size: 'sm', kind: 'primary', icon: 'play', count: c.launch, fkey: 'batch:launch', onclick: () => batch(() => launchConfirmed(sel)) }) : null,
       c.cancel ? btn(t('course.lectures.batch.cancel'), { size: 'sm', kind: 'inverse', icon: 'ban', count: c.cancel, fkey: 'batch:cancel', onclick: () => batch(() => A.cancelLectures(sel)) }) : null,
-      c.update ? btn(t('course.lectures.batch.update'), { size: 'sm', kind: 'inverse', icon: 'refresh-cw', count: c.update, fkey: 'batch:update', onclick: () => batch(() => A.updateLectures(sel)) }) : null,
+      c.update ? btn(t('course.lectures.batch.update'), { size: 'sm', kind: 'inverse', icon: 'refresh-cw', count: c.update, fkey: 'batch:update', onclick: () => batch(() => updateConfirmed(sel)) }) : null,
       rerunStages(sel).length ? btn(t('course.lectures.batch.rerun'), { size: 'sm', kind: 'inverse', icon: 'rotate-cw', fkey: 'batch:rerun', onclick: () => rerun(sel) }) : null,
       btn(t('course.lectures.batch.delete'), { size: 'sm', kind: 'inverse-danger', icon: 'trash-2', count: sel.length, fkey: 'batch:delete', onclick: () => batchDelete(sel) }),
       h('span', { class: 'batchbar-sep' }),
@@ -705,6 +860,24 @@ export function createLectureList(opts) {
     bar.hidden = false;
     if (!was) requestAnimationFrame(() => bar.classList.add('is-in'));
     else bar.classList.add('is-in');
+  }
+
+  // R78 low 3: the texts of the rows that change with time ("running for
+  // 3 min", "uploaded 5 min ago") are worked out again without redrawing
+  // the rows: rows are no longer redrawn by every other lecture's refresh
+  // (updateRow). The course page calls it with its minute tick.
+  function refreshTimes() {
+    for (const ref of refs.values()) {
+      if (!ref.el || !ref.el.isConnected) continue;
+      const s = statusLine(ref.lec);
+      ref.statusEl.textContent = s.text;
+      ref.statusEl.title = s.text;
+      if (ref.metaEl && s.meta.length) {
+        const m = s.meta.join(' · ');
+        ref.metaEl.textContent = m;
+        ref.metaEl.title = m;
+      }
+    }
   }
 
   // In-place progress from SSE (keeps hover cards and focus).
@@ -725,7 +898,7 @@ export function createLectureList(opts) {
     return refs.has(id);
   }
 
-  return { table, bar, render, setProgress, has, openMenuFor: (lec, anchorEl) => openMenu(menuFor(lec), { anchor: anchorEl }) };
+  return { table, bar, render, updateRow, refreshTimes, setProgress, has, openMenuFor: (lec, anchorEl) => openMenu(menuFor(lec), { anchor: anchorEl }) };
 }
 
 // A legend of the stage states (colour + pattern), shown under the list.

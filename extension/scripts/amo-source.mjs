@@ -32,9 +32,10 @@ const REPO_URL = 'https://github.com/ShouldBeQuincy/LectureFlow';
 
 // What the build reads (scripts/build.mjs): the extension's own tree, the
 // app's design tokens and the licence. The rest of the extension's tree
-// (tests, fixtures, schema) is source too and goes with it.
+// (tests, fixtures, schema) is source too and goes with it; extension/go.mod
+// is not (it only keeps the app's Go tools out of extension/, P6 C6).
 const PATHS = ['extension', 'web/style.css', 'LICENSE'];
-const EXCLUDE = ['extension/CLAUDE.md', 'extension/AGENTS.md', 'extension/docs'];
+const EXCLUDE = ['extension/CLAUDE.md', 'extension/AGENTS.md', 'extension/docs', 'extension/go.mod'];
 const FORBIDDEN = /(^|\/)(CLAUDE\.md|AGENTS\.md|PROGRESS\.md|NOTES\.md|SPEC[^/]*\.md)$|(^|\/)\.claude\//;
 
 function arg(name, def = '') {
@@ -114,8 +115,9 @@ ${REPO_URL}. It was made with:
     git archive --format=zip --prefix=${prefix}/ ${commit} -- ${PATHS.join(' ')} ${EXCLUDE.map((x) => `':(exclude)${x}'`).join(' ')}
 
 plus this file. Left out: the AI-agent instructions for contributors
-(extension/CLAUDE.md, extension/AGENTS.md) and the documentation pictures
-(extension/docs/); the build reads neither.
+(extension/CLAUDE.md, extension/AGENTS.md), the documentation pictures
+(extension/docs/) and extension/go.mod (it only keeps the repository's Go
+tools out of extension/); the build reads none of them.
 
 ## Environment
 

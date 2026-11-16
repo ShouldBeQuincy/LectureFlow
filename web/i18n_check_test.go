@@ -193,26 +193,41 @@ func TestI18nKeyCompleteness(t *testing.T) {
 	}
 }
 
-var placeholderRe = regexp.MustCompile(`\{(\w+)\}`)
+// placeholderRe matches {param} and {param:modifier}. The one modifier t()
+// knows is lc (round 9 WH-10, i18n.js: the value's words lower-cased at
+// their first letter, for a fragment in the middle of a Russian sentence);
+// {wait:lc} is the same param as {wait}.
+var placeholderRe = regexp.MustCompile(`\{(\w+)(?::(\w+))?\}`)
+
+// placeholderMods are the modifiers t() knows.
+var placeholderMods = map[string]bool{"lc": true}
 
 // paramSets returns the {param} set of each form of a value: "" for a plain
-// string, the plural category otherwise.
+// string, the plural category otherwise. {param:lc} counts as {param}; an
+// unknown modifier is an error (t() would leave it as written).
 func paramSets(v any) (map[string][]string, error) {
-	set := func(s string) []string {
+	set := func(s string) ([]string, error) {
 		seen := map[string]bool{}
 		var out []string
 		for _, m := range placeholderRe.FindAllStringSubmatch(s, -1) {
+			if m[2] != "" && !placeholderMods[m[2]] {
+				return nil, fmt.Errorf("placeholder %s has an unknown modifier %q (only :lc)", m[0], m[2])
+			}
 			if !seen[m[1]] {
 				seen[m[1]] = true
 				out = append(out, m[1])
 			}
 		}
 		sort.Strings(out)
-		return out
+		return out, nil
 	}
 	switch x := v.(type) {
 	case string:
-		return map[string][]string{"": set(x)}, nil
+		ps, err := set(x)
+		if err != nil {
+			return nil, err
+		}
+		return map[string][]string{"": ps}, nil
 	case map[string]any:
 		out := map[string][]string{}
 		for form, s := range x {
@@ -220,7 +235,11 @@ func paramSets(v any) (map[string][]string, error) {
 			if !ok {
 				return nil, fmt.Errorf("plural form %q is not a string", form)
 			}
-			out[form] = set(str)
+			ps, err := set(str)
+			if err != nil {
+				return nil, fmt.Errorf("plural form %q: %w", form, err)
+			}
+			out[form] = ps
 		}
 		return out, nil
 	}

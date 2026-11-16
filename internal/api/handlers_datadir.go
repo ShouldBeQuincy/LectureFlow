@@ -13,6 +13,8 @@ package api
 //   GET    /api/app/data-dir            DataDirStatus (also GET /api/app/import)
 //   POST   /api/app/import {"path"}     stage a development data directory,
 //                                       restart; applied before the database opens
+//   DELETE /api/app/folder-pick {"path"} the user declined the confirmation of
+//                                       the folder they picked: forget the pick
 //   GET    /api/app/old-data-dir        the directory the data was moved from
 //   DELETE /api/app/old-data-dir {"path"} delete it after the user confirmed
 
@@ -39,6 +41,7 @@ func init() {
 		h("POST /api/app/data-dir/check", s.postDataDirCheck)
 		h("GET /api/app/import", s.getDataDirStatus)
 		h("POST /api/app/import", s.postImport)
+		h("DELETE /api/app/folder-pick", s.deleteFolderPick)
 		h("GET /api/app/old-data-dir", s.getOldDataDir)
 		h("DELETE /api/app/old-data-dir", s.deleteOldDataDir)
 	})
@@ -146,11 +149,13 @@ func relocateStatus(code string) int {
 	switch code {
 	case relocate.CodeNoSpace:
 		return http.StatusInsufficientStorage
+	case codeDataDirPathNotAllowed, codeDataDirPathNotGranted:
+		return http.StatusForbidden
 	case relocate.CodeNotFresh, relocate.CodeSourceChanged, "data_dir.busy", "data_dir.in_progress", "data_dir.env_override":
 		return http.StatusConflict
 	case relocate.CodePathInvalid, relocate.CodePathTooLong, relocate.CodeSameDir, relocate.CodeTargetNotEmpty, relocate.CodeTargetInside,
 		relocate.CodeTargetContains, relocate.CodeTargetNotWritable, relocate.CodeNotLectureFlow, relocate.CodeTooNew,
-		relocate.CodeImportSameDir, codeImportNetworkPath:
+		relocate.CodeImportSameDir, codeImportNetworkPath, relocate.CodeOutsidePath, relocate.CodeModified:
 		return http.StatusBadRequest
 	}
 	return http.StatusInternalServerError
@@ -243,7 +248,7 @@ func (s *Server) volumeFree(dir string) int64 {
 	}
 	dir = filepath.Clean(dir)
 	for {
-		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+		if fi, err := s.statDir(dir); err == nil && fi.IsDir() {
 			break
 		}
 		parent := filepath.Dir(dir)
@@ -256,6 +261,84 @@ func (s *Server) volumeFree(dir string) int64 {
 		return f
 	}
 	return -1
+}
+
+// codeDataDirPathNotAllowed: a network folder the folder dialog did not pick.
+const codeDataDirPathNotAllowed = "data_dir.path_not_allowed"
+
+// codeDataDirPathNotGranted: any other folder the folder dialog did not pick
+// (a local path, a mapped drive; r4 path-grants).
+const codeDataDirPathNotGranted = "data_dir.path_not_granted"
+
+// folderRefused is the first check of the data directory endpoints on the
+// page's path, before anything touches it. Every folder they take comes
+// from the folder dialog (window.lectureflow.pickFolder), whose pick the
+// desktop main process grants (pathgrant.go, folder grants), so a path
+// without a grant is refused:
+//
+//   - a network or device path (networkPath: \\server\share,
+//     //server/share, \\?\UNC\…, \\.\…; security review SEC24 R1): os.Stat
+//     of \\server\… makes Windows authenticate to that server and send the
+//     user's NTLM credentials. Refused with data_dir.path_not_allowed. A
+//     data directory on a share stays possible (NOTES netpath-datadir), but
+//     only one the user chose.
+//   - any other absolute path (D:\Foo, a mapped drive Z:\, /Volumes/x):
+//     refused with data_dir.path_not_granted (r4; SEC24b residual: without
+//     it, page script could probe whether a local folder exists, is empty
+//     and how much room it has, and move or import the data directory to
+//     or from any local folder).
+//   - a path that is not absolute (empty, relative, C:x, \x) is
+//     data_dir.path_invalid as it always was (relocate's cleanAbs rule),
+//     decided here without any file system call: the dialog never returns
+//     one, so no grant can name it.
+//
+// consume uses the grant up (the move, the import; returned when the
+// request fails, grantScope); the check only looks, leaving it to the move
+// that follows. A pick is good for folderGrantTTL (pathgrant.go, "Folder
+// grants"): after that it is refused like a folder that was never picked.
+func (s *Server) folderRefused(ctx context.Context, p string, consume bool) error {
+	network := networkPath(p)
+	if !network {
+		if t := strings.TrimSpace(p); t == "" || !filepath.IsAbs(t) {
+			return model.Errorf(relocate.CodePathInvalid, map[string]any{"path": p}, nil)
+		}
+	}
+	if consume && s.useFolderGrant(ctx, p) || !consume && s.grants != nil && s.grants.hasFolder(p) {
+		return nil
+	}
+	if network {
+		slog.Warn("data directory: refused a network path the user did not pick in the folder dialog")
+		return model.Errorf(codeDataDirPathNotAllowed, map[string]any{"path": p}, nil)
+	}
+	slog.Warn("data directory: refused a folder the user did not pick in the folder dialog")
+	return model.Errorf(codeDataDirPathNotGranted, map[string]any{"path": p}, nil)
+}
+
+// DELETE /api/app/folder-pick {"path"} → 204: the user picked path in the
+// folder dialog and it will not be used (cancel in the page's move or
+// import dialog, or the setup guide's check refused the folder; web/api.js
+// forgetFolderPick), so the pick is forgotten now instead of when it
+// expires (security review SEC26 low-1): a move or an import of that folder
+// needs the dialog again. 204 for a JSON object (or null; a missing path is
+// the empty one), whether or not path had a pick; 400 request.bad_json for
+// any other body (not JSON, an array, a string, a path that is not a
+// string). Neither answer depends on the picks, and nothing is asked of the
+// file system: the path is only compared with the picks (pathGrantKey).
+// The page's own request (the access token, no grant header): giving a
+// pick up widens nothing. 404 in web mode.
+func (s *Server) deleteFolderPick(w http.ResponseWriter, r *http.Request) {
+	if !s.desktopOnly(w, r) {
+		return
+	}
+	var in pathBody
+	if err := decodeJSON(r, &in); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if s.grants != nil {
+		s.grants.forgetFolder(in.Path)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // GET /api/app/data-dir, GET /api/app/import.
@@ -376,7 +459,9 @@ func (s *Server) pauseDispatch(h RelocateHooks) (func(), map[string]string, erro
 }
 
 // POST /api/app/data-dir {"path"}: 409 data_dir.env_override (the data
-// directory comes from LECTUREFLOW_DATA_DIR), data_dir.in_progress,
+// directory comes from LECTUREFLOW_DATA_DIR); 403
+// data_dir.path_not_allowed / data_dir.path_not_granted {path} (not the
+// folder dialog's pick: folderRefused); 409 data_dir.in_progress,
 // data_dir.busy {running, queued}; 400/507 for the checks of
 // relocate.CheckMove; else 202 DataDirStatus and the copy runs in the
 // background, followed by the restart.
@@ -394,13 +479,17 @@ func (s *Server) postDataDir(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	if err := s.folderRefused(ctx, in.Path, true); err != nil {
+		s.writeRelocateError(w, r, err)
+		return
+	}
 	run, err := s.beginRun(ctx)
 	if err != nil {
 		s.writeRelocateError(w, r, err)
 		return
 	}
 	src := s.absDataDir()
-	plan, err := relocate.CheckMove(ctx, src, in.Path, s.desktop.LocationFile)
+	plan, err := s.checkMove(ctx, src, in.Path, s.desktop.LocationFile)
 	if err != nil {
 		run.release()
 		s.writeRelocateError(w, r, err)
@@ -439,10 +528,6 @@ func (s *Server) postDataDirCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := DataDirCheck{Path: in.Path, FreeBytes: -1}
-	if p := strings.TrimSpace(in.Path); p != "" && filepath.IsAbs(p) {
-		out.Path = filepath.Clean(p)
-		out.FreeBytes = s.volumeFree(out.Path)
-	}
 	refuse := func(err error) {
 		info := relocateInfo(err)
 		if relocateStatus(info.Code) == http.StatusInternalServerError {
@@ -451,11 +536,19 @@ func (s *Server) postDataDirCheck(w http.ResponseWriter, r *http.Request) {
 		out.Error = &info
 		writeJSON(w, http.StatusOK, out)
 	}
+	ctx := r.Context()
+	if err := s.folderRefused(ctx, in.Path, false); err != nil {
+		refuse(err)
+		return
+	}
+	if p := strings.TrimSpace(in.Path); p != "" && filepath.IsAbs(p) {
+		out.Path = filepath.Clean(p)
+		out.FreeBytes = s.volumeFree(out.Path)
+	}
 	if s.desktop.LocationFile == "" {
 		refuse(model.Errorf("data_dir.env_override", nil, nil))
 		return
 	}
-	ctx := r.Context()
 	run := s.dataDirRun()
 	run.mu.Lock()
 	busy := run.busy
@@ -468,7 +561,7 @@ func (s *Server) postDataDirCheck(w http.ResponseWriter, r *http.Request) {
 		refuse(err)
 		return
 	}
-	plan, err := relocate.CheckMove(ctx, s.absDataDir(), in.Path, s.desktop.LocationFile)
+	plan, err := s.checkMove(ctx, s.absDataDir(), in.Path, s.desktop.LocationFile)
 	if err != nil {
 		refuse(err)
 		return
@@ -521,6 +614,10 @@ func (s *Server) postImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	if err := s.folderRefused(ctx, in.Path, true); err != nil {
+		s.writeRelocateError(w, r, err)
+		return
+	}
 	run, err := s.beginRun(ctx)
 	if err != nil {
 		s.writeRelocateError(w, r, err)
@@ -530,7 +627,7 @@ func (s *Server) postImport(w http.ResponseWriter, r *http.Request) {
 		run.release()
 		s.writeRelocateError(w, r, err)
 	}
-	info, err := relocate.CheckImportSource(ctx, in.Path)
+	info, err := s.checkImportSource(ctx, in.Path)
 	if err != nil {
 		refuse(err)
 		return
@@ -618,6 +715,10 @@ func (s *Server) oldDataDir(ctx context.Context) (string, error) {
 
 // GET /api/app/old-data-dir: the directory of the last move (kv
 // app.old_data_dir in the new database), whether it still exists and its size.
+// A recorded value that is not an absolute path on this computer's drives
+// (relocate.LocalAbsPath; an import by an older version could bring a
+// share along, and opening one sends it the user's credentials) is none,
+// never stat'ed (SEC44 low-4).
 func (s *Server) getOldDataDir(w http.ResponseWriter, r *http.Request) {
 	if !s.desktopOnly(w, r) {
 		return
@@ -626,6 +727,9 @@ func (s *Server) getOldDataDir(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.fail(w, r, err)
 		return
+	}
+	if !relocate.LocalAbsPath(p) {
+		p = ""
 	}
 	out := OldDataDir{Path: p}
 	if p != "" {
@@ -644,6 +748,8 @@ func (s *Server) getOldDataDir(w http.ResponseWriter, r *http.Request) {
 // LectureFlow data directory (409 old_data_dir.not_lectureflow: no
 // lectureflow.db in it). In the default data directory the desktop shell's
 // location.json and electron/ profile stay. 200 OldDataDir (now empty).
+// A recorded value that is not an absolute path on this computer's drives
+// is none (as for GET; SEC44 low-4).
 func (s *Server) deleteOldDataDir(w http.ResponseWriter, r *http.Request) {
 	if !s.desktopOnly(w, r) {
 		return
@@ -659,7 +765,7 @@ func (s *Server) deleteOldDataDir(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	if rec == "" {
+	if rec == "" || !relocate.LocalAbsPath(rec) {
 		writeError(w, http.StatusNotFound, "old_data_dir.none", nil)
 		return
 	}

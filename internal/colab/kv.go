@@ -27,6 +27,10 @@ const (
 	// tokens), so that the next start releases a session a crash left
 	// behind (V14.3 step 5).
 	KVSession = "colab.session"
+	// KVLost lists runtimes no session stands for any more that could not
+	// be released yet (lostRuntime JSON array, no tokens; lost.go): Tick and
+	// the next start release them (security review SEC2 H1).
+	KVLost = "colab.lost"
 	// KVSettings are the backend settings (Settings JSON).
 	KVSettings = "colab.settings"
 	// KVRates are the measured speeds per accelerator, model and precision

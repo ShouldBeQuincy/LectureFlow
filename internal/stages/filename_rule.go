@@ -17,6 +17,7 @@ import (
 	"lectureflow/internal/calendar"
 	"lectureflow/internal/ctxbuild"
 	"lectureflow/internal/db"
+	"lectureflow/internal/llm"
 	"lectureflow/internal/model"
 	"lectureflow/internal/state"
 )
@@ -224,7 +225,11 @@ func (s *filenameRuleStage) Run(ctx context.Context, courseID string, progress f
 		err = errNoFilenameModel
 	} else {
 		a, unusable, err = askJSONRetry(ctx, d.LLM, s.role, req.System, req.User, check)
-		if err != nil && !unusable {
+		// A refusal (llm.ErrRefusal: a refusal stop reason or a content
+		// filter) is a model that gave no usable rule, like an unusable
+		// answer: the built-in pattern is tried and the names are recorded,
+		// so they do not trigger (and get refused) again (review R25 B-1).
+		if err != nil && !unusable && !errors.Is(err, llm.ErrRefusal) {
 			return err
 		}
 	}
@@ -243,7 +248,12 @@ func (s *filenameRuleStage) Run(ctx context.Context, courseID string, progress f
 				fa.Explanation = panoptoNoModelExplanation
 				slog.Info("filename rule: no model configured, built-in Panopto pattern used", "course", courseID)
 			} else {
-				slog.Info("filename rule: model's rule rejected, built-in Panopto pattern used", "course", courseID, "error", err)
+				// what was wrong, not the error: it quotes the regex and file names (SEC1 L4)
+				problem := unusableKind(err)
+				if errors.Is(err, llm.ErrRefusal) {
+					problem = "refused"
+				}
+				slog.Info("filename rule: model's rule rejected, built-in Panopto pattern used", "course", courseID, "problem", problem)
 			}
 			a, parsed, matched, kindMap, kindNotes, err = fa, p, m, nil, nil, nil
 		}
@@ -255,6 +265,9 @@ func (s *filenameRuleStage) Run(ctx context.Context, courseID string, progress f
 			return mErr
 		}
 		d.events().Changed("course", courseID)
+		if errors.Is(err, llm.ErrRefusal) {
+			return err // coded llm.refusal, permanent: says to use another model
+		}
 		var rj *ruleRejected
 		if errors.As(err, &rj) {
 			return model.Errorf("filename_rule.rejected", map[string]any{"matched": rj.matched, "total": rj.total}, err)
@@ -264,7 +277,7 @@ func (s *filenameRuleStage) Run(ctx context.Context, courseID string, progress f
 			// model to ask: say how to get the recording times
 			return model.Errorf("filename_rule.not_configured", nil, err)
 		}
-		return model.Errorf("filename_rule.invalid_output", map[string]any{"attempts": auxAttempts}, err)
+		return model.Errorf("filename_rule.invalid_output", map[string]any{"attempts": auxAttempts}, withoutAnswerText(err))
 	}
 	progress(0.9)
 	if len(kindNotes) > 0 {

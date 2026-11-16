@@ -14,6 +14,7 @@ const (
 	CodeSetupNeeded       = "remote.setup_needed"       // device
 	CodeInstallFailed     = "remote.install_failed"     // device, step
 	CodeAgentFailed       = "remote.agent_failed"       // device
+	CodeAgentMissing      = "remote.agent_missing"      // device (this installation has no lf-agent build)
 	CodeProtocol          = "remote.protocol"           // device, reason
 	CodeUploadFailed      = "remote.upload_failed"      // device
 	CodeDownloadFailed    = "remote.download_failed"    // device
@@ -37,7 +38,7 @@ const (
 // ErrorCodes lists them (stages.ErrorCodes includes them).
 var ErrorCodes = []string{
 	CodeOffline, CodeAuthFailed, CodeHostKeyUnknown, CodeHostKeyMismatch, CodeSetupNeeded, CodeInstallFailed,
-	CodeAgentFailed, CodeProtocol, CodeUploadFailed, CodeDownloadFailed, CodeResultInvalid, CodeWorkerFailed,
+	CodeAgentFailed, CodeAgentMissing, CodeProtocol, CodeUploadFailed, CodeDownloadFailed, CodeResultInvalid, CodeWorkerFailed,
 	CodeDeviceUnusable, CodeOutOfMemory, CodeNoSpace, CodeDisconnected, CodeBusy, CodeUnsupported,
 	CodeNotConfigured, CodeAudioUnreadable, CodeCleanupIncomplete, CodeSelfTestSSH,
 }

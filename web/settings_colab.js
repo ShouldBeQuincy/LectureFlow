@@ -40,10 +40,11 @@
 
 import { h, btn, skeleton, errorBlock, toast, confirmDialog, copyText } from './dom.js';
 import { icon } from './icons.js';
-import { t, has } from './i18n.js';
+import { t, has, getLocale } from './i18n.js';
 import * as U from './util.js';
 import { appRequest } from './settings_app.js';
 import { createColabLogin } from './colab_login.js';
+import { keepChildren } from './components_ui.js';
 
 // ---- shared state: the resource snapshot's "remote" ----
 
@@ -249,21 +250,40 @@ export function effectiveAccel(st) {
 }
 
 /**
- * Why accelerator x cannot be borrowed now ('' = it can): account_unknown,
- * no_balance or ineligible (texts resources.remote.lock.*). Every
- * accelerator is open with a back end that does not list them.
+ * Why accelerator x cannot be borrowed now ('' = it can): need_auth,
+ * account_unknown, no_balance or ineligible (texts resources.remote.lock.*).
+ * Every accelerator is open with a back end that does not list them. An
+ * account not read because Colab is not authorized yet is need_auth, not
+ * account_unknown, which reads like a failure (round 2, T6 #11).
  */
 export function lockOf(st, x) {
   const list = st && st.selectable_accelerators;
   if (!Array.isArray(list) || list.includes(x)) return '';
   const a = accountOf(st);
-  if (!accountKnown(a)) return 'account_unknown';
+  if (!accountKnown(a)) return st.auth && !st.auth.present ? 'need_auth' : 'account_unknown';
   if (!(a.paid_balance_cu > 0)) return 'no_balance';
   return 'ineligible';
 }
 
 export function lockText(reason) {
   return reason && has(`resources.remote.lock.${reason}`) ? t(`resources.remote.lock.${reason}`) : reason || '';
+}
+
+/**
+ * lockText on a line of its own (the accelerator row): the reasons are
+ * lower-case fragments made to sit inside a sentence, so the first letter
+ * is raised there (no change in scripts without case).
+ */
+export function lockLine(reason) {
+  const s = lockText(reason);
+  if (!s) return '';
+  let first;
+  try {
+    first = s.charAt(0).toLocaleUpperCase(getLocale() || undefined);
+  } catch {
+    first = s.charAt(0).toUpperCase();
+  }
+  return first + s.slice(1);
 }
 
 /** "免费额度约 3.2 CU，下次补充 10月28日 08:00" ('' without a free quota). */
@@ -297,11 +317,15 @@ export function colabCard(res) {
   const c = card || {};
   let jobs;
   if (Array.isArray(c.jobs) && c.jobs.length) {
-    jobs = c.jobs.map((j) => ({ title: j.lecture_title || '', step: '', stage: j.stage || '', progress: j.progress, eta: j.eta_sec, split: j.split || 0 }));
+    jobs = c.jobs.map((j) => ({ title: j.lecture_title || '', step: '', stage: j.stage || '', progress: j.progress, eta: j.eta_sec, split: j.split || 0, reconnect: reconnectOf(j) }));
   } else {
     const list = Array.isArray(s.jobs) && s.jobs.length ? s.jobs : s.current ? [s.current] : [];
-    jobs = list.map((j) => ({ title: j.lecture_title || '', step: j.step || '', stage: j.stage || '', progress: j.overall, eta: j.eta_sec, split: j.split || 0 }));
+    jobs = list.map((j) => ({ title: j.lecture_title || '', step: j.step || '', stage: j.stage || '', progress: j.overall, eta: j.eta_sec, split: j.split || 0, reconnect: reconnectOf(j) }));
   }
+  // stopping (v3.2.x): the runtime is being released; the lectures it ran
+  // are back in the local queue, so their old steps and progress are not
+  // shown (the back end drops them already; this guards a late snapshot)
+  if (s.state === 'stopping') jobs = [];
   return {
     st: s,
     machine: c.machine || s.machine || null,
@@ -310,6 +334,78 @@ export function colabCard(res) {
     queued: card ? c.queued || 0 : s.planned || 0,
     ahead: card ? c.uploaded_ahead || 0 : s.uploaded_ahead || 0,
   };
+}
+
+// ---- v3.2.x: reconnecting, still billed, releasing ----
+
+// A card job's reconnect {attempt, of, next_at} (internal/remote.Reconnect),
+// null when the lecture is not waiting for the runtime to answer.
+function reconnectOf(j) {
+  const r = j && j.reconnect;
+  if (!r || typeof r !== 'object' || !(Number(r.attempt) > 0)) return null;
+  return { attempt: Number(r.attempt), of: Number(r.of) || 0, nextAt: r.next_at || null };
+}
+
+/**
+ * "连接不稳定，正在重试（2/3）" of a job's reconnect, with the seconds to
+ * the next try when next_at is still ahead of now (ms): {text, next}; null
+ * without a reconnect.
+ */
+export function reconnectText(rc, now = Date.now()) {
+  if (!rc) return null;
+  const text = t('resources.remote.reconnecting', { attempt: U.fmtInt(rc.attempt), of: U.fmtInt(rc.of || rc.attempt) });
+  const at = rc.nextAt ? new Date(rc.nextAt).getTime() : NaN;
+  const sec = isFinite(at) ? Math.ceil((at - now) / 1000) : 0;
+  return { text, next: sec > 0 ? t('resources.remote.reconnect_next', { time: durText(sec) }) : '' };
+}
+
+/**
+ * The warning of a runtime that is held but does not answer (status.runtime;
+ * user decision: a hint only, nothing is released because of it): paid
+ * "仍在计费（本次已用 X CU，约 Y CU/小时）", free "仍在占用本次使用窗口".
+ * Null when the runtime answers or nothing asked it lately (unknown), while
+ * a lecture is retrying in place (its own line says so). While the runtime
+ * is being released (stopping, the release retried by itself) a paid one
+ * gets its own text without the "立即关机" hint (the button is hidden), a
+ * free one "仍在占用" (R8 B-s1: both tiers are told).
+ */
+export function runtimeWarning(st, jobs) {
+  const rt = st && st.runtime;
+  if (!rt || !rt.held || rt.reachable !== 'unreachable') return null;
+  if (st.state === 'stopping') return rt.billing ? t('resources.remote.still_billing_releasing') : t('resources.remote.still_holding');
+  if (Array.isArray(jobs) && jobs.some((j) => j && j.reconnect)) return null;
+  if (!rt.billing) return t('resources.remote.still_holding');
+  const spent = Number(st.session_spent_cu);
+  const rate = Number(st.cu_per_hour);
+  if (spent > 0 && rate > 0) return t('resources.remote.still_billing', { cu: cuText(spent), rate: U.fmtDecimal(rate, 2) });
+  return t('resources.remote.still_billing_plain');
+}
+
+/**
+ * The Colab error worth showing: status.last_error unless it is older than
+ * the current session (session_started_at; the back end clears it when a
+ * session starts, this is the second guard).
+ */
+export function visibleError(st) {
+  const e = st && st.last_error;
+  if (!e || !e.code) return null;
+  const at = st.last_error_at ? new Date(st.last_error_at).getTime() : NaN;
+  const since = st.session_started_at ? new Date(st.session_started_at).getTime() : NaN;
+  if (isFinite(at) && isFinite(since) && at < since) return null;
+  return e;
+}
+
+/**
+ * A runtime that was not released (status.leftover: an earlier run's
+ * session, or a runtime whose release failed and is retried by itself, also
+ * one known only by its notebook, without an accelerator).
+ */
+export function leftoverText(lo) {
+  if (!lo || !lo.code) return '';
+  const acc = lo.accelerator || '';
+  if (lo.code === 'colab.release_failed') return acc ? t('resources.remote.leftover_retrying', { accelerator: acc }) : t('resources.remote.leftover_retrying_any');
+  if (lo.code === 'colab.leftover_session' && !acc) return t('resources.remote.leftover_session_any');
+  return infoText({ code: lo.code, params: { accelerator: acc } });
 }
 
 // RAM segment kinds left to right (internal/remote SegRAMDisk …); "used"
@@ -491,6 +587,10 @@ export function createColabSection(ui) {
   let advancedOpen = null; // the "use your own gcloud" fold (null: not toggled yet)
   let loginStarted = false;
   let refreshing = false; // "重新查询" of the account
+  // WV-10: kept across redraws (render, appLoginBlock)
+  let headEl = null;
+  let formEl = null;
+  let loginEl = null;
   const redraw = () => alive && ui.rerender();
   // 3.1.0: the in-app sign-in (the gcloud component, then the Google sign-in)
   const appLogin = createColabLogin({
@@ -643,15 +743,20 @@ export function createColabSection(ui) {
   // 3.1.0: the in-app sign-in — install the Google Cloud CLI component when
   // it is missing, then "sign in to Google" (waiting, the fallback link,
   // cancel, failures with gcloud's message: as in the onboarding).
+  // WV-10: the block is kept (loginEl) and its children put in place with
+  // keepChildren, so the install's view (gcloudBlock's view.el: its status
+  // line and alert) is never taken out and put back on a redraw.
   function appLoginBlock() {
     if (!loginStarted) {
       loginStarted = true;
       appLogin.start();
     }
+    if (!loginEl) loginEl = h('div', { class: 'colab-login' });
     const parts = [h('p', { class: 'colab-login-hint' }, t('settings.colab.app_login_hint'))];
     if (appLogin.loading) {
       parts.push(note('loader-circle', t('onboarding.loading')));
-      return h('div', { class: 'colab-login' }, parts);
+      keepChildren(loginEl, parts);
+      return loginEl;
     }
     const g = appLogin.gcloud();
     const ready = appLogin.gcloudReady();
@@ -674,7 +779,8 @@ export function createColabSection(ui) {
       const a = appLogin.loginAction();
       parts.push(h('div', { class: 'set-inline colab-login-actions' }, btn(a.label, { size: 'sm', kind: 'primary', icon: a.icon, disabled: a.disabled, fkey: 'set:colab:login', onclick: a.onclick }), appLogin.cancelButton({ size: 'sm' })));
     }
-    return h('div', { class: 'colab-login' }, parts);
+    keepChildren(loginEl, parts);
+    return loginEl;
   }
 
   // The earlier manual way, folded: run gcloud yourself, 检测授权, import.
@@ -965,7 +1071,7 @@ export function createColabSection(ui) {
           ),
           per && has(`settings.colab.accel_info.${x}`) ? h('span', { class: 'acc-meas' }, t(`settings.colab.accel_info.${x}`)) : null,
           per ? h('span', { class: 'acc-sub' }, t('settings.colab.acc_rate', { rate: U.fmtDecimal(spec.cuh, 2) })) : null,
-          lock ? h('span', { class: 'acc-why' }, icon('lock', { size: 12 }), h('span', null, lockText(lock))) : null,
+          lock ? h('span', { class: 'acc-why' }, icon('lock', { size: 12 }), h('span', null, lockLine(lock))) : null,
         ),
         side ? h('span', { class: 'acc-fit' }, side) : null,
       ),
@@ -1087,38 +1193,39 @@ export function createColabSection(ui) {
     );
   }
 
+  // The section in its shell, which keeps what render put there before
+  // (aligns: view_settings.js does not empty it); the head, the form and
+  // the sign-in block are kept, the rows drawn anew as before (WV-10).
   function render(shell) {
-    shell.append(ui.head('zap', t('settings.colab.title')));
+    if (!headEl) headEl = ui.head('zap', t('settings.colab.title'));
     if (unavailable) {
-      shell.append(h('div', { class: 'card-bd' }, note('info', t('settings.colab.unavailable'))));
+      keepChildren(shell, [headEl, h('div', { class: 'card-bd' }, note('info', t('settings.colab.unavailable')))]);
       return;
     }
     if (!view) {
-      shell.append(h('div', { class: 'card-bd' }, error ? errorBlock(t('settings.colab.load_error', { error }), retry) : skeleton(4)));
+      keepChildren(shell, [headEl, h('div', { class: 'card-bd' }, error ? errorBlock(t('settings.colab.load_error', { error }), retry) : skeleton(4))]);
       return;
     }
     const authed = !!(view.status.auth && view.status.auth.present);
-    shell.append(
-      h(
-        'div',
-        { class: 'card-bd set-form colab-form' },
-        privacyBlock(),
-        saveError ? h('p', { class: 'set-note is-warn', role: 'alert' }, icon('circle-alert', { size: 13 }), h('span', null, saveError)) : null,
-        h('h3', { class: 'colab-sub' }, t('settings.colab.auth_title')),
-        authed ? null : appLoginBlock(),
-        authRow(),
-        authed ? accountRow() : null,
-        authed ? null : advancedBlock(),
-        h('h3', { class: 'colab-sub' }, t('settings.colab.use_title')),
-        enabledRow(),
-        accelRow(),
-        modelRow(),
-        memoryRow(),
-        fastRow(),
-        waitRow(),
-        batteryRow(),
-      ),
-    );
+    if (!formEl) formEl = h('div', { class: 'card-bd set-form colab-form' });
+    keepChildren(formEl, [
+      privacyBlock(),
+      saveError ? h('p', { class: 'set-note is-warn', role: 'alert' }, icon('circle-alert', { size: 13 }), h('span', null, saveError)) : null,
+      h('h3', { class: 'colab-sub' }, t('settings.colab.auth_title')),
+      authed ? null : appLoginBlock(),
+      authRow(),
+      authed ? accountRow() : null,
+      authed ? null : advancedBlock(),
+      h('h3', { class: 'colab-sub' }, t('settings.colab.use_title')),
+      enabledRow(),
+      accelRow(),
+      modelRow(),
+      memoryRow(),
+      fastRow(),
+      waitRow(),
+      batteryRow(),
+    ]);
+    keepChildren(shell, [headEl, formEl]);
   }
 
   function retry() {
@@ -1129,6 +1236,7 @@ export function createColabSection(ui) {
 
   return {
     render,
+    aligns: true, // WV-10: render puts its children in place itself
     load,
     // SSE "changed settings": another window changed Colab (or the auth)
     onSettingsChanged() {

@@ -705,9 +705,9 @@ func TestVRAMCalibrationKeyUsesSnapshotModel(t *testing.T) {
 	var e *env
 	asr := &fakeStage{name: model.StageASR, res: ResourceGPU, run: func(ctx context.Context, id string, p func(float64)) error {
 		e.gpu.set(14000, 24000, 7000) // +6000 MB over the 1000 MB baseline
-		time.Sleep(80 * time.Millisecond)
+		err := e.waitSampledPeak(id, 6000)
 		e.gpu.set(20000, 24000, 1000)
-		return nil
+		return err
 	}}
 	e = newEnv(t, nil, instant(model.StagePrep, ResourceCPU), asr)
 	a := e.s.set.ASR()

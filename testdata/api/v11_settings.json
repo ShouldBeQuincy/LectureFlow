@@ -71,7 +71,8 @@
     }
    },
    "offpeak_only": false,
-   "supports_thinking": true
+   "supports_thinking": true,
+   "default_batch_claude": 1
   },
   {
    "id": "01JPRV0000000000000000000A",
@@ -102,7 +103,23 @@
    "models_probed_at": "2026-10-21T09:30:00Z",
    "tariff": null,
    "offpeak_only": false,
-   "supports_thinking": true
+   "supports_thinking": true,
+   "default_batch_claude": 10,
+   "rate_limits": {
+    "model": "claude-opus-5-5",
+    "requests_per_minute": 4000,
+    "input_tokens_per_minute": 2000000,
+    "output_tokens_per_minute": 400000,
+    "observed_at": "2026-10-21T09:41:00Z",
+    "advice": {
+     "max_concurrency": 23,
+     "rpm": 600,
+     "below": true,
+     "concurrency_below": true,
+     "rpm_below": true,
+     "measured": true
+    }
+   }
   },
   {
    "id": "01JPRV0000000000000000000B",
@@ -132,7 +149,8 @@
    },
    "tariff": null,
    "offpeak_only": false,
-   "supports_thinking": false
+   "supports_thinking": false,
+   "default_batch_claude": 1
   }
  ],
  "roles": [
@@ -172,7 +190,8 @@
    "model": "deepseek-chat",
    "temperature": 0.2,
    "configured": true,
-   "thinking": "off"
+   "thinking": "off",
+   "max_tokens": 6000
   },
   {
    "role": "repair",
@@ -191,7 +210,8 @@
    "temperature": 0.3,
    "window": 3,
    "configured": true,
-   "thinking": "off"
+   "thinking": "off",
+   "batch": 4
   },
   {
    "role": "chapters",
@@ -230,7 +250,8 @@
  "general": {
   "keep_original_media": true,
   "notifications": true,
-  "daily_budget": 20
+  "daily_budget": 20,
+  "llm_idle_timeout_s": 300
  },
  "default_base_urls": {
   "anthropic": "https://api.anthropic.com",

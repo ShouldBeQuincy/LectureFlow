@@ -20,7 +20,7 @@
 
 import { el, icon, t } from './dom.js';
 import { bulkTrackIds, rowState, bulkCounts } from '../lib/inpage.js';
-import { errorText, rememberBox, restrictedNotice } from './sendcard.js';
+import { errorText, rememberBox, restrictedNotice, disconnectedText, registerMayHelp, noCourse } from './sendcard.js';
 
 const GAP_MS = 250;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -41,6 +41,7 @@ export function createBulkCard({ mount, ask, rows, origin = 'page', fetchInfo, p
     progress: { i: 0, n: 0 },
     results: new Map(), // sessionId → { state: queued | failed | skipped, error }
     disabled: [], // sessionIds whose download switch is off (known after reading)
+    policyStopped: false, // the switch could not be read: the profile was stopped as too slow (SEC18f 低-18)
     remembered: false, // the user turned the restricted reminder off for this platform
     rememberTick: false, // "对这个平台不再提醒", ticked in the open reminder
     message: null,
@@ -94,7 +95,7 @@ export function createBulkCard({ mount, ask, rows, origin = 'page', fetchInfo, p
   function courseField() {
     const c = S.conn || {};
     const courses = c.courses || [];
-    if (courses.length === 0) return el('p', { class: 'note', id: 'no-course', text: t('courseNone') });
+    if (courses.length === 0) return noCourse(() => start(true));
     const select = el(
       'select',
       { class: 'input', id: 'course', 'aria-label': t('courseLabel') },
@@ -153,10 +154,16 @@ export function createBulkCard({ mount, ask, rows, origin = 'page', fetchInfo, p
   function render() {
     const counts = bulkCounts(rows, [...S.items.values()], S.picked);
     const parts = [];
-    if (S.phase === 'loading') parts.push(el('p', { class: 'muted', id: 'bulk-loading', text: t('detecting') }));
+    // nothing is detected here: the card waits for LectureFlow (T26 G7)
+    if (S.phase === 'loading') parts.push(el('p', { class: 'muted', id: 'bulk-loading', text: t('connectingApp') }));
     else if (S.conn && S.conn.status !== 'connected') {
-      // Two messages, each a sentence of its own in every language.
-      parts.push(el('p', { class: 'note', id: 'bulk-disconnected' }, el('strong', { text: t('disconnectedTitle') }), ' ', t('discNotInstalled')));
+      // Two messages, each a sentence of its own in every language; the
+      // reason as the popup says it, and the button it names (T26 G8).
+      // a request the background refused (ext.not_allowed, ext.site_blocked):
+      // its own reason, not "not found" (SEC42 低-3)
+      parts.push(el('p', { class: 'note', id: 'bulk-disconnected' }, el('strong', { text: t('disconnectedTitle') }), ' ', S.conn.error ? errorText(S.conn.error) : disconnectedText(S.conn)));
+      if (registerMayHelp(S.conn)) parts.push(el('p', { class: 'small muted', id: 'disc-register', text: t('discRegister') }));
+      parts.push(el('div', { class: 'btn-row' }, el('button', { class: 'btn', id: 'bulk-recheck', type: 'button', onclick: () => start(true) }, icon('refresh'), el('span', { text: t('connRecheck') }))));
     } else {
       parts.push(
         el(
@@ -167,11 +174,17 @@ export function createBulkCard({ mount, ask, rows, origin = 'page', fetchInfo, p
         ),
       );
       parts.push(el('ul', { class: 'bulk-rows', id: 'bulk-rows' }, rows.map(rowItem)));
+      // why those cannot be ticked, and where they are resumed (T26 G5)
+      if (counts.refresh > 0) parts.push(el('p', { class: 'small muted', id: 'bulk-refresh-note', dataset: { count: String(counts.refresh) }, text: t('bulkRefreshNote', [String(counts.refresh)]) }));
       if (origin === 'page') parts.push(el('p', { class: 'small faint', text: t('bulkPageOnly') }));
+      // Known only once the sessions were read, so the reminder is behind:
+      // the notice without "发送前会再提醒一次" (T26 G6).
       if (S.disabled.length && S.phase !== 'confirm') {
         const banner = (text) => el('p', { class: 'note note-warn', id: 'bulk-warning' }, el('span', { class: 'note-icon' }, icon('alert-triangle')), text);
-        parts.push(...restrictedNotice({ remembered: S.remembered, name: platformName, banner }));
+        parts.push(...(S.remembered ? restrictedNotice({ remembered: true, name: platformName, banner }) : [banner(t('restrictedNoticeQuiet'))]));
       }
+      // as the send card's chip: why some switches are unknown (SEC18f 低-18)
+      if (S.policyStopped) parts.push(el('p', { class: 'note note-warn', id: 'bulk-policy-stopped', dataset: { flag: 'policy-stopped' } }, el('span', { class: 'note-icon' }, icon('alert-triangle')), t('policyStopped')));
       parts.push(modeField());
       parts.push(courseField());
       if (S.phase === 'done') {
@@ -181,7 +194,9 @@ export function createBulkCard({ mount, ask, rows, origin = 'page', fetchInfo, p
       } else {
         let label = t('bulkSend', [String(counts.toSend)]);
         if (S.phase === 'reading') label = t('bulkReading', [String(S.progress.i), String(S.progress.n)]);
-        else if (S.phase === 'sending' || S.phase === 'confirm') label = t('bulkSending', [String(S.progress.i), String(S.progress.n)]);
+        // the reminder is open: nothing is being sent yet (T26 G6)
+        else if (S.phase === 'confirm') label = t('bulkWaiting');
+        else if (S.phase === 'sending') label = t('bulkSending', [String(S.progress.i), String(S.progress.n)]);
         const b = el('button', { class: 'btn btn-primary btn-block', id: 'primary', onclick: send }, icon('send'), el('span', { text: label }));
         b.disabled = busy() || counts.toSend === 0 || !S.courseId || !S.checked;
         parts.push(b);
@@ -214,6 +229,7 @@ export function createBulkCard({ mount, ask, rows, origin = 'page', fetchInfo, p
     const todo = rows.filter((x) => S.picked.has(x.sessionId));
     if (todo.length === 0) return;
     S.message = null;
+    S.policyStopped = false;
     // 1. The platform's sessionInfo, one session after another, only now.
     S.phase = 'reading';
     S.progress = { i: 0, n: todo.length };
@@ -229,9 +245,11 @@ export function createBulkCard({ mount, ask, rows, origin = 'page', fetchInfo, p
           const r = await ask('session.load', { sessionId: x.sessionId, values: info.values, url: info.url });
           if (r.ok) S.remembered = !!r.view.remembered;
           const ids = r.ok ? bulkTrackIds(r.view.tracks || [], S.mode, presets) : [];
-          if (!r.ok) S.results.set(x.sessionId, { state: 'failed', error: errorText(r.error) });
+          // a profile stopped as too slow: the same reason as the send card's chip (SEC22 L-D)
+          if (!r.ok && r.policyStopped) S.policyStopped = true;
+          if (!r.ok) S.results.set(x.sessionId, { state: 'failed', error: r.policyStopped ? t('policyStopped') : errorText(r.error) });
           else if (ids.length === 0) S.results.set(x.sessionId, { state: 'failed', error: t('bulkNoTrack') });
-          else prepared.push({ sessionId: x.sessionId, ids, disabled: r.view.downloadPolicy === 'disabled' });
+          else prepared.push({ sessionId: x.sessionId, ids, disabled: r.view.downloadPolicy === 'disabled', stopped: !!r.view.policyStopped });
         }
       } catch (e) {
         S.results.set(x.sessionId, { state: 'failed', error: errorText({ code: 'ext.info_failed', params: { status: 0 } }) });
@@ -241,6 +259,7 @@ export function createBulkCard({ mount, ask, rows, origin = 'page', fetchInfo, p
     // 2. One warning for the sessions whose lecturer turned downloads off,
     // unless the user turned it off for this platform.
     S.disabled = prepared.filter((p) => p.disabled).map((p) => p.sessionId);
+    S.policyStopped = S.policyStopped || prepared.some((p) => p.stopped);
     let override = false;
     let remember = false;
     if (S.disabled.length && S.remembered) override = true;
@@ -275,10 +294,13 @@ export function createBulkCard({ mount, ask, rows, origin = 'page', fetchInfo, p
     onSent(new Map(S.results));
   }
 
-  async function start() {
+  /** hello (recheck: "重新检测", a fresh one), the course, then the check. */
+  async function start(recheck = false) {
+    if (busy()) return;
+    S.phase = 'loading';
     render();
-    const r = await ask('connection', { recheck: false });
-    S.conn = r.ok ? r.connection : { status: 'unavailable' };
+    const r = await ask('connection', { recheck });
+    S.conn = r.ok ? r.connection : { status: 'unavailable', reason: (r.error && r.error.code) || '', params: (r.error && r.error.params) || {}, error: r.error || { code: 'ext.failed', params: {} } };
     if (S.conn.status !== 'connected') {
       S.phase = 'idle';
       render();

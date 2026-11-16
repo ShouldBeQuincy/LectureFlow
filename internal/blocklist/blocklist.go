@@ -16,6 +16,12 @@
 // info or trailing dot, fullwidth letters folded (browsers send IDNA
 // hosts, already ASCII); paths with percent escapes decoded, lower-cased,
 // "\" read as "/", repeated slashes collapsed and dot segments resolved.
+// A host the list cannot compare safely (UnusualHost: a byte outside
+// ASCII, a control character, a percent sign, any other character but
+// letters, digits, "-", "_" and dots, an empty label) is refused as a whole
+// (CategoryUnusualHost) unless it already matches an entry: net/http maps
+// such a name by IDNA before dialling (a soft hyphen dropped, a circled
+// letter made plain) to a host the comparison here would miss (SEC10).
 // TestSameListAsTheExtension keeps the two lists equal, in the same order.
 //
 // Deliberately not on it (user 2026-10-27): 雨课堂 yuketang.cn, 超星 / 学习通
@@ -26,6 +32,7 @@ package blocklist
 
 import (
 	"net"
+	"net/netip"
 	"net/url"
 	"strings"
 )
@@ -35,6 +42,10 @@ import (
 const (
 	CategoryYouTube = "youtube"
 	CategoryCourses = "courses"
+	// CategoryUnusualHost is not a list entry: a host with characters the
+	// list cannot compare safely (UnusualHost), refused whatever it maps
+	// to. The extension sends ASCII (punycode) hosts only.
+	CategoryUnusualHost = "unusual_host"
 )
 
 // entries is the list: {category, "host" or "host/path"}, as
@@ -46,6 +57,7 @@ var entries = [][2]string{
 	{CategoryYouTube, "youtube-nocookie.com"},   // YouTube's privacy-enhanced embeds
 	{CategoryYouTube, "youtubekids.com"},        // YouTube Kids
 	{CategoryYouTube, "youtube.googleapis.com"}, // YouTube's API and legacy embed host
+	{CategoryYouTube, "youtubeeducation.com"},   // YouTube's embed host for schools (YouTube Player for Education)
 	{CategoryYouTube, "googlevideo.com"},        // YouTube's media servers
 	// Course platforms: international MOOCs and paid / online course sites
 	{CategoryCourses, "udemy.com"},               // Udemy: paid course marketplace (and Udemy Business tenants)
@@ -193,9 +205,9 @@ func foldRune(r rune) rune {
 	return r
 }
 
-// NormalizeHost is a host as the list compares it: lower case, no port,
-// user info, brackets or trailing dots, fullwidth letters folded.
-func NormalizeHost(host string) string {
+// hostPart is host without the surrounding spaces, user info, port and
+// brackets.
+func hostPart(host string) string {
 	h := strings.TrimSpace(host)
 	if i := strings.LastIndexByte(h, '@'); i >= 0 {
 		h = h[i+1:]
@@ -203,22 +215,90 @@ func NormalizeHost(host string) string {
 	if hh, _, err := net.SplitHostPort(h); err == nil {
 		h = hh
 	}
-	h = strings.Trim(h, "[]")
-	h = strings.ToLower(strings.Map(foldRune, h))
+	return strings.Trim(h, "[]")
+}
+
+// NormalizeHost is a host as the list compares it: lower case, no port,
+// user info, brackets or trailing dots, fullwidth letters folded. It is
+// meaningful for an ASCII host only; HostCategory and URLCategory refuse
+// the others (UnusualHost) when no entry matches.
+func NormalizeHost(host string) string {
+	h := strings.ToLower(strings.Map(foldRune, hostPart(host)))
 	return strings.TrimRight(h, ".")
 }
 
-// HostCategory is the category of a host blocked as a whole (subdomains
-// included; not the path entries), or "".
-func HostCategory(host string) string {
-	h := NormalizeHost(host)
-	if h == "" {
-		return ""
-	}
-	for _, e := range parsed {
-		if e.path == "" && under(h, e.host) {
-			return e.category
+// UnusualHost reports a host name that is not plain ASCII as a URL parser
+// leaves it: a byte outside ASCII (a Unicode name, U+00AD SOFT HYPHEN, a
+// zero-width or circled character, a full-width letter), an ASCII control
+// character or space, or a percent sign (what "%25" decodes to) outside an
+// IPv6 zone. net/http maps such a name by IDNA before dialling, so no
+// comparison without IDNA can tell which host it reaches; browsers and the
+// extension send ASCII (punycode) hosts only, so it is refused rather than
+// mapped. host is a URL's Hostname() or Host (a port and user info are
+// set aside; a space anywhere counts).
+//
+// A name (anything but an IP address) is also unusual when it is not
+// plainName (SEC11 low-1): any ASCII character but a letter, a digit, "-",
+// "_" and the dots between labels ("a;b.example", "localhost,", "a*b"),
+// or an empty label ("localhost..", "foo..bar", ".example"; one trailing
+// dot, the root, stays allowed). Go's resolver refuses such a name, or
+// fails to look it up, where aria2c's resolver may well send it to DNS:
+// the address check, which lets a failed look-up through, would judge
+// nothing while aria2c reaches whatever the name's DNS answers. No real
+// host needs those characters. An IP address keeps its own rules (an IPv6
+// one with its zone: fe80::1%eth0), and so do the numbers resolvers read
+// as one ("0x7f.1", "2130706433", "127.1": plain names here, refused by
+// internal/fetch).
+func UnusualHost(host string) bool {
+	for i := 0; i < len(host); i++ {
+		if c := host[i]; c < 0x21 || c >= 0x7f {
+			return true
 		}
+	}
+	h := hostPart(host)
+	if h == "" {
+		return false
+	}
+	if _, err := netip.ParseAddr(h); err == nil {
+		return false
+	}
+	return !plainName(h)
+}
+
+// plainName: labels of ASCII letters, digits, "-" and "_", none empty,
+// separated by single dots, with at most one dot at the end.
+func plainName(h string) bool {
+	h = strings.TrimSuffix(h, ".")
+	if h == "" {
+		return false
+	}
+	for _, label := range strings.Split(h, ".") {
+		if label == "" {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '-' || c == '_') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// HostCategory is the category of a host blocked as a whole (subdomains
+// included; not the path entries), CategoryUnusualHost for a host the
+// list cannot compare safely (UnusualHost) and no entry matches, or "".
+func HostCategory(host string) string {
+	if h := NormalizeHost(host); h != "" {
+		for _, e := range parsed {
+			if e.path == "" && under(h, e.host) {
+				return e.category
+			}
+		}
+	}
+	if UnusualHost(host) {
+		return CategoryUnusualHost
 	}
 	return ""
 }
@@ -274,8 +354,9 @@ func pathCovered(path, prefix string) bool {
 }
 
 // URLCategory is the category of a blocked page, frame or media URL (host
-// or path entries; a blob: URL by the page that made it), or "" — also for
-// anything that is not an http(s) URL.
+// or path entries; a blob: URL by the page that made it;
+// CategoryUnusualHost for a host the list cannot compare safely), or "" —
+// also for anything that is not an http(s) URL.
 func URLCategory(raw string) string {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
@@ -287,12 +368,12 @@ func URLCategory(raw string) string {
 	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
 		return ""
 	}
+	if c := HostCategory(u.Hostname()); c != "" {
+		return c
+	}
 	host := NormalizeHost(u.Hostname())
 	if host == "" {
 		return ""
-	}
-	if c := HostCategory(host); c != "" {
-		return c
 	}
 	var path string
 	for _, e := range parsed {

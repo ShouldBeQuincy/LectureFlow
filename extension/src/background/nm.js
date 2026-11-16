@@ -47,13 +47,18 @@ export function setTestConnect(fn) {
 }
 
 /**
- * hello (or a fresh one), as the popup shows it. noLaunch for a passive
- * query (src/lib/nmclient.js hello()); a recheck is always a user action.
+ * hello (or a fresh one: recheck), as the popup shows it. noLaunch for a
+ * passive query (src/lib/nmclient.js hello()); a fresh one with noLaunch
+ * looks again without starting LectureFlow.
  */
 export async function connection(recheck = false, { noLaunch = false } = {}) {
   const c = nm();
   try {
-    const reply = recheck ? await c.recheck() : await c.hello({ noLaunch });
+    let reply;
+    if (recheck && noLaunch) {
+      c.close();
+      reply = await c.hello({ noLaunch: true });
+    } else reply = recheck ? await c.recheck() : await c.hello({ noLaunch });
     return connectionView('connected', reply, null);
   } catch (e) {
     return { status: 'unavailable', reason: e && e.code ? e.code : 'ext.host_unavailable', params: e && e.params ? { reason: e.params.reason || '' } : {} };

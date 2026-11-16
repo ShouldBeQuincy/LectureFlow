@@ -23,7 +23,7 @@
     "message": "LectureFlow connected"
   },
   "connConnectedVersion": {
-    "message": "LectureFlow $P1$",
+    "message": "Connected · $P1$",
     "description": "Connected, with app version",
     "placeholders": {
       "p1": {
@@ -71,12 +71,25 @@
   "noAccess": {
     "message": "The extension cannot read this page."
   },
+  "pageLoading": {
+    "message": "The page is still loading. Try again in a moment.",
+    "description": "Popup: the page did not finish loading before detection gave up waiting"
+  },
   "noTracks": {
     "message": "No tracks found"
   },
   "tracksDetected": {
     "message": "$P1$ tracks found",
     "description": "Header with the track count",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "tracksDetectedOne": {
+    "message": "$P1$ track found",
+    "description": "Header with the track count when exactly one track was found (singular where the language needs it)",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -96,7 +109,7 @@
     }
   },
   "sourceGeneric": {
-    "message": "Generic detection"
+    "message": "Found on the page"
   },
   "unreviewed": {
     "message": "Not reviewed",
@@ -126,7 +139,7 @@
     "message": "Recommended"
   },
   "unreadable": {
-    "message": "Manifest not readable"
+    "message": "This track’s details could not be read; it may not be fetchable"
   },
   "kind_video": {
     "message": "Video"
@@ -180,7 +193,7 @@
     "message": "The report could not be made for this page."
   },
   "reportSaved": {
-    "message": "Report saved. Read it before you share it."
+    "message": "Report saved where your browser saves files. It is for developers, to support this site, and is never sent automatically. It is redacted but keeps this site’s address; read it before you share it."
   },
   "finding_email": {
     "message": "Something looks like an email address."
@@ -219,7 +232,7 @@
     "message": "Platform profiles"
   },
   "profilesHint": {
-    "message": "Profiles name the tracks of a platform. Imported ones are marked “Not reviewed” and take precedence."
+    "message": "A profile is a small file that tells the extension what a recording platform’s tracks are called and which to choose; common platforms are built in. Imported ones are marked “Not reviewed” and take precedence."
   },
   "importProfile": {
     "message": "Import a local profile"
@@ -327,7 +340,7 @@
   },
   "titleGenerated": {
     "message": "LectureFlow will name this lecture",
-    "description": "Generic detection reads no title"
+    "description": "No title to show: the page has none, or only a placeholder or the site name; LectureFlow names the lecture"
   },
   "durationMinutes": {
     "message": "$P1$ min",
@@ -367,7 +380,7 @@
     "description": "Course select label"
   },
   "courseNone": {
-    "message": "LectureFlow has no courses yet. Create one in LectureFlow first.",
+    "message": "LectureFlow has no courses yet.",
     "description": "No courses"
   },
   "sendButton": {
@@ -393,6 +406,15 @@
   "selectTrack": {
     "message": "Select $P1$",
     "description": "Checkbox label",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "trackOnHost": {
+    "message": "on $P1$",
+    "description": "Track list: in a track’s small line, after its kind and quality, when the track is on another site than the page (EU-03; AUD3 中-1). $P1$ is a host name such as media.example.net (never a path)",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -448,7 +470,7 @@
     "description": "Fetch task state"
   },
   "state_failed": {
-    "message": "Fetch failed",
+    "message": "Failed",
     "description": "Fetch task state"
   },
   "state_needs_refresh": {
@@ -587,7 +609,7 @@
     "description": "Options section"
   },
   "reportsHint": {
-    "message": "Export a redacted detection report to write or improve a profile. A recording page appears here once you have clicked the extension icon on it.",
+    "message": "A detection report is a file for developers, used to make LectureFlow support a new recording site or improve an existing one (by writing a profile). It is redacted: no cookies; addresses keep the site and the path (long IDs in the path become fakes of the same shape), and parameter values are replaced by placeholders; page text such as lecture titles keeps only its shape; if anything looks like personal data, it is not exported. Nothing is sent automatically; read it before you share it. A recording page appears here once you have clicked the extension icon on it.",
     "description": "Options: reports"
   },
   "reportsEmpty": {
@@ -597,6 +619,18 @@
   "reportRow": {
     "message": "$P1$ · $P2$ tracks",
     "description": "Options: one page",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "reportRowOne": {
+    "message": "$P1$ · $P2$ track",
+    "description": "Options: one page with exactly one track (singular where the language needs it)",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -771,6 +805,15 @@
   "chooseTracks": {
     "message": "Choose tracks… ($P1$)",
     "description": "Opens the full track list",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "tracksHidden": {
+    "message": "Tracks not shown (too many to list): $P1$",
+    "description": "Track list: how many tracks are left out because the page gave too many to list (they cannot be chosen); $1 is a number",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -1016,6 +1059,47 @@
     "message": "Not in use: same id as a built-in profile. Import it again and confirm.",
     "description": "Settings: chip on a local profile with a built-in profile’s id that was never confirmed"
   },
+  "profileInvalid": {
+    "message": "Not in use: this local profile no longer passes the checks ($P1$). Fix the file and import it again.",
+    "description": "Settings: chip on a local profile that no longer passes the profile checks (for example a sessionInfo POST stored before local profiles were limited to GET); $1 is the first problem, as \"path message\" in English",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "profileTooSlow": {
+    "message": "Not in use: rule $P1$ took too long to match ($P2$ ms). Fix the file and import it again to use it.",
+    "description": "Settings: chip on a local profile stopped by the runtime regex guard (one match too slow, or too much time in all); $1 is the place of the rule in the file (\"/tracks/1/detect/urlPattern\"), $2 the milliseconds",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "profileTooSlowBuiltin": {
+    "message": "Not in use: rule $P1$ of this built-in profile took too long to match on this computer ($P2$ ms). This is a LectureFlow bug; please report it. Updating the extension tries it again.",
+    "description": "Settings: chip on a built-in profile stopped by the runtime regex guard (several slow matches, or one very slow); $1 is the place of the rule, $2 the milliseconds",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "profileReenable": {
+    "message": "Enable again",
+    "description": "Settings: button on a built-in profile stopped as too slow: use it again"
+  },
+  "policyStopped": {
+    "message": "Restriction unknown: the profile was stopped as too slow",
+    "description": "Popup and in-page card: chip when the runtime regex guard stopped the platform profile during this detection, so the restriction switch could not be read"
+  },
   "embedWhy": {
     "message": "This recording page is embedded in a page of $P1$. So that another site cannot trick you into clicking, confirm in this window.",
     "description": "Confirmation window: why it opened; $1 is the site the recording page is embedded in (an origin)",
@@ -1054,5 +1138,119 @@
   "errConfirmWindow": {
     "message": "Send from the LectureFlow confirmation window.",
     "description": "Error: this frame must confirm in the extension’s window"
+  },
+  "openApp": {
+    "message": "Open LectureFlow",
+    "description": "Popup, not connected: LectureFlow is installed but not running; the button starts it (T26 G1)"
+  },
+  "discNotOpen": {
+    "message": "LectureFlow is installed but not open. Click “Open LectureFlow” to start it, or “Check again” if you have just opened it yourself.",
+    "description": "Popup, not connected: LectureFlow is installed but not running; opening the popup does not start it (T26 G1). Quotes openApp (starts it) and connRecheck (only looks again; SEC42 低-2)"
+  },
+  "failNetwork": {
+    "message": "The network connection failed, so fetching did not finish. Once you are back online, click “Retry” in LectureFlow to carry on.",
+    "description": "Queued view: the fetch failed for the network (retryable; T26 G3). “Retry” is LectureFlow’s button (downloads.action.retry)"
+  },
+  "failDisk": {
+    "message": "There is not enough disk space, or the fetched files could not be written. Free some space or check the disk of LectureFlow’s data folder, then click “Retry” in LectureFlow.",
+    "description": "Queued view: the fetch failed for the disk (no space, or not writable; retryable; T26 G3)"
+  },
+  "failEngineMissing": {
+    "message": "LectureFlow’s built-in fetching tool is missing. Reinstall LectureFlow, then click “Retry” in LectureFlow.",
+    "description": "Queued view: the fetch failed because LectureFlow’s aria2c is missing (retryable after a reinstall; T26 G3)"
+  },
+  "failUnsupported": {
+    "message": "This track is a live stream or a format LectureFlow does not support yet, so it cannot be fetched, and retrying will not help. If the page has other tracks, send one of those.",
+    "description": "Queued view: a live stream or an unsupported format (not retryable; T26 G3)"
+  },
+  "failUnsafeAddress": {
+    "message": "This lecture’s track addresses lead to this computer or its local network, or cannot be checked safely, so LectureFlow refused to fetch them. Retrying will not help.",
+    "description": "Queued view: the tracks’ addresses lead to this computer, the local network, or cannot be checked (not retryable; T26 G3)"
+  },
+  "failAngle": {
+    "message": "The second picture has no video, so it cannot be kept as a second view. Choose “Main audio & video” and send the lecture again.",
+    "description": "Queued view: the second picture has no video (not retryable; T26 G3). Quotes presetMain"
+  },
+  "failTooLarge": {
+    "message": "This recording is over the size limit for one fetch, so it cannot be fetched. It may be a live stream, or the server keeps sending data. If the page has other tracks, send one of those.",
+    "description": "Queued view: the recording is over the size one fetch may hold (downloads.too_large; a live stream, or a server that keeps sending; not retryable, so no “Retry”; C165b)"
+  },
+  "failNotMedia": {
+    "message": "What was fetched is not a recording (perhaps a sign-in or error page), so retrying will not help. Make sure the lecture plays on its page, then send it again.",
+    "description": "Queued view: what was fetched is not a recording (an empty file, a web page, a playlist, a refused format; not retryable; T26 G3)"
+  },
+  "failedCode": {
+    "message": "Fetching did not finish (code $P1$). LectureFlow shows why and can retry it.",
+    "description": "Queued view: the fetch failed with a code this version does not know (LectureFlow treats it as retryable; T26 G3)",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "failEmbeddedHint": {
+    "message": "If the recording is embedded in another site, open the player’s own page and send it again from there.",
+    "description": "Added after the failed note or the needs_refresh text when the platform refused the fetch (401 / 403) and the lecture may have been sent from a page that embeds the player (EU-02; SEC46 低-3): the cookies it needs may only reach the player’s own page"
+  },
+  "errOpenGone": {
+    "message": "LectureFlow no longer has this lecture or fetch: it may have been deleted or removed.",
+    "description": "“Open in LectureFlow”: the lecture was deleted or the task removed (open.not_found; T26 G3)"
+  },
+  "presetUnavailable": {
+    "message": "“$P1$” is not available. $P2$.",
+    "description": "Send card, under the three choices: why one cannot be chosen (T26 G4). $P1$ is the choice (presetDual…), $P2$ its reason (presetDualNone…, no final full stop)",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "bulkRefreshNote": {
+    "message": "Needing a refresh: $P1$. These cannot be ticked here; click “Send to LectureFlow” on their row in the list to resume them.",
+    "description": "Bulk card: lectures whose fetch needs a refresh cannot be ticked; each is resumed from its own row’s button (T26 G5). Quotes sendButton; $P1$ is how many",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "bulkWaiting": {
+    "message": "Waiting for your decision…",
+    "description": "Bulk card button while the reminder before sending restricted recordings is open: nothing is sent yet (T26 G6)"
+  },
+  "connectingApp": {
+    "message": "Connecting to LectureFlow…",
+    "description": "Popup and cards: the tracks are found, waiting for LectureFlow to answer (T26 G7)"
+  },
+  "launchingApp": {
+    "message": "Starting LectureFlow…",
+    "description": "Popup: the user clicked “Open LectureFlow”; it is being started (T26 G7)"
+  },
+  "discRegister": {
+    "message": "Already installed and open? In LectureFlow, open “Diagnostics”, find “Browser extension connection”, click “Register again”, then come back and click “Check again”.",
+    "description": "Not connected, “not found”: the browser’s registration may be broken; LectureFlow’s Diagnostics page (nav.system) › Browser extension connection (common.check.browser_ext) › Register again (system.ext.register) fixes it (T26 G8). Quotes connRecheck"
+  },
+  "courseCreate": {
+    "message": "In LectureFlow, click “Add course” to create one, then click “Check again”.",
+    "description": "No course in LectureFlow yet: where to make one (nav.add_course), then the button beside it (T26 G9). Quotes connRecheck"
+  },
+  "doneTitle": {
+    "message": "Fetched",
+    "description": "Queued view title once the fetch is done and the lecture made (T26 J2)"
+  },
+  "failedTitle": {
+    "message": "Fetching did not finish",
+    "description": "Queued view title when the fetch failed (T26 J2)"
+  },
+  "closeHintCard": {
+    "message": "You can close this card; fetching carries on in LectureFlow.",
+    "description": "In-page card, queued: the card may be closed (closeHint says “window”, for the popup and the confirmation window; T26 J2)"
+  },
+  "exportReportHint": {
+    "message": "Makes a file for developers that helps LectureFlow support this recording site; nothing is sent automatically. The file is redacted: no cookies; addresses keep the site and the path (long IDs in the path become fakes of the same shape), and IDs, signatures and other parameter values are replaced by placeholders; page text such as the lecture title keeps only its shape. If anything looks like personal data, it is not exported. Read it before you share it.",
+    "description": "Tooltip of the popup’s “Export detection report”: what it is, for whom, what the redaction does (src/lib/redact.js, report.js; T26 G14, SEC42 低-5: no promise beyond what it does)"
   }
 }

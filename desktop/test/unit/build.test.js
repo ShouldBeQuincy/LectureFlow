@@ -19,6 +19,7 @@ const { buildSizeReport, renderMarkdown, groupTopLevel, walk, BUDGET_BYTES } = r
 const {
   checkConfigure, checkLicenseText, gplFree, gplComponents, targetKey, WORKER_FILES,
   checkAria2cVersion, aria2cSourceText, ffmpegSourceText, bundledFileProblems, GO_PROGRAMS,
+  stageAgent, bundleAgent, BUNDLE_AGENT_ENV, BUNDLE_AGENT_DEFAULT, agentBuildArgs, AGENT_TARGETS, cachedBuildProblems, reuseCachedBuild,
   machoSlices, machoVersion, compareVersions, macMinimumCheck,
 } = require('../../scripts/stage');
 const sources = require('../../scripts/sources');
@@ -256,6 +257,67 @@ test('pinned downloads: verified before use, cached by hash, mismatches rejected
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('cached builds: reused only when BUILDINFO.txt names the pinned version and sources, else deleted', () => {
+  const m = JSON.parse(fs.readFileSync(path.join(DESKTOP, 'packaging', 'third-party.json'), 'utf8'));
+  const mac = m.ffmpeg['darwin-arm64'];
+  const ar = m.aria2c['darwin-arm64'];
+  // BUILDINFO.txt as the build scripts write it (first lines that matter).
+  const info = {
+    'ffmpeg windows-x64': [`FFmpeg ${m.ffmpeg.version} for Windows x64, built by desktop/scripts/build-ffmpeg-windows.sh`, 'compiler: x'],
+    'ffmpeg darwin-arm64': [`FFmpeg ${m.ffmpeg.version} for macOS arm64, built by desktop/scripts/build-ffmpeg-macos.sh`, `source: ${mac.url}`, `source sha256: ${mac.sha256}`,
+      ...(mac.deps || []).map((d) => `dependency: ${d.name} ${d.version} ${d.url} sha256 ${d.sha256} (static library, meson)`), 'compiler: x'],
+    'aria2c darwin-arm64': [`aria2 ${m.aria2c.version} for macOS arm64, built by packaging/aria2c/build-aria2c-macos.sh`, `source: ${ar.url}`, `source sha256: ${ar.sha256}`],
+  };
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lf-cached-build-'));
+  const make = (name, lines) => {
+    const root = path.join(tmp, name);
+    fs.mkdirSync(path.join(root, 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'bin', 'tool'), 'binary');
+    if (lines) fs.writeFileSync(path.join(root, 'BUILDINFO.txt'), `${lines.join('\n')}\n`);
+    return root;
+  };
+  const log = console.log;
+  console.log = () => {};
+  try {
+    for (const [id, lines] of Object.entries(info)) {
+      const [program, key] = id.split(' ');
+      const ok = make(`${program}-${key}-ok`, lines);
+      assert.deepEqual(cachedBuildProblems(ok, program, key, m), [], id);
+      assert.equal(reuseCachedBuild(ok, path.join('bin', 'tool'), program, key, m), true, `${id}: a matching build is reused`);
+      assert.ok(fs.existsSync(ok));
+      const crlf = make(`${program}-${key}-crlf`, lines.map((l) => `${l}\r`));
+      assert.deepEqual(cachedBuildProblems(crlf, program, key, m), [], `${id}: CRLF`);
+
+      const bad = {
+        'no BUILDINFO.txt': null,
+        'another version': [lines[0].replace(` ${m[program].version} `, ' 0.0.1 '), ...lines.slice(1)],
+        'another platform': [lines[0].replace(/for (Windows x64|macOS arm64)/, 'for Linux x64'), ...lines.slice(1)],
+      };
+      if (key === 'darwin-arm64') {
+        bad['another source'] = lines.map((l) => (l.startsWith('source sha256:') ? `source sha256: ${'0'.repeat(64)}` : l));
+        bad['no source line'] = lines.filter((l) => !l.startsWith('source sha256:'));
+      }
+      if (id === 'ffmpeg darwin-arm64' && (mac.deps || []).length) {
+        bad['another dependency'] = lines.map((l) => (l.startsWith('dependency:') ? l.replace(/sha256 [0-9a-f]{64}/, `sha256 ${'1'.repeat(64)}`) : l));
+      }
+      for (const [what, badLines] of Object.entries(bad)) {
+        const root = make(`${program}-${key}-${what.replace(/ /g, '-')}`, badLines);
+        assert.notDeepEqual(cachedBuildProblems(root, program, key, m), [], `${id}: ${what} refused`);
+        assert.equal(reuseCachedBuild(root, path.join('bin', 'tool'), program, key, m), false, `${id}: ${what} not reused`);
+        assert.ok(!fs.existsSync(root), `${id}: ${what}: the cached build is deleted, so it is built again`);
+      }
+    }
+    // nothing cached: built, nothing deleted
+    assert.equal(reuseCachedBuild(path.join(tmp, 'none'), path.join('bin', 'tool'), 'ffmpeg', 'windows-x64', m), false);
+  } finally {
+    console.log = log;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+  const src = fs.readFileSync(path.join(DESKTOP, 'scripts', 'stage.js'), 'utf8');
+  assert.equal((src.match(/if \(!reuseCachedBuild\(root, /g) || []).length, 3, 'stage checks the Windows ffmpeg, the macOS ffmpeg and the macOS aria2c caches');
+  assert.equal((src.match(/checkFreshBuild\(root, '/g) || []).length, 3, 'and every build it makes instead');
 });
 
 test('size report: budget, resources, ten largest files, Markdown', () => {
@@ -878,4 +940,94 @@ test('update summary: the electron-updater feed and whether the in-app update ke
   // The rest of the build configuration does not depend on the key.
   assert.deepEqual(updateBuildConfig({ LECTUREFLOW_UPDATE_REPO: 'o/r' }, { inAppKey: withKey }).publish, updateBuildConfig({ LECTUREFLOW_UPDATE_REPO: 'o/r' }).publish);
   assert.equal(updateBuildConfig({}, { inAppKey: withKey }).publish, null);
+});
+
+// --- ssh-1b: the SSH servers' agent in resources/agent ---------------------------------
+
+test('lf-agent: one static build per remote target, the platforms the service knows', () => {
+  // the targets are internal/remote.Platforms, in its order
+  const proto = fs.readFileSync(path.join(REPO, 'internal', 'remote', 'protocol.go'), 'utf8');
+  const consts = Object.fromEntries([...proto.matchAll(/(Platform\w+)\s*=\s*"([a-z0-9-]+)"/g)].map((m) => [m[1], m[2]]));
+  const list = proto.match(/var Platforms = \[\]string\{([^}]*)\}/)[1].split(',').map((x) => consts[x.trim()]);
+  assert.deepEqual(AGENT_TARGETS.map((t) => t.target), list);
+  assert.deepEqual(AGENT_TARGETS.map((t) => `${t.goos}/${t.goarch}`), ['linux/amd64', 'darwin/arm64', 'windows/amd64']);
+  // built like make.ps1 agent: trimmed, stripped, the app version in internal/agent.Version
+  const args = agentBuildArgs('3.2.0', '/out/lf-agent');
+  assert.deepEqual(args, ['build', '-trimpath', '-ldflags', '-s -w -X lectureflow/internal/agent.Version=3.2.0', '-o', '/out/lf-agent', './cmd/lf-agent']);
+  assert.ok(fs.existsSync(path.join(REPO, 'cmd', 'lf-agent', 'main.go')), 'cmd/lf-agent/main.go');
+  assert.match(fs.readFileSync(path.join(REPO, 'internal', 'agent', 'agent.go'), 'utf8'), /\bVersion\b/, 'internal/agent has the Version the build sets');
+  const src = fs.readFileSync(path.join(DESKTOP, 'scripts', 'stage.js'), 'utf8');
+  assert.match(src, /CGO_ENABLED: '0', GOOS: t\.goos, GOARCH: t\.goarch/, 'pure Go, cross-compiled for each target');
+  assert.match(src, /const agent = withAgent \? stageAgent\(version\) : null;/, 'stage builds the agents when they are bundled');
+  // where the service looks: resources/agent/<platform>/lf-agent
+  assert.match(fs.readFileSync(path.join(REPO, 'cmd', 'lectureflow', 'ssh.go'), 'utf8'), /filepath\.Join\(abs, "agent"\)/);
+  assert.match(fs.readFileSync(path.join(REPO, 'internal', 'sshremote', 'bootstrap.go'), 'utf8'), /filepath\.Join\(dir, platform, "lf-agent"\)/);
+});
+
+test('lf-agent: stageAgent writes every target and kit.json with their SHA-256', () => {
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'lf-agent-stage-'));
+  try {
+    const built = [];
+    const kit = stageAgent('3.2.0', {
+      out,
+      build: (t, file) => {
+        built.push(t.target);
+        fs.writeFileSync(file, `agent for ${t.goos}/${t.goarch}`);
+      },
+    });
+    assert.deepEqual(built, ['linux-x64', 'darwin-arm64', 'windows-x64']);
+    const onDisk = JSON.parse(fs.readFileSync(path.join(out, 'agent', 'kit.json'), 'utf8'));
+    assert.deepEqual(onDisk, kit);
+    assert.equal(kit.version, '3.2.0');
+    for (const t of AGENT_TARGETS) {
+      const file = path.join(out, 'agent', t.target, 'lf-agent');
+      assert.equal(kit.builds[t.target], crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'), t.target);
+      if (process.platform !== 'win32' && t.goos !== 'windows') assert.ok(fs.statSync(file).mode & 0o100, `${t.target} is executable`);
+    }
+    // a build that leaves no file fails staging
+    assert.throws(() => stageAgent('3.2.0', { out, build: (t, file) => t.target === 'darwin-arm64' && fs.rmSync(file, { force: true }) }), /lf-agent for darwin-arm64 was not built/);
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test('lf-agent: left out of the installers by default, LECTUREFLOW_BUNDLE_LF_AGENT=1 puts it in', () => {
+  // user decision 2026-11-11: not bundled while LECTUREFLOW_EXPERIMENTAL_SSH is experimental
+  assert.equal(BUNDLE_AGENT_ENV, 'LECTUREFLOW_BUNDLE_LF_AGENT');
+  assert.equal(BUNDLE_AGENT_DEFAULT, false, 'flip this (and BUNDLE_AGENT_DEFAULT in stage.js) when the SSH servers become public');
+  assert.equal(bundleAgent({}), false);
+  assert.equal(bundleAgent({ LECTUREFLOW_BUNDLE_LF_AGENT: '' }), false);
+  assert.equal(bundleAgent({ LECTUREFLOW_BUNDLE_LF_AGENT: '0' }), false);
+  assert.equal(bundleAgent({ LECTUREFLOW_BUNDLE_LF_AGENT: '1' }), true);
+  assert.equal(bundleAgent({ LECTUREFLOW_EXPERIMENTAL_SSH: '1' }), false, 'the runtime switch does not bundle it');
+  for (const bad of ['true', 'yes', '2']) {
+    assert.throws(() => bundleAgent({ LECTUREFLOW_BUNDLE_LF_AGENT: bad }), /LECTUREFLOW_BUNDLE_LF_AGENT must be 1 or 0/);
+  }
+  // stage reads the switch before building and builds resources/agent only with it
+  const src = fs.readFileSync(path.join(DESKTOP, 'scripts', 'stage.js'), 'utf8');
+  const body = src.slice(src.indexOf('async function stage('), src.indexOf('\nmodule.exports'));
+  assert.ok(body.indexOf('bundleAgent(env)') >= 0 && body.indexOf('bundleAgent(env)') < body.indexOf('fs.rmSync(OUT'), 'the switch is read before OUT is emptied');
+  assert.equal((body.match(/stageAgent\(/g) || []).length, 1, 'one call, behind the switch');
+  assert.match(body, /const agent = withAgent \? stageAgent\(version\) : null;/);
+  // OUT is emptied before staging, so no agent of an earlier build stays in resources/
+  assert.ok(body.indexOf('fs.rmSync(OUT, { recursive: true, force: true })') < body.indexOf('stageAgent('));
+  // nothing else in the build puts lf-agent into the installer: electron-builder copies build/resources only
+  const c = loadConfig({});
+  assert.deepEqual(c.extraResources, [{ from: 'build/resources', to: '.', filter: ['**/*'] }]);
+  assert.ok(!JSON.stringify(c.files || []).includes('agent'), 'files does not name the agent');
+  for (const f of fs.readdirSync(path.join(DESKTOP, 'scripts')).filter((x) => x.endsWith('.js') && x !== 'stage.js')) {
+    assert.doesNotMatch(fs.readFileSync(path.join(DESKTOP, 'scripts', f), 'utf8'), /lf-agent|stageAgent/, `scripts/${f} does not build the agent`);
+  }
+});
+
+test('lf-agent: the macOS app leaves the Linux and Windows agents unsigned', () => {
+  const c = loadConfig({});
+  const re = c.mac.signIgnore.map((x) => new RegExp(x));
+  const app = '/build/dist/mac-arm64/LectureFlow.app/Contents/Resources';
+  const ignored = (p) => re.some((r) => r.test(p));
+  assert.ok(ignored(`${app}/agent/linux-x64/lf-agent`));
+  assert.ok(ignored(`${app}/agent/windows-x64/lf-agent`));
+  assert.ok(!ignored(`${app}/agent/darwin-arm64/lf-agent`), 'the Mach-O agent is signed like the rest');
+  assert.ok(!ignored(`${app}/bin/lectureflow`));
+  assert.deepEqual(loadConfig({ CSC_NAME: 'Developer ID Application: X' }).mac.signIgnore, c.mac.signIgnore, 'the same with a certificate');
 });

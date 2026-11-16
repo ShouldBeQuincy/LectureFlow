@@ -48,9 +48,9 @@ func TestMDTextEscapes(t *testing.T) {
 		`<img src="https://evil.example/t.png">`:     `&lt;img src="https://evil.example/t.png">`,
 		"<IMG SRC=x onerror=y>":                      "&lt;IMG SRC=x onerror=y>",
 		"</script> <!-- c --> <?php ?> <!DOCTYPE x>": "&lt;/script> &lt;!-- c --> &lt;?php ?> &lt;!DOCTYPE x>",
-		"![tracker](https://evil.example/t.png)":     `!\[tracker](https://evil.example/t.png)`,
-		"![a][ref] and !![b](u)":                     `!\[a][ref] and !!\[b](u)`,
-		"[a link](https://example.com) stays":        "[a link](https://example.com) stays",
+		"![tracker](https://evil.example/t.png)":     `!\[tracker]\(https://evil.example/t.png)`,
+		"![a][ref] and !![b](u)":                     `!\[a][ref] and !!\[b]\(u)`,
+		"[a link](https://example.com) is inert":     `[a link]\(https://example.com) is inert`,
 		"Wow! [note]":                                "Wow! [note]",
 		"<https://example.com> autolink":             "&lt;https://example.com> autolink",
 		"中文<b>粗体</b>！[注]":                            "中文&lt;b>粗体&lt;/b>！[注]",
@@ -115,7 +115,7 @@ func TestExportEscapesModelOutput(t *testing.T) {
 	}
 	for _, want := range []string{
 		"**[00:00]** Look at &lt;img src=\"https://evil.example/t.png\"> this.\n\n看这个 &lt;img src=x onerror=alert(1)>。\n\n",
-		"**[00:04]** !\\[pixel](https://evil.example/p.png) and Tom & Jerry.\n\n!\\[像素](https://evil.example/p.png) 和 Tom & Jerry。\n\n",
+		"**[00:04]** !\\[pixel]\\(https://evil.example/p.png) and Tom & Jerry.\n\n!\\[像素]\\(https://evil.example/p.png) 和 Tom & Jerry。\n\n",
 		"**[00:08]** If i < 10 and x&lt;y then A --> B.\n\n如果 i < 10 且 x&lt;y，则 A --> B。\n\n",
 		"**[00:12]** Close &lt;/script>&lt;!-- note -->.\n\n&lt;b>粗体&lt;/b>\n\n",
 	} {

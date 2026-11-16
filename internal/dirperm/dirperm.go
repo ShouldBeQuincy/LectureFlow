@@ -25,6 +25,10 @@
 // directory itself; what lies below inherits it). Nothing here changes a
 // directory the user already had unless they ask for it: the data directory
 // is made private when LectureFlow creates it or moves the data into it.
+//
+// What already lies below a directory keeps its own owner and its own
+// entries: CheckTree looks at every entry of a tree, RestrictTree resets
+// the ones it would report (tree.go).
 package dirperm
 
 import (
@@ -45,23 +49,35 @@ type Exposure struct {
 	// "group <name>", "others", "owner <uid>", or the ancestor that lets
 	// them rename the directory). At most a few names.
 	Who []string
+	// Writers are the names of Who that may change the directory (the
+	// reason for Write), without those that may only read it.
+	Writers []string
 }
 
 // Exposed reports whether another account can read or change the directory.
 func (e Exposure) Exposed() bool { return e.Write || e.Read }
 
-// maxWho bounds Exposure.Who.
+// maxWho bounds Exposure.Who and Exposure.Writers.
 const maxWho = 4
 
-func (e *Exposure) add(who string) {
-	for _, w := range e.Who {
+func addName(list []string, who string) []string {
+	for _, w := range list {
 		if w == who {
-			return
+			return list
 		}
 	}
-	if len(e.Who) < maxWho {
-		e.Who = append(e.Who, who)
+	if len(list) < maxWho {
+		list = append(list, who)
 	}
+	return list
+}
+
+func (e *Exposure) add(who string) { e.Who = addName(e.Who, who) }
+
+// addWriter names an account that may change the directory.
+func (e *Exposure) addWriter(who string) {
+	e.Who = addName(e.Who, who)
+	e.Writers = addName(e.Writers, who)
 }
 
 // MkdirPrivate creates dir (and its missing parents, as os.MkdirAll does)
@@ -126,6 +142,55 @@ func Check(dir string) (Exposure, error) {
 	}
 	return check(dir)
 }
+
+// CheckAbove reports whether another account can take dir out of its
+// place: remove or rename a folder above it, or remove or rename dir in its
+// folder, and put a folder of its own there (security audit M-4: an
+// installation in D:\Apps\LectureFlow is only as safe as D:\Apps). path is
+// the first folder, walking up from dir's own, whose owner or permissions
+// allow it ("" when none does); e names the accounts. Only the folders
+// below top are looked at ("" = every folder up to the root of the drive or
+// share; tests stop at a folder of their own). It only reads; a folder whose
+// permissions cannot be read is an error naming it.
+//
+// Windows: a folder above dir counts when another account owns it, or an
+// entry that applies to the folder itself (not one that is only passed
+// down) gives another account DELETE, FILE_DELETE_CHILD, WRITE_DAC,
+// WRITE_OWNER or GENERIC_ALL; the root of the drive only for what lets it
+// remove its entries (FILE_DELETE_CHILD and the rights to give itself
+// that), since nobody renames a drive's root. A folder without any DACL
+// (FAT, exFAT) lets everyone. Deny entries are not counted (the safe side).
+// A folder on the way that is a link (a junction, a symbolic link or
+// another reparse point: what the system reads is the link's own entry,
+// not the folders it leads into) is an error wrapping ErrLink, with path
+// naming it: not vouched for (security review SEC20). Callers that also
+// want the folders the path really goes through (a subst or mapped drive
+// letter hides them) check FinalPath(dir) as well.
+// macOS, Linux: Check already looks at every folder above dir (links
+// resolved); CheckAbove reports nothing there.
+func CheckAbove(dir, top string) (path string, e Exposure, err error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", Exposure{}, err
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return "", Exposure{}, err
+	}
+	if top != "" {
+		if top, err = filepath.Abs(top); err != nil {
+			return "", Exposure{}, err
+		}
+	}
+	return checkAbove(filepath.Clean(abs), top)
+}
+
+// ErrLink: a folder CheckAbove looked at is a link.
+var ErrLink = errors.New("it is a link (a junction, a symbolic link or another reparse point): where it leads is not checked")
+
+// FinalPath is the path the system really opens for dir (Windows:
+// GetFinalPathNameByHandle, which resolves junctions, symbolic links, subst
+// and mapped drive letters; elsewhere filepath.EvalSymlinks).
+func FinalPath(dir string) (string, error) { return finalPath(dir) }
 
 // Save records dir's current permissions; the returned function puts them
 // back (a move into a directory the user chose undoes its Restrict when it

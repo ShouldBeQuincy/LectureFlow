@@ -56,6 +56,18 @@ type CardJob struct {
 	Progress     *float64 `json:"progress,omitempty"`      // 0–1
 	ETASec       *int     `json:"eta_sec,omitempty"`
 	Split        int      `json:"split,omitempty"` // speed mode: parts the lecture is cut into (0 = whole)
+	// Reconnect: the device does not answer and the lecture is trying
+	// again in place (v3.2.x); absent otherwise.
+	Reconnect *Reconnect `json:"reconnect,omitempty"`
+}
+
+// Reconnect tells that a lecture on a remote device waits for the device to
+// answer again: the attempt under way (from 1), how many there are before
+// the lecture is handed back, and when the device is probed next.
+type Reconnect struct {
+	Attempt int       `json:"attempt"`
+	Of      int       `json:"of"`
+	NextAt  time.Time `json:"next_at"`
 }
 
 // CardError is the device's last error, as an error code (§9.6).

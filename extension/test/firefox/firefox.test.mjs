@@ -42,6 +42,7 @@ import { startServer, PANOPTO, LIST } from '../e2e/server.mjs';
 import { installFakeLectureFlow, COURSES, COOKIE_TRACK } from '../e2e/harness.mjs';
 import { Bidi } from './bidi.mjs';
 import { firefoxForTests, UPDATE_PREFS } from './provision.mjs';
+import { runProcesses, isInside } from './run-processes.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const extDir = path.join(root, 'dist', 'firefox-e2e');
@@ -77,53 +78,61 @@ function freePort() {
 }
 
 /**
- * Processes of this run, whatever their name (Firefox also starts
- * crashhelper.exe, which can outlive it): the main one and its descendants,
- * and anything whose command line names one of `dirs` (this run's temporary
- * directory, which crashhelper gets as its dump directory; the copy's
- * directory, which only these tests run from: one test:firefox at a time).
+ * The process table: [{ ProcessId, ParentProcessId, Name, CommandLine,
+ * Created }]. Created, the creation time, is only compared between rows
+ * (run-processes.mjs): on Windows in microseconds since the epoch (the
+ * precision Win32_Process gives; well below 2^53, so exact in a JS number);
+ * elsewhere in whole seconds, from ps's elapsed time (to a second either way,
+ * enough: the snapshot, not the time, is what keeps other processes out).
  */
-function ourFirefoxProcesses(mainPid, dirs) {
-  let rows = [];
+function processTable() {
   if (process.platform === 'win32') {
-    const out = execFileSync('powershell', ['-NoProfile', '-Command', 'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).trim();
-    rows = out ? [].concat(JSON.parse(out)) : [];
-  } else {
-    const out = execFileSync('ps', ['-axo', 'pid=,ppid=,args='], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-    rows = out.split('\n').map((l) => {
-      const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(l);
-      return m ? { ProcessId: Number(m[1]), ParentProcessId: Number(m[2]), Name: m[3].split(/\s/)[0], CommandLine: m[3] } : null;
-    }).filter(Boolean);
+    const out = execFileSync('powershell', ['-NoProfile', '-Command', "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine,@{n='Created';e={if ($_.CreationDate) { [long][math]::Floor(([DateTimeOffset]::new($_.CreationDate).UtcTicks - 621355968000000000) / 10) }}} | ConvertTo-Json -Compress"], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).trim();
+    return out ? [].concat(JSON.parse(out)) : [];
   }
-  const named = (r) => dirs.some((d) => d && String(r.CommandLine || '').toLowerCase().includes(d.toLowerCase()));
-  const ours = new Set(rows.filter((r) => (mainPid && r.ProcessId === mainPid) || named(r)).map((r) => r.ProcessId));
-  for (let grew = true; grew;) {
-    grew = false;
-    for (const r of rows) {
-      if (!ours.has(r.ProcessId) && ours.has(r.ParentProcessId) && r.ProcessId !== process.pid) {
-        ours.add(r.ProcessId);
-        grew = true;
-      }
-    }
-  }
-  if (mainPid) for (const r of rows) if (r.ParentProcessId === mainPid) ours.add(r.ProcessId);
-  return rows.filter((r) => ours.has(r.ProcessId)).map((r) => ({ ProcessId: r.ProcessId, ParentProcessId: r.ParentProcessId, Name: r.Name, ours: named(r) ? 'dirs' : 'tree' }));
+  const out = execFileSync('ps', ['-axo', 'pid=,ppid=,etime=,args='], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  const now = Math.floor(Date.now() / 1000);
+  const seconds = (etime) => {
+    const m = /^(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)$/.exec(etime);
+    return m ? ((Number(m[1] || 0) * 24 + Number(m[2] || 0)) * 60 + Number(m[3])) * 60 + Number(m[4]) : null;
+  };
+  return out.split('\n').map((l) => {
+    const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(l);
+    if (!m) return null;
+    const age = seconds(m[3]);
+    return { ProcessId: Number(m[1]), ParentProcessId: Number(m[2]), Name: m[4].split(/\s/)[0], CommandLine: m[4], Created: age === null ? undefined : now - age };
+  }).filter(Boolean);
 }
 
-/** Removes what earlier runs could not (lf-ext-firefox-* over an hour old in `dir`); best effort. */
-function sweepEarlierRuns(dir) {
+/**
+ * Processes of this run, whatever their name (Firefox also starts
+ * crashhelper.exe, which can outlive it), with whether the run may stop them:
+ * the rules are in run-processes.mjs (and its unit test).
+ */
+function ourFirefoxProcesses(mainPid, dirs) {
+  return runProcesses({ rows: processTable(), mainPid, dirs, selfPid: process.pid, selfStart: before0.selfStart, preexisting: before0.preexisting });
+}
+
+/** Removes the entries of `dir` that `pick(name)` selects and are over `minAgeMs` old; best effort: [removed, stuck]. */
+function sweep(dir, pick, minAgeMs) {
   let removed = 0;
   let stuck = 0;
   for (const name of fs.readdirSync(dir)) {
     const p = path.join(dir, name);
     try {
-      if (!name.startsWith('lf-ext-firefox-') || Date.now() - fs.statSync(p).mtimeMs < 3600 * 1000) continue;
+      if (!pick(name) || Date.now() - fs.statSync(p).mtimeMs < minAgeMs) continue;
       fs.rmSync(p, { recursive: true, force: true });
       removed++;
     } catch {
       stuck++;
     }
   }
+  return [removed, stuck];
+}
+
+/** Removes what earlier runs could not (lf-ext-firefox-* over an hour old in `dir`); best effort. */
+function sweepEarlierRuns(dir) {
+  const [removed, stuck] = sweep(dir, (name) => name.startsWith('lf-ext-firefox-'), 3600 * 1000);
   if (removed || stuck) console.log(`# firefox: temporary directories of earlier runs: ${removed} removed, ${stuck} still locked`);
 }
 
@@ -134,9 +143,14 @@ let control; // a tab kept on the extension's settings page: the way into the ba
 let mainPid = 0;
 let profileDir = '';
 let tmpRoot = '';
+let fxTemp = ''; // Firefox's own temp directory (see before)
 let ownDirs = []; // the copy's directory: every Firefox process started from it is this run's
+// Taken just before Firefox is started: the ids of every process then, and this
+// process's creation time from the same table (null when either is unknown,
+// and then no process is stopped on the strength of its parent id).
+const before0 = { preexisting: null, selfStart: null };
 const saved = {};
-const ours = () => (mainPid || tmpRoot ? ourFirefoxProcesses(mainPid, [tmpRoot, ...ownDirs]) : []);
+const ours = () => (mainPid || tmpRoot ? ourFirefoxProcesses(mainPid, [tmpRoot, fxTemp, ...ownDirs]) : []);
 
 before(async () => {
   assert.ok(fs.existsSync(path.join(extDir, 'manifest.json')), 'run "node scripts/build.mjs --target firefox --e2e" first');
@@ -145,18 +159,42 @@ before(async () => {
   ownDirs = firefox.ownDirs;
   console.log(firefox.source === 'LF_FIREFOX' ? `# firefox: LF_FIREFOX=${binary}` : `# firefox: Firefox ${firefox.version}, the tests' own copy (${{ download: 'downloaded now', unpacked: 'unpacked now', cache: 'cached' }[firefox.source]}): ${binary}`);
   server = await startServer();
-  // Everything temporary of this run (web-ext's profile, Firefox's own temp
-  // files) goes into one directory, removed at the end. With the copy, that
-  // is <cache>/tmp: should a run's directory resist removal (on the
-  // development machine, the security software sometimes keeps a Firefox
-  // profile's files from other programs after Firefox has exited; see
-  // NOTES), it stays in that ignored place and a later run removes it.
+  // This run's directory holds web-ext's temporary profile (and, except on
+  // Windows with the copy, Firefox's own temp files); it is removed at the
+  // end and the test checks that. With the copy, it is in <cache>/tmp:
+  // should a run's directory resist removal (on the development machine the
+  // security software often keeps a Firefox profile's files from other
+  // programs after Firefox has exited; see NOTES), it stays in that ignored
+  // place and a later run removes it.
   const tmpParent = firefox.cacheRoot ? path.join(firefox.cacheRoot, 'tmp') : os.tmpdir();
   fs.mkdirSync(tmpParent, { recursive: true });
   if (firefox.cacheRoot) sweepEarlierRuns(tmpParent);
   tmpRoot = fs.mkdtempSync(path.join(tmpParent, 'lf-ext-firefox-'));
+  // Firefox's own temp directory on Windows, except for LF_FIREFOX: one fixed
+  // directory of the copy (<cache>/firefox-temp), reused by every run; its
+  // entries are removed after each run as far as possible (not checked), the
+  // directory itself never. On the development machine nothing could delete
+  // the directory a Firefox used as its temp directory for minutes after
+  // that Firefox had exited (an empty directory; RemoveDirectory: access
+  // denied; no process left; the cause is not fully established, likely the
+  // security software), so with it inside the run's directory the run's
+  // directory could not be removed (NOTES, ext r4). Firefox reads TMP before
+  // TEMP (GetTempPathW); Node reads TEMP first (os.tmpdir(), where web-ext
+  // puts the profile), so the profile stays in the run's directory.
+  fxTemp = process.platform === 'win32' && firefox.cacheRoot ? path.join(firefox.cacheRoot, 'firefox-temp') : tmpRoot;
+  fs.mkdirSync(fxTemp, { recursive: true });
+  // The processes before Firefox starts (see run-processes.mjs).
+  try {
+    const rows = processTable();
+    const me = rows.find((r) => r.ProcessId === process.pid);
+    before0.preexisting = new Set(rows.map((r) => r.ProcessId));
+    before0.selfStart = me && typeof me.Created === 'number' ? me.Created : null;
+  } catch {
+    before0.preexisting = null;
+  }
   for (const k of ['TEMP', 'TMP', 'TMPDIR', 'MOZ_HEADLESS', 'MOZ_CRASHREPORTER_DISABLE']) saved[k] = process.env[k];
-  process.env.TEMP = process.env.TMP = process.env.TMPDIR = tmpRoot;
+  process.env.TEMP = process.env.TMPDIR = tmpRoot;
+  process.env.TMP = fxTemp;
   process.env.MOZ_HEADLESS = '1'; // no window: the user is asleep
   process.env.MOZ_CRASHREPORTER_DISABLE = '1';
   const port = await freePort();
@@ -172,6 +210,17 @@ before(async () => {
     'network.proxy.share_proxy_settings': true,
     'network.proxy.no_proxies_on': 'localhost, 127.0.0.1, .lf-e2e.test, .lf-e2e-x.test, .cloud.panopto.eu',
     'network.proxy.allow_hijacking_localhost': false,
+    // and no way around that proxy: no direct connection when it fails (on
+    // 2026-11-13 a Firefox of a failed start, left running for three minutes,
+    // fetched the Widevine and OpenH264 plugins, about 23 MB, past the proxy
+    // into its profile), none for requests that may skip proxies
+    'network.proxy.failover_direct': false,
+    'network.proxy.allow_bypass': false,
+    // nor Firefox's plugin downloads themselves (GMPInstallManager.checkForAddons
+    // checks the first); the tests use no DRM, and Clear Key comes with Firefox
+    'media.gmp-manager.updateEnabled': false,
+    'media.gmp-widevinecdm.enabled': false,
+    'media.gmp-gmpopenh264.enabled': false,
     'network.trr.mode': 5,
     'network.captive-portal-service.enabled': false,
     'network.connectivity-service.enabled': false,
@@ -217,6 +266,8 @@ before(async () => {
 });
 
 after(async () => {
+  let rmError = '';
+  let profileInside = true;
   try {
     if (bidi) {
       await bidi.send('browser.close', {}, { timeoutMs: 10000 }).catch(() => {});
@@ -232,10 +283,15 @@ after(async () => {
     await waitGone(15000);
     if (ours().length && runner) await runner.exit().catch(() => {});
     await waitGone(15000);
-    // What Firefox started and left behind (crashhelper.exe, which keeps the
-    // test runner's output pipes open, so node would never exit): stopped,
-    // but only processes whose command line names this run's directories.
-    for (const p of ours().filter((x) => x.ours === 'dirs')) {
+    // What is left and certainly this run's is stopped (run-processes.mjs):
+    // the suite's own programs that name this run's directories and are new
+    // since the snapshot (crashhelper.exe, which keeps the test runner's
+    // output pipes open, so node would never exit) and, after a start that
+    // failed half-way, the
+    // Firefox this process started with what it started in turn (on the
+    // development machine the security software hides those processes'
+    // command lines, so a left crashhelper would not be found by name).
+    for (const p of ours().filter((x) => x.stop)) {
       try {
         process.kill(p.ProcessId);
         console.log(`# firefox: stopped ${p.Name} (${p.ProcessId}), left behind by this run's Firefox`);
@@ -243,19 +299,40 @@ after(async () => {
     }
     await waitGone(10000);
     if (server) await server.close();
-    for (let i = 0; i < 20 && tmpRoot && fs.existsSync(tmpRoot); i++) {
+    // Removed with a few spaced attempts (about 23 s in all), the profile
+    // first, and only when it is inside this run's directory (the assertion
+    // in before checks that; should it have failed, the profile is not
+    // touched and the run fails below); the last error is kept for the
+    // assertion. On the development machine the security software keeps
+    // other programs out of a Firefox profile while that Firefox runs, and
+    // often for good after it has exited; no wait or retry gets past that
+    // (NOTES, ext r4).
+    profileInside = !profileDir || isInside(profileDir, tmpRoot, path);
+    for (let i = 0, wait = 1000; i < 6 && tmpRoot && fs.existsSync(tmpRoot) && profileInside; i++, wait *= 2) {
       try {
+        if (profileDir) fs.rmSync(profileDir, { recursive: true, force: true });
         fs.rmSync(tmpRoot, { recursive: true, force: true });
-      } catch {
-        await new Promise((r) => setTimeout(r, 500));
+      } catch (e) {
+        const at = e.path ? path.relative(tmpRoot, String(e.path).replace(/^\\\\\?\\/, '')) : '';
+        rmError = `${e.code || e.message} on ${at || 'the run directory'} (attempt ${i + 1})`;
+        if (i < 5) await new Promise((r) => setTimeout(r, Math.min(wait, 8000)));
       }
+    }
+    // Firefox's own temp directory, when it is not the run's (see before):
+    // its entries, as far as they go; not checked.
+    if (fxTemp && fxTemp !== tmpRoot && fs.existsSync(fxTemp)) {
+      try {
+        const [, stuck] = sweep(fxTemp, () => true, 0);
+        if (stuck) console.log(`# firefox: ${stuck} entries of ${fxTemp} not removed yet (a later run tries again)`);
+      } catch {}
     }
   }
   const left = ours();
-  console.log(`# firefox: temporary profile ${profileDir} ${fs.existsSync(profileDir) ? 'STILL THERE' : 'removed'}; processes of this run left: ${left.length}`);
+  console.log(`# firefox: temporary profile ${profileDir} ${fs.existsSync(profileDir) ? 'STILL THERE' : 'removed'}; processes of this run left: ${left.length}${rmError && fs.existsSync(tmpRoot) ? `; last removal error: ${rmError}` : ''}`);
   assert.deepEqual(left, [], 'no Firefox process of this run is left');
   if (START_MENU_SHORTCUT) assert.equal(fileState(START_MENU_SHORTCUT), startMenuBefore, `${START_MENU_SHORTCUT} is as it was before the run`);
-  assert.equal(fs.existsSync(tmpRoot), false, 'the temporary profile and temp files are gone');
+  assert.ok(profileInside, `the profile ${profileDir} is inside this run's directory ${tmpRoot} (it is not, so it was left alone)`);
+  assert.equal(fs.existsSync(tmpRoot), false, `this run's directory, the temporary profile in it included, is gone${rmError ? ` (${rmError})` : ''}`);
 });
 
 // ------------------------------------------------------------- helpers

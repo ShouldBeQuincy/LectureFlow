@@ -7,8 +7,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"time"
 
@@ -23,8 +25,9 @@ import (
 // same start on demand, idle stop, RPC secret and conf file handling.
 
 // UpdateDownloader returns the queue's aria2c as a selfupdate.Downloader.
-// When aria2c cannot be started (missing, refused to start) a download
-// falls back to selfupdate's own net/http downloader.
+// When aria2c cannot be started (missing, refused to start), or the proxy
+// set for a URL is one aria2c cannot use, a download falls back to
+// selfupdate's own net/http downloader.
 func (q *Queue) UpdateDownloader() selfupdate.Downloader {
 	return &updateDownloader{q: q, fallback: &selfupdate.HTTPDownloader{}}
 }
@@ -32,6 +35,17 @@ func (q *Queue) UpdateDownloader() selfupdate.Downloader {
 type updateDownloader struct {
 	q        *Queue
 	fallback selfupdate.Downloader
+}
+
+// policy is the queue's address policy for the update's downloads,
+// without ALL_PROXY's rule (addrPolicy.ignoreAllProxy): the update's
+// other way, net/http, does not read ALL_PROXY either, so refusing it
+// there would only trade aria2c and the guard for a direct download
+// without the guard's checks.
+func (d *updateDownloader) policy() *addrPolicy {
+	p := *d.q.local
+	p.ignoreAllProxy = true
+	return &p
 }
 
 // errLocal marks a failure of the local file (disk full, permissions):
@@ -60,6 +74,21 @@ func (d *updateDownloader) Download(ctx context.Context, req selfupdate.Download
 	}
 	if done, err := d.prepare(req); err != nil || done {
 		return err
+	}
+	// a proxy aria2c cannot use (SOCKS, https:// HTTP(S)_PROXY: local.go
+	// upstream): net/http speaks to it, where aria2c would connect directly
+	// or send the proxy's password in the clear. A SOCKS or https://
+	// ALL_PROXY alone does not count here (policy): net/http does not read
+	// it either, so aria2c and the guard download directly, with the
+	// guard's checks (SEC19 low-7).
+	pol := d.policy()
+	for _, raw := range req.URLs {
+		if u, err := url.Parse(raw); err == nil {
+			if _, err := pol.upstream(u); err != nil {
+				d.q.log.Warn("selfupdate: the proxy set is one aria2c cannot use; the update downloads over net/http", "err", err)
+				return d.fallback.Download(ctx, req)
+			}
+		}
 	}
 	inst, err := d.q.eng.acquire(ctx)
 	if err != nil {
@@ -122,15 +151,33 @@ func (d *updateDownloader) prepare(req selfupdate.DownloadRequest) (done bool, e
 
 var errUpdateSize = errors.New("the server's file has another size than update.json says")
 
-// one downloads req from u with aria2c.
+// one downloads req from u with aria2c, through the guard proxy like every
+// download (guard.go). When u is one of the user's own sources
+// (req.UserURLs: a mirror the user added) its host may be on this computer
+// or the local network; any other URL of the update (GitHub, update.json's
+// own: public addresses) is judged like a recording's URL from an unknown
+// page, and so is what a redirect leads to: public addresses only (SEC19
+// info-5).
 func (d *updateDownloader) one(ctx context.Context, inst *instance, u string, req selfupdate.DownloadRequest) error {
 	d.q.mu.Lock()
 	conns := d.q.conns
 	d.q.mu.Unlock()
+	var trusted []string
+	if slices.Contains(req.UserURLs, u) {
+		trusted = []string{u}
+	}
+	sess, err := inst.guard.open(d.policy().forTask(""), trusted...)
+	if err != nil {
+		return engineFailure(inst, err)
+	}
+	defer sess.close()
 	opts := map[string]any{
 		"dir": filepath.Dir(req.Path), "out": filepath.Base(req.Path),
 		"split": strconv.Itoa(conns), "max-connection-per-server": strconv.Itoa(conns), "min-split-size": "1M",
 		"user-agent": selfupdate.UserAgent,
+	}
+	for name, v := range sess.options() {
+		opts[name] = v
 	}
 	gid, err := inst.rpc.addURIDetached(ctx, u, opts)
 	if err != nil {
@@ -157,6 +204,11 @@ func (d *updateDownloader) one(ctx context.Context, inst *instance, u string, re
 			}
 			return engineFailure(inst, err)
 		}
+		if err := sess.refused(); err != nil {
+			stop() // a redirect the guard refused: the next mirror
+			_ = inst.rpc.removeResult(ctx, gid)
+			return errors.New(asFailure(err).detail)
+		}
 		st := sts[0]
 		switch st.Status {
 		case "complete":
@@ -176,7 +228,7 @@ func (d *updateDownloader) one(ctx context.Context, inst *instance, u string, re
 		case "error":
 			_ = inst.rpc.removeResult(ctx, gid)
 			var f *failure
-			if !errors.As(ariaFailure(st), &f) {
+			if !errors.As(sess.failureOf(st), &f) {
 				return errors.New("aria2 error " + st.ErrorCode)
 			}
 			if f.code == CodeNoSpace || f.code == CodeWriteFailed {

@@ -146,7 +146,12 @@ func (n numbering) cite() map[string]calendar.Numbered {
 // citeExported reports whether a citation JSON of the course was exported
 // (kv cite_exported:{course}; "" = cleared).
 func (s *Server) citeExported(ctx context.Context, courseID string) (bool, error) {
-	v, ok, err := s.st.GetKV(ctx, model.KVCiteExportPrefix+courseID)
+	return citeExportedIn(ctx, s.st, courseID)
+}
+
+// citeExportedIn is citeExported reading from st (course_reads.go).
+func citeExportedIn(ctx context.Context, st db.Store, courseID string) (bool, error) {
+	v, ok, err := st.GetKV(ctx, model.KVCiteExportPrefix+courseID)
 	return ok && strings.TrimSpace(v) != "", err
 }
 
@@ -260,7 +265,12 @@ func parseRule(raw *string) *calendar.FilenameRule {
 
 // kvValue reads a kv entry; "" (cleared) counts as absent.
 func (s *Server) kvValue(ctx context.Context, key string) (string, bool, error) {
-	v, ok, err := s.st.GetKV(ctx, key)
+	return kvValueIn(ctx, s.st, key)
+}
+
+// kvValueIn is kvValue reading from st (course_reads.go).
+func kvValueIn(ctx context.Context, st db.Store, key string) (string, bool, error) {
+	v, ok, err := st.GetKV(ctx, key)
 	if err != nil || !ok || strings.TrimSpace(v) == "" {
 		return "", false, err
 	}

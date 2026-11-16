@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "serial": 3,
-  "published": "2026-10-27",
-  "app_version": "3.2.0",
+  "serial": 4,
+  "published": "2026-11-16",
+  "app_version": "3.3.0",
   "compat": ">=3.0.0 <4.0.0",
   "sources": {
     "files": {
@@ -75,7 +75,7 @@
   "components": [
     {
       "id": "core",
-      "version": "3.2.0",
+      "version": "3.3.0",
       "upstream": "LectureFlow: Electron shell, Go service, web UI, ffmpeg (LGPL build), uv 0.13.1, aria2 1.37.0",
       "kind": "binary",
       "bundled": true,

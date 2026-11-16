@@ -3,7 +3,10 @@
 
 package model
 
-import "path/filepath"
+import (
+	"path/filepath"
+	"time"
+)
 
 // Rows of the tables in migrations/001_init.sql. Times are UTC RFC3339 strings.
 
@@ -183,6 +186,28 @@ type JobStats struct {
 	// scheduler writes it into job.error when the job becomes done.
 	Warning       string  `json:"warning,omitempty"`
 	EstimatedCost float64 `json:"estimated_cost,omitempty"`
+
+	// v3.2.x additions (lead freeze, .claude/v32x-brief.md). Written by the
+	// scheduler only: a stage's UpdateStats cannot change LLM and
+	// LastActivityAt (like the token fields).
+	// LLM: the requests of the run, attempt by attempt (P1-c).
+	LLM *LLMStats `json:"llm,omitempty"`
+	// LastActivityAt: when the run last showed life (a request event, a
+	// usage report, a progress call, a stats update), RFC 3339 UTC.
+	LastActivityAt string `json:"last_activity_at,omitempty"`
+	// PendingSentences (translate, written by the stage, P1): sentences left
+	// without a translation after the business retries (zh "", qa_failed);
+	// the stage is done with a warning.
+	PendingSentences int `json:"pending_sentences,omitempty"`
+	// MixedModels (translate, v3.2.x P1-b, Q10a): the models the lecture's
+	// current translations come from, as "provider name / model", in the
+	// order they were first used, without duplicates. Empty = one model.
+	// Written by state (RetranslateSentenceWith, when a pending sentence is
+	// sent to the current setting's model), carried to the next translate
+	// job by an incremental run, and dropped with the translations (a retry
+	// with another model, a rerun). Stages cannot change it (like the token
+	// fields).
+	MixedModels []string `json:"mixed_models,omitempty"`
 
 	// v1.1 additions.
 	// ASRPrompt is the initial_prompt the asr run actually sent (A1).
@@ -366,6 +391,24 @@ type RoleParams struct {
 	// when off, so a role or snapshot without thinking is byte for byte
 	// what it was before the option existed.
 	Thinking *string `json:"thinking,omitempty"`
+	// MaxTokens (v3.2.x D1, lead freeze): the output limit the user set for
+	// the role, or for one retry (LLMSnapshot.Source manual). nil = automatic:
+	// the client's default for the role and thinking level. A snapshot holds
+	// it only when the user set one, so snapshots without it are byte for
+	// byte what they were. Compared by sameParams; never part of a hash.
+	MaxTokens *int `json:"max_tokens,omitempty"`
+	// Batch (v3.2.x P2, lead freeze; translate only): target sentences per
+	// request, 1–20. nil = 1 (one request per sentence, the behaviour before
+	// the option existed; a snapshot written before it has none). Not
+	// compared by sameParams and not part of a hash: like the prompt
+	// version it changes how the stage asks, not what it reads. A snapshot
+	// of the current settings for a Claude model on an Anthropic provider
+	// (settings.DefaultBatch) whose role leaves it
+	// empty holds settings.DefaultAnthropicBatch (user 2026-11-11), so the
+	// default is fixed when the snapshot is written; since Batch is not
+	// compared, an older snapshot without it still equals the current
+	// setting.
+	Batch *int `json:"batch,omitempty"`
 }
 
 // UsageDaily is one row of usage_daily (A5.1, A10.3).
@@ -403,7 +446,9 @@ type ASRSettings struct {
 	MaxParallel   int    `json:"max_parallel"`
 	VRAMReserveMB int    `json:"vram_reserve_mb"`
 	// VRAMPerJobMB is the initial per-job estimate of SPEC §17.2 (not on the
-	// settings page; imported from config.toml, default 5000).
+	// settings page; imported from config.toml, default 5000). Since r2
+	// T-PERF-02 it caps the estimate of the models devices.VRAMTableMB
+	// knows (the smaller one is used) and is the estimate of the others.
 	VRAMPerJobMB int `json:"vram_per_job_mb"`
 
 	// DeviceMode is "转写设备" (I8): ASRDeviceModeAuto (default) or the id
@@ -445,6 +490,34 @@ type GeneralSettings struct {
 	// DailyBudget is SPEC §17.7 llm.daily_budget, in the providers' price
 	// currency; 0 = no budget.
 	DailyBudget float64 `json:"daily_budget"`
+	// AutoChapters (v3.2.x P3, lead freeze): queue the chapters task when a
+	// lecture's export completes and the lecture has no chapters yet. nil
+	// (settings saved before the option) = on; use AutoChaptersOn.
+	AutoChapters *bool `json:"auto_chapters,omitempty"`
+	// LLMIdleTimeoutS (v3.2.x P1-c, lead freeze): seconds a streamed LLM
+	// request may stay without any event before it is cut and retried.
+	// nil = DefaultLLMIdleTimeoutS, 0 = no idle timeout; use LLMIdleTimeout.
+	LLMIdleTimeoutS *int `json:"llm_idle_timeout_s,omitempty"`
+}
+
+// DefaultLLMIdleTimeoutS is the idle timeout of a streamed LLM request when
+// the user set none: 90 (180 until the keep-alive during hidden thinking was
+// verified against the real API; real acceptance T9: a ping every 30 s, the
+// longest gap 30.0 s; approved by the user 2026-11-11, NOTES.md). Only
+// Anthropic requests to current Claude models are streamed (llm.streamed),
+// so it applies to nothing else. A value the user saved is kept.
+const DefaultLLMIdleTimeoutS = 90
+
+// AutoChaptersOn reports whether chapters are generated after an export.
+func (g GeneralSettings) AutoChaptersOn() bool { return g.AutoChapters == nil || *g.AutoChapters }
+
+// LLMIdleTimeout returns the idle timeout of a streamed LLM request (0 = none).
+func (g GeneralSettings) LLMIdleTimeout() time.Duration {
+	s := DefaultLLMIdleTimeoutS
+	if g.LLMIdleTimeoutS != nil {
+		s = max(*g.LLMIdleTimeoutS, 0)
+	}
+	return time.Duration(s) * time.Second
 }
 
 // ProbedModels is the cached result of "探测模型" (A5.3), kv provider_models:{id}.

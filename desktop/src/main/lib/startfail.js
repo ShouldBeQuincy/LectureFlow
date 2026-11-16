@@ -16,6 +16,8 @@
 //           the ERROR line (Chinese and English) under "Details".
 'use strict';
 
+const { CHAINS } = require('./i18n');
+
 const STARTING_PREFIX = 'LECTUREFLOW_STARTING ';
 const FAILURE_PREFIX = 'LECTUREFLOW_FAILURE ';
 
@@ -50,18 +52,39 @@ function extractFailure(lines) {
   return null;
 }
 
-/** gb(bytes): "3.1" (at least "0.1"), the number the texts put before "GB". */
-function gb(bytes) {
-  const n = Math.max(0.1, Math.round((bytes / 2 ** 30) * 10) / 10);
-  return n.toFixed(1);
+/**
+ * numberLocale(locale): the first tag of the shell locale's fallback chain
+ * (lib/i18n.js CHAINS) that Intl knows ("yue-Hant-HK" may be missing from a
+ * small ICU: zh-TW, then en), or "en".
+ */
+function numberLocale(locale) {
+  const chain = [...(CHAINS[locale] || [locale]), 'en'];
+  for (const l of chain) {
+    try {
+      if (typeof l === 'string' && Intl.NumberFormat.supportedLocalesOf([l]).length > 0) return l;
+    } catch {
+      // not a valid tag: the next one
+    }
+  }
+  return 'en';
 }
 
 /**
- * startFailureText(failure, t): the error page's text for a known code in
- * the interface language (desktop/locales "startfail.*"), or null (an
- * unknown code, or its parameters missing: the generic text then).
+ * gb(bytes, locale): "3.1" (at least "0.1"), the number the texts put before
+ * "GB", with the decimal separator of the interface language ("3,1" in ru).
  */
-function startFailureText(failure, t) {
+function gb(bytes, locale = 'en') {
+  const n = Math.max(0.1, Math.round((bytes / 2 ** 30) * 10) / 10);
+  return new Intl.NumberFormat(numberLocale(locale), { minimumFractionDigits: 1, maximumFractionDigits: 1, useGrouping: false }).format(n);
+}
+
+/**
+ * startFailureText(failure, t, locale): the error page's text for a known
+ * code in the interface language (desktop/locales "startfail.*"; locale
+ * formats the numbers), or null (an unknown code, or its parameters
+ * missing: the generic text then).
+ */
+function startFailureText(failure, t, locale = 'en') {
   if (!failure) return null;
   const p = failure.params || {};
   switch (failure.code) {
@@ -83,12 +106,29 @@ function startFailureText(failure, t) {
       const free = num(p.free_bytes);
       const dir = str(p.dir);
       if (need === null || free === null || dir === null) return null;
-      return t('startfail.upgrade_backup_no_space', { need: gb(need), free: gb(free), path: dir });
+      return t('startfail.upgrade_backup_no_space', { need: gb(need, locale), free: gb(free, locale), path: dir });
     }
     case 'startup.upgrade_backup_failed': {
       const dir = str(p.dir);
       if (dir === null) return null;
       return t('startfail.upgrade_backup_failed', { path: dir });
+    }
+    // the database cannot be opened or migrated (test-upgrade F5,
+    // cmd/lectureflow/dbfail.go)
+    case 'startup.db_busy':
+    case 'startup.db_readonly':
+    case 'startup.db_cant_open':
+    case 'startup.db_disk_full':
+    case 'startup.db_io_error': {
+      const path = str(p.path);
+      if (path === null) return null;
+      return t(`startfail.${failure.code.slice('startup.'.length)}`, { path });
+    }
+    case 'startup.db_not_a_database': {
+      const path = str(p.path);
+      const backups = str(p.backups);
+      if (path === null || backups === null) return null;
+      return t('startfail.db_not_a_database', { path, backups });
     }
     default:
       return null;
@@ -96,12 +136,38 @@ function startFailureText(failure, t) {
 }
 
 /**
+ * ENVIRONMENT_FAILURES: failures whose cause lies outside this version:
+ * another LectureFlow holds the data folder; the database is locked by
+ * another program, read-only, cannot be opened (a disconnected disk, no
+ * permission), the disk is full or failing (cmd/lectureflow/dbfail.go).
+ * The previous version would meet them as well, and a rollback writes to
+ * the database files (security review SEC3, section 4). Not here:
+ * startup.upgrade_backup_no_space (the backup comes before the migrations,
+ * so after a rollback the older version starts on an unchanged database);
+ * startup.db_not_a_database, which the new version itself may have caused
+ * and which the database snapshot a rollback restores can repair;
+ * "database table is locked", always this program's own fault, has
+ * no code (internal/db/openerr.go). A defect of the new version can still
+ * look like one of these: the shell gives back at most
+ * selfupdate.js MAX_REFUNDS starts per installation.
+ */
+const ENVIRONMENT_FAILURES = Object.freeze([
+  'startup.data_dir_in_use',
+  'startup.db_busy',
+  'startup.db_readonly',
+  'startup.db_cant_open',
+  'startup.db_disk_full',
+  'startup.db_io_error',
+]);
+
+/**
  * isEnvironmentFailure: the start failed because of something outside this
- * version (another LectureFlow holds the data folder): a freshly installed
- * version that meets it has not failed its probation (no rollback).
+ * version (ENVIRONMENT_FAILURES): a freshly installed version that meets it
+ * has not failed its probation (no rollback, and the start does not count
+ * as a try: shell.js refunds it).
  */
 function isEnvironmentFailure(failure) {
-  return !!failure && failure.code === 'startup.data_dir_in_use';
+  return !!failure && ENVIRONMENT_FAILURES.includes(failure.code);
 }
 
 module.exports = {
@@ -110,6 +176,8 @@ module.exports = {
   parseStartingLine,
   extractFailure,
   startFailureText,
+  ENVIRONMENT_FAILURES,
   isEnvironmentFailure,
   gb,
+  numberLocale,
 };

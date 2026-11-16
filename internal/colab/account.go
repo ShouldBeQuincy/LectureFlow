@@ -350,6 +350,9 @@ func (b *Backend) readAccount(ctx context.Context) error {
 	}
 	after := b.accountLocked()
 	b.mu.Unlock()
+	if err == nil {
+		b.accountReadOK()
+	}
 	before.ReadAt, after.ReadAt = nil, nil
 	if !reflect.DeepEqual(before, after) {
 		if err != nil {

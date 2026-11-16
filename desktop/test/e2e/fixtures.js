@@ -19,10 +19,15 @@ const FAKE = path.join(DESKTOP, 'test', 'fixtures', 'fake-server.js');
 const GO_BIN = path.join(DESKTOP, '.e2e-tmp', 'bin', process.platform === 'win32' ? 'lectureflow.exe' : 'lectureflow');
 const APP_URL = /^http:\/\/127\.0\.0\.1:\d+\/(#.*)?$/;
 
+// cleanEnv: the caller's environment without the app's own variables and
+// without any variable whose name ends in _API_KEY (DEEPSEEK_API_KEY and
+// the other model service keys): the app under test would otherwise offer
+// the caller's real key (GET /api/onboarding/env-keys). A test that wants
+// one passes it in launch({ env }). The values are never read.
 function cleanEnv() {
   const env = { ...process.env };
   for (const k of Object.keys(env)) {
-    if (/^(LECTUREFLOW_|FAKE_|ELECTRON_RUN_AS_NODE$)/i.test(k)) delete env[k];
+    if (/^(LECTUREFLOW_|FAKE_|ELECTRON_RUN_AS_NODE$)|_API_KEY$/i.test(k)) delete env[k];
   }
   return env;
 }

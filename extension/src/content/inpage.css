@@ -46,7 +46,12 @@
   padding: var(--sp-6);
   border: 1px solid var(--border-2); border-radius: var(--r-lg);
   background: var(--bg-card);
+  /* the send button sticks to the card's bottom edge (ui/card.css .send):
+     no bottom padding on what scrolls; the content keeps the space */
+  padding-bottom: 0;
+  --send-bg: var(--bg-card);
 }
+.ip-card-body > .lf-card { padding-bottom: var(--sp-6); }
 .ip-card-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); margin-bottom: var(--sp-5); }
 .ip-card-head h2 { font-size: var(--fs-md); font-weight: 600; }
 .ip-close { width: 28px; height: 28px; padding: 0; justify-content: center; }

@@ -134,6 +134,7 @@ test('dropped or chosen files resolve to their paths on disk', async ({ launch }
 });
 
 test('navigation away from the service is blocked; web links go to the system browser', async ({ launch }) => {
+  test.setTimeout(120_000); // about 12 s of waiting for the link limit's window
   const { app, page } = await launch();
   const start = await waitForApp(page);
   await app.evaluate(({ shell }) => {
@@ -151,12 +152,18 @@ test('navigation away from the service is blocked; web links go to the system br
   await page.evaluate(() => { location.href = 'ms-settings:privacy'; }).catch(() => {});
   await page.evaluate(() => { window.open('mailto:lecturer@uni.example?subject=CSC1003', '_blank', 'noopener'); });
   await page.waitForTimeout(700);
+  // A fourth link within 10 s is dropped (one limit for every link to the
+  // system browser: 3 in 10 s, security audit FB1 L-6 / review R44) ...
+  await page.evaluate(() => { location.href = 'mailto:office@uni.example'; }).catch(() => {});
+  await page.waitForTimeout(1000);
+  const threeFirst = ['https://example.com/', 'https://example.org/x', 'mailto:lecturer@uni.example?subject=CSC1003'];
+  expect(await app.evaluate(() => globalThis.__opened)).toEqual(threeFirst);
+  // ... and goes through once the first ones have left the window.
+  await page.waitForTimeout(10_500);
   await page.evaluate(() => { location.href = 'mailto:office@uni.example'; }).catch(() => {});
   await page.waitForTimeout(1000);
   expect(new URL(page.url()).origin).toBe(start.origin);
-  expect(await app.evaluate(() => globalThis.__opened)).toEqual([
-    'https://example.com/', 'https://example.org/x', 'mailto:lecturer@uni.example?subject=CSC1003', 'mailto:office@uni.example',
-  ]);
+  expect(await app.evaluate(() => globalThis.__opened)).toEqual([...threeFirst, 'mailto:office@uni.example']);
   expect(app.windows().length).toBe(1);
   expect(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length)).toBe(1);
 });

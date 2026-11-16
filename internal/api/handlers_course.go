@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"lectureflow/internal/calendar"
+	"lectureflow/internal/ctxbuild"
 	"lectureflow/internal/db"
 	"lectureflow/internal/glossary"
 	"lectureflow/internal/model"
@@ -37,10 +39,20 @@ func (s *Server) listCourses(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	// the per-course data of every course at once (course_reads.go)
+	ids := make([]string, len(cs))
+	for i, c := range cs {
+		ids[i] = c.ID
+	}
+	rd, err := s.readCourses(r.Context(), ids, true)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	janitor := s.janitorConfigured(r.Context())
 	out := make([]Course, 0, len(cs))
 	for _, c := range cs {
-		v, err := s.courseViewJobs(r.Context(), c, ix, janitor)
+		v, err := s.courseViewJobs(r.Context(), c, ix, janitor, rd)
 		if err != nil {
 			s.fail(w, r, err)
 			return
@@ -300,6 +312,10 @@ func (s *Server) uploadSyllabus(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, notFoundAs(err, "course.not_found"))
 		return
 	}
+	if err := checkRecordIDs(courseID); err != nil { // record_dir.go
+		s.fail(w, r, err)
+		return
+	}
 	if s.glossarySeedRunning(ctx, courseID) {
 		writeError(w, http.StatusConflict, syllabusBusy, nil)
 		return
@@ -391,6 +407,10 @@ func (s *Server) uploadMaterial(w http.ResponseWriter, r *http.Request) {
 	c, err := s.st.GetCourse(ctx, courseID)
 	if err != nil {
 		s.fail(w, r, notFoundAs(err, "course.not_found"))
+		return
+	}
+	if err := checkRecordIDs(courseID); err != nil { // record_dir.go
+		s.fail(w, r, err)
 		return
 	}
 	if err := s.checkSpace(r); err != nil {
@@ -599,13 +619,32 @@ func (s *Server) deleteMaterial(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	if err := os.RemoveAll(model.MaterialDir(s.dataDir, m.CourseID, m.ID)); err != nil {
-		s.logWarn("remove material dir", m.ID, err)
-	}
+	s.removeMaterialDir(m)
 	s.materialSetsChanged(m.CourseID)
 	s.kick()
 	s.hub.Changed("course", m.CourseID)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// removeMaterialDir removes the directory of material m (the row is gone
+// already, §4.6: database first). The ids come from the database, which an
+// imported library supplies (AUD1 M-1), so the directory is removed only
+// when it is the material's own (removableRecordDir: the course and
+// material ids single path elements — no separator, not "." or ".." —, the
+// directory strictly inside data_dir, and named exactly like the material,
+// not a sibling "own" for the material "OWN"; the same rule the lecture
+// deletion applies). Anything else is logged and left alone.
+func (s *Server) removeMaterialDir(m model.Material) {
+	p := model.MaterialDir(s.dataDir, m.CourseID, m.ID)
+	if !s.removableRecordDir(p, m.CourseID, m.ID) {
+		if _, err := os.Lstat(p); err == nil || checkRecordIDs(m.CourseID, m.ID) != nil {
+			slog.Warn("refusing to remove a material directory outside its place", "material", m.ID, "path", p)
+		}
+		return
+	}
+	if err := os.RemoveAll(p); err != nil {
+		s.logWarn("remove material dir", m.ID, err)
+	}
 }
 
 // POST /api/materials/{id}/stages/{stage}/{action} (NOTES.md D).
@@ -695,6 +734,15 @@ func (s *Server) createTerm(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "term.en_empty", nil)
 		return
 	}
+	// the length limits of an extracted term (AUD5 low-1)
+	switch {
+	case ctxbuild.TermTooLong(en, ""):
+		writeError(w, http.StatusBadRequest, "upload.field_too_long", map[string]any{"field": "en"})
+		return
+	case ctxbuild.TermTooLong("", req.Zh):
+		writeError(w, http.StatusBadRequest, "upload.field_too_long", map[string]any{"field": "zh"})
+		return
+	}
 	if _, err := s.st.GetCourse(ctx, courseID); err != nil {
 		s.fail(w, r, notFoundAs(err, "course.not_found"))
 		return
@@ -752,6 +800,9 @@ func (s *Server) patchTerm(w http.ResponseWriter, r *http.Request) {
 		return
 	case req.Tier != nil && *req.Tier != model.TierEnforce && *req.Tier != model.TierReference:
 		writeError(w, http.StatusBadRequest, "term.bad_tier", nil)
+		return
+	case req.Zh != nil && ctxbuild.TermTooLong("", *req.Zh): // as createTerm (AUD5 low-1)
+		writeError(w, http.StatusBadRequest, "upload.field_too_long", map[string]any{"field": "zh"})
 		return
 	}
 	var t model.Term

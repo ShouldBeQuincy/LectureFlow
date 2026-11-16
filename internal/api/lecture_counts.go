@@ -26,12 +26,22 @@ func (s *Server) counter() db.Counter {
 // lectureCounts returns the counts of the lectures ids for their views
 // (lectureInfo.counts); nil without a db.Counter, and lectureViewJobs then
 // reads each lecture itself (lectureCountsOne).
+// Each id is asked once (R77 info-1: the dashboard may list a lecture twice,
+// and the store adds the sentence counts of an id met in two chunks).
 func (s *Server) lectureCounts(ctx context.Context, ids []string) (map[string]db.LectureCounts, error) {
 	c := s.counter()
 	if c == nil || len(ids) == 0 {
 		return nil, nil
 	}
-	return c.LectureCounts(ctx, ids)
+	seen := make(map[string]bool, len(ids))
+	uniq := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if !seen[id] {
+			seen[id] = true
+			uniq = append(uniq, id)
+		}
+	}
+	return c.LectureCounts(ctx, uniq)
 }
 
 // countsFor is the entry of id in m, nil when m has none.

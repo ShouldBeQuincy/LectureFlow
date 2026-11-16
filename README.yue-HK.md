@@ -103,10 +103,11 @@ LectureFlow 係一個喺你自己部電腦度行嘅講課工具。將堂課嘅�
 ## 私隱
 
 - **錄音同轉寫全部喺你自己部電腦度完成**，乜都唔會上載。
-- 只有喺你設定咗模型服務之後，轉寫出嚟嘅文字先會傳去**你自己揀**嘅服務商，用嚟修正、做摘要同翻譯；你亦可以揀「淨係轉寫」，完全唔用任何網上服務。
+- 只有喺你設定咗模型服務之後，轉寫出嚟嘅文字先會傳去**你自己揀**嘅服務商，用嚟修正、做摘要同翻譯；整理講座標題嗰陣，仲會連同摘要傳埋講座嘅原始檔名（由瀏覽器擴充功能送過嚟嘅講座，就係頁面或者平台上面嘅標題）。你亦可以揀「淨係轉寫」，完全唔用任何網上服務。
 - 用 Google Colab 後端嘅時候，錄音會上載去 Google 嘅伺服器，揀嘅時候會清楚提你。LectureFlow 亦會用你自己嘅授權，向 Google 查你 Colab 帳戶仲有幾多運算單元、可以借邊啲 GPU；淨係喺用緊執行階段嘅時候，先會讀佢嘅記憶體同 GPU 讀數，顯示喺資源欄。
 - 儲低咗嘅 API key 同 Colab 授權，會用系統帳戶嘅憑證保護（Windows 嘅 DPAPI、macOS 嘅鑰匙圈）加密存放。將資料目錄搬去另一部電腦或者另一個系統帳戶之後，要重新輸入。
 - LectureFlow 唔會收集任何使用數據，冇遙測，唔使開帳戶。
+- 網頁模式（唔經桌面版，直接執行伺服器程式再用瀏覽器打開）冇存取碼，呢部電腦上面嘅其他帳戶或者程式都可以存取佢（佢只會監聽本機地址，區域網絡入面嘅其他電腦存取唔到）；幾個人共用嘅電腦，請用桌面版。
 - 瀏覽器擴充功能淨係同你部電腦入面嘅 LectureFlow 溝通，只會喺你送堂入去嘅時候先讀錄播網站嘅 Cookie，詳情睇[擴充功能私隱聲明](docs/extension/privacy.md)。
 
 ## 轉寫後端
@@ -144,7 +145,7 @@ LectureFlow 係一個喺你自己部電腦度行嘅講課工具。將堂課嘅�
 
 ## 點樣開始
 
-1. 喺 [Releases](https://github.com/ShouldBeQuincy/LectureFlow/releases) 下載啱你系統嘅安裝檔：Windows 用 `LectureFlow-Setup-3.2.0-x64.exe`（或者免安裝版），Apple Silicon Mac 用 `LectureFlow-3.2.0-arm64.dmg`。新版有咩唔同，睇[發佈說明](docs/release-notes/3.2.0.md)。
+1. 喺 [Releases](https://github.com/ShouldBeQuincy/LectureFlow/releases) 下載啱你系統嘅安裝檔：Windows 用 `LectureFlow-Setup-3.3.0-x64.exe`（或者免安裝版），Apple Silicon Mac 用 `LectureFlow-3.3.0-arm64.dmg`。新版有咩唔同，睇[發佈說明](docs/release-notes/3.3.0.md)。
 2. 安裝檔暫時未有程式碼簽署，系統會彈出安全提示，點樣放行可以睇 [docs/install.md](docs/install.md)。
 3. 打開 LectureFlow，跟住導引行幾步：揀語言、檢查電腦、揀收費方案、下載組件。每一步都可以跳過，遲啲再返嚟。
 4. 加一科：填返科目名稱同開課日期，可以順手貼埋課程大綱、上載簡報（唔係必須，但會明顯令專業術語準啲）。

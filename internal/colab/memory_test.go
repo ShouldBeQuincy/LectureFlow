@@ -50,7 +50,7 @@ type dialAt struct{ verified, released bool }
 
 func (w *remoteWatch) written() bool {
 	got, err := os.ReadFile(filepath.Join(w.outDir, "result.json"))
-	return err == nil && string(got) == w.want
+	return err == nil && sameResult(got, w.want)
 }
 
 func (w *remoteWatch) dial(base Dialer) Dialer {
@@ -140,7 +140,7 @@ func runAndRelease(t *testing.T, e *testEnv) string {
 	if err != nil {
 		t.Fatalf("Transcribe: %v", err)
 	}
-	if got, _ := os.ReadFile(path); string(got) != e.rs.vars["result_json"] {
+	if got, _ := os.ReadFile(path); !sameResult(got, e.rs.vars["result_json"]) {
 		t.Fatal("result.json differs from the download")
 	}
 	if st := e.b.Status(ctx); st.State != StateRunning {
@@ -300,6 +300,7 @@ func TestMemoryProbeViolation(t *testing.T) {
 	if Code(err) != CodeContractViolation || !IsFallback(err) {
 		t.Fatalf("err %v", err)
 	}
+	e.b.handbacksSettled() // v3.2.x: the runtime goes in the background
 	if st := e.b.Status(ctx); st.State != StateReleased || st.LastRelease.Reason != ReleaseFailed {
 		t.Errorf("status %+v", st)
 	}

@@ -80,7 +80,7 @@ func TestColabObsSettingsWiring(t *testing.T) {
 	src := readWeb(t, "settings_colab.js")
 	for _, want := range []string{
 		"function accountRow()", "authed ? accountRow() : null", "'/api/colab/account/refresh'", "fkey: 'set:colab:recheck'",
-		"role: 'radiogroup'", "type: 'radio'", "disabled: !!lock || !!saving", "lockText(lock)", "fkey: `set:colab:accel:${x}`",
+		"role: 'radiogroup'", "type: 'radio'", "disabled: !!lock || !!saving", "lockLine(lock)", "const s = lockText(reason);", "fkey: `set:colab:accel:${x}`",
 		"settings.colab.locked_note", "s.accelerator_chosen && s.accelerator !== eff", "effectiveAccel(view.status)",
 	} {
 		if !strings.Contains(src, want) {
@@ -164,7 +164,7 @@ func TestColabObsLogic(t *testing.T) {
 		t.Fatal(err)
 	}
 	url := "file:///" + strings.TrimPrefix(filepath.ToSlash(dir), "/") + "/"
-	out, err := exec.Command(node, filepath.Join("testdata", "colab_obs_test.mjs"), url).CombinedOutput()
+	out, err := runNode(t, node, "colab_obs_test.mjs", url)
 	if err != nil || !strings.Contains(string(out), "colab-obs checks: ok") {
 		t.Fatalf("colab_obs_test.mjs: %v\n%s", err, out)
 	}

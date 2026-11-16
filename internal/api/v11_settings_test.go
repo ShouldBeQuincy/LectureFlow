@@ -86,6 +86,10 @@ func TestSettingsAndProvidersNeverReturnKeys(t *testing.T) {
 	if pv.KeyHint != "sk-…abcd" || pv.Type != model.ProviderAnthropic || pv.MaxConcurrency != 2 || pv.UsedByRoles == nil || pv.Models == nil {
 		t.Fatalf("created %+v", pv)
 	}
+	// the translate batch an empty role setting means on it (user 2026-11-11)
+	if pv.DefaultBatchClaude != settings.DefaultAnthropicBatch {
+		t.Errorf("anthropic default_batch_claude %d, want %d", pv.DefaultBatchClaude, settings.DefaultAnthropicBatch)
+	}
 	r.next(3*time.Second, func(f sseFrame) bool { return f.event == "changed" && strings.Contains(f.data, `"settings"`) })
 	call("PATCH", "/api/providers/"+pv.ID, ProviderInput{Name: ptr("Claude 2"), APIKey: ptr("")}, http.StatusOK, &pv)
 	if p, _ := e.set.Provider(pv.ID); p.APIKey != secret || p.Name != "Claude 2" {

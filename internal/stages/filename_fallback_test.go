@@ -4,12 +4,16 @@
 package stages
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"lectureflow/internal/calendar"
+	"lectureflow/internal/llm"
 	"lectureflow/internal/llm/llmtest"
 	"lectureflow/internal/model"
+	"lectureflow/internal/sched"
 )
 
 // weekdayMissedRegex is the kind of answer seen in the v3 acceptance: the
@@ -136,5 +140,68 @@ func TestFilenameRuleFallbackNotUsedOnAcceptedRule(t *testing.T) {
 	}
 	if rule.Regex != llmtest.PanoptoRegex {
 		t.Errorf("regex %s", rule.Regex)
+	}
+}
+
+// A refused filename-rule request (Claude's stop_reason refusal, an
+// OpenAI-compatible content filter) is handled like an unusable answer:
+// asked once, the built-in Panopto pattern applied, the names recorded so
+// they do not trigger again (review R25 B-1).
+func TestFilenameRuleRefusalFallsBack(t *testing.T) {
+	for _, name := range []string{"anthropic", "openai"} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.organizerRoles()
+			var d Deps
+			var count func() int
+			if name == "anthropic" {
+				fake := &scriptLLM{fn: func(context.Context, int, llmCall) (string, error) { return "", refusedErr() }}
+				d = e.deps(fake)
+				count = func() int { return len(fake.calls) }
+			} else {
+				d = e.deps(nil)
+				e.fake.FailNext(llmtest.RoleFilenameRule, 1, llmtest.FailRefusal)
+				count = func() int { return e.fake.Count(llmtest.RoleFilenameRule) }
+			}
+			l := e.upload("CSC1003 Lecture Wed Oct 07 09-35-00 BST 2026.mp4", lt(2026, 10, 24, 18, 5))
+			r := e.runFilenameRule(d)
+			if r.err != nil || r.job.Status != model.StatusDone {
+				t.Fatalf("err %v job %s", r.err, r.job.Status)
+			}
+			if n := count(); n != 1 {
+				t.Errorf("%d requests, want 1 (a refusal is not asked again)", n)
+			}
+			var rule calendar.FilenameRule
+			if raw := e.courseRow().FilenameRule; raw == nil || json.Unmarshal([]byte(*raw), &rule) != nil || rule.Regex != panoptoFallbackRegex {
+				t.Fatalf("fallback rule not applied: %+v", rule)
+			}
+			if got := e.lec(l.ID); ptrStr(got.RecordedAt) != "2026-10-07T09:35" {
+				t.Errorf("recorded_at %s", ptrStr(got.RecordedAt))
+			}
+			if s := e.samplesUsed(); len(s) != 1 {
+				t.Errorf("samples used %v", s)
+			}
+		})
+	}
+}
+
+// A refusal on names the built-in pattern does not fit: the names are
+// recorded all the same and the job fails with the refusal (llm.refusal,
+// permanent), not as an unusable answer.
+func TestFilenameRuleRefusalWithoutFallback(t *testing.T) {
+	e := newEnv(t)
+	e.organizerRoles()
+	fake := &scriptLLM{fn: func(context.Context, int, llmCall) (string, error) { return "", refusedErr() }}
+	d := e.deps(fake)
+	e.upload("CS101_2026-10-06_1000.mp4", lt(2026, 10, 24, 18, 0))
+	r := e.runFilenameRule(d)
+	if !errors.Is(r.err, llm.ErrRefusal) || !sched.IsPermanent(r.err) || jobErrorCode(r.job) != llm.CodeRefusal {
+		t.Fatalf("err %v job %s %v", r.err, r.job.Status, r.job.Error)
+	}
+	if len(fake.calls) != 1 {
+		t.Errorf("%d requests", len(fake.calls))
+	}
+	if s := e.samplesUsed(); len(s) != 1 {
+		t.Errorf("samples used %v", s)
 	}
 }

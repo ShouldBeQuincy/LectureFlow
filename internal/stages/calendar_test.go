@@ -6,11 +6,13 @@ package stages
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"lectureflow/internal/calendar"
 	"lectureflow/internal/db"
+	lfmedia "lectureflow/internal/media"
 	"lectureflow/internal/model"
 )
 
@@ -384,6 +386,31 @@ func TestFilenameRuleTitleOnlyForFilenameSource(t *testing.T) {
 				if ptrStr(l.RecordedAt) != c.at || l.RecordedAtSource != model.RecordedAtFilename {
 					t.Errorf("%s: recorded_at %s (%s), want %s from the file name", c.title, ptrStr(l.RecordedAt), l.RecordedAtSource, c.at)
 				}
+			}
+		})
+	}
+}
+
+// A title the file-name rule captures is stored like every title
+// (lfmedia.CleanTitle, test-media I8): at most 200 characters, also when
+// the file name gives a longer one, on both the resolve and the apply path.
+func TestFilenameRuleTitleCapped(t *testing.T) {
+	long := strings.Repeat("x", 230)
+	want := strings.Repeat("x", lfmedia.MaxTitleRunes)
+	for _, via := range []string{"resolve", "apply"} {
+		t.Run(via, func(t *testing.T) {
+			e := newEnv(t)
+			d := e.deps(nil)
+			l := e.upload("CS101_2026-10-06_1000_"+long+".mp4", lt(2026, 10, 20, 15, 0))
+			switch via {
+			case "resolve":
+				e.setRule(ruleCS101, calendar.RuleSourceLLM)
+				e.must(ResolveRecordedAt(e.ctx, d, l.ID, nil))
+			case "apply":
+				e.must(ApplyFilenameRule(e.ctx, d, e.course.ID, calendar.FilenameRule{Regex: ruleCS101, Source: calendar.RuleSourceUser}))
+			}
+			if got := e.lec(l.ID); got.Title != want || got.TitleSource != model.TitleSourceFilename {
+				t.Errorf("title %q (%d characters, %s), want %d x (filename)", got.Title, len([]rune(got.Title)), got.TitleSource, lfmedia.MaxTitleRunes)
 			}
 		})
 	}

@@ -10,6 +10,10 @@
 //	    [-tag v3.2.0] [-channel stable|beta] [-released-at 2026-11-02T10:00:00Z]
 //	    [-min-version 3.0.0] [-notes-url URL] [-mirror PREFIX=REPLACE ...]
 //	    [-allow-missing] [-out DIR/update.json]
+//	go run ./scripts/release/make-update-json -verify update.json -dir DIR -tag v3.2.0 [-channel stable|beta] [-allow-mirrors]
+//
+// -verify checks an update.json against local packages before it is signed
+// (verify.go); sign-update.sh / sign-update.ps1 run it.
 //
 // The packages are found by their names:
 //
@@ -76,8 +80,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.Var(&mirrors, "mirror", "mirror rule PREFIX=REPLACE (repeatable)")
 	fs.BoolVar(&o.allowMissing, "allow-missing", false, "accept a release without every package")
 	fs.StringVar(&o.out, "out", "", "output file (default <dir>/update.json)")
+	allowMirrors := fs.Bool("allow-mirrors", false, "with -verify: accept mirror rules in update.json (they are printed)")
+	verify := fs.String("verify", "", "check this update.json against the packages in -dir and -tag instead of writing one (before signing)")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if *verify != "" {
+		if o.version != "" || o.repo != "" || fs.NArg() > 0 {
+			fmt.Fprintln(stderr, "make-update-json: -verify takes -dir, -tag and -channel only (the repository is selfupdate.Repo)")
+			return 2
+		}
+		return runVerify(*verify, o.dir, o.tag, o.channel, *allowMirrors, stdout, stderr)
 	}
 	if o.dir == "" || o.version == "" || o.repo == "" || fs.NArg() > 0 {
 		fmt.Fprintln(stderr, "make-update-json: -dir, -version and -repo are required")

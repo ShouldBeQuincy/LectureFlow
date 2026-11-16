@@ -1018,20 +1018,41 @@ func (s *sqlStore) ListCurrentJobs(ctx context.Context, scope, scopeID string) (
 }
 
 func (s *sqlStore) ListCurrentJobsByStatus(ctx context.Context, statuses ...string) ([]model.Job, error) {
+	return s.listCurrentJobsByStatus(ctx, nil, statuses...)
+}
+
+func (s *sqlStore) ListScanJobs(ctx context.Context, draftHeld []string) ([]model.Job, error) {
+	return s.listCurrentJobsByStatus(ctx, draftHeld, model.StatusPending, model.StatusQueued)
+}
+
+// listCurrentJobsByStatus is ListCurrentJobsByStatus leaving out the
+// pending jobs of draft lectures whose stage is in draftHeld (ListScanJobs).
+func (s *sqlStore) listCurrentJobsByStatus(ctx context.Context, draftHeld []string, statuses ...string) ([]model.Job, error) {
 	if len(statuses) == 0 {
 		return nil, nil
 	}
 	cols := strings.ReplaceAll("j."+jobCols, ", ", ", j.")
+	args := make([]any, 0, len(statuses)+len(draftHeld)+2)
+	for _, st := range statuses {
+		args = append(args, st)
+	}
+	drafts := ""
+	if len(draftHeld) > 0 {
+		// l.id IS NOT NULL: a job whose lecture row is missing stays listed
+		// (the scan reports its lookup error as before).
+		drafts = ` AND NOT (j.status = ? AND j.scope = ? AND l.id IS NOT NULL AND l.launched_at IS NULL
+			AND j.stage IN (` + placeholders(len(draftHeld)) + `))`
+		args = append(args, model.StatusPending, model.ScopeLecture)
+		for _, st := range draftHeld {
+			args = append(args, st)
+		}
+	}
 	q := `SELECT ` + cols + ` FROM job j
 		LEFT JOIN lecture l ON j.scope = 'lecture' AND l.id = j.scope_id
 		LEFT JOIN material m ON j.scope = 'material' AND m.id = j.scope_id
 		LEFT JOIN course c ON j.scope = 'course' AND c.id = j.scope_id
-		WHERE j.is_current = 1 AND j.status IN (` + placeholders(len(statuses)) + `)
+		WHERE j.is_current = 1 AND j.status IN (` + placeholders(len(statuses)) + `)` + drafts + `
 		ORDER BY COALESCE(l.created_at, m.created_at, c.created_at, j.created_at), j.scope_id, j.created_at, j.id`
-	args := make([]any, len(statuses))
-	for i, st := range statuses {
-		args[i] = st
-	}
 	rows, err := s.q.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -1139,7 +1160,7 @@ func (s *sqlStore) GetKV(ctx context.Context, key string) (string, bool, error) 
 func (s *sqlStore) SetKV(ctx context.Context, key, value string) error {
 	if isSealedKV(key) { // cred-enc: sealed at rest (sealed.go)
 		var err error
-		if value, err = sealStored(value); err != nil {
+		if value, err = sealKV(key, value); err != nil {
 			return err
 		}
 	}

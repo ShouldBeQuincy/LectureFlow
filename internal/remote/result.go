@@ -139,7 +139,9 @@ func ValidateResult(raw []byte, audioMS int64) ([]byte, *Result, error) {
 		return nil, nil, refuse("too many sentences")
 	}
 	if audioMS <= 0 {
-		audioMS = math.MaxInt64 / 4
+		// without the audio's length the times would have no upper bound
+		// (SEC41 L4); the asr stage sends no such lecture to a remote
+		return nil, nil, refuse("audio length")
 	}
 	limit := audioMS + ResultTimeSlackMS
 	prevStart := int64(-1)
@@ -319,10 +321,16 @@ func checkSentence(raw json.RawMessage, limit int64) (ResultSentence, error) {
 	return s, nil
 }
 
-// cleanControl drops control and format characters (tabs and newlines
-// become spaces).
+// cleanControl drops control and format characters from the text of a
+// sentence or a word (tabs and newlines become spaces). ZWNJ (U+200C) and
+// ZWJ (U+200D) stay: they are part of the text in Persian, Hindi and other
+// scripts and of emoji sequences, which a local transcript keeps too
+// (SEC41 L3); the bidi controls (U+061C among them), U+200B, U+2060–U+206F
+// and the BOM go.
+// Identifier-like strings (CleanText) keep the stricter rule.
 func cleanControl(s string) string {
-	if !strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 || (r >= 0x7f && r < 0xa0) || isFormatRune(r) }) {
+	drop := func(r rune) bool { return r < 0x20 || (r >= 0x7f && r < 0xa0) || isTextFormatRune(r) }
+	if !strings.ContainsFunc(s, drop) {
 		return s
 	}
 	var b strings.Builder
@@ -330,12 +338,18 @@ func cleanControl(s string) string {
 		switch {
 		case r == '\t' || r == '\n' || r == '\r':
 			b.WriteByte(' ')
-		case r < 0x20 || (r >= 0x7f && r < 0xa0) || isFormatRune(r):
+		case drop(r):
 		default:
 			b.WriteRune(r)
 		}
 	}
 	return b.String()
+}
+
+// isTextFormatRune is isFormatRune without the joiners ZWNJ and ZWJ, for
+// the text of sentences and words (cleanControl).
+func isTextFormatRune(r rune) bool {
+	return isFormatRune(r) && r != 0x200c && r != 0x200d
 }
 
 // checkTiming keeps the timing block's numbers and booleans (and objects of

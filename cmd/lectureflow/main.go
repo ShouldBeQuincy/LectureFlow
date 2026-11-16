@@ -139,6 +139,30 @@ type cliOptions struct {
 	// package into a new private directory there (sec-update M2, M3).
 	SelfUpdatePrevious bool
 	SelfUpdateCopy     string
+	// SelfUpdatePrivate: check nothing but the data directory's
+	// permissions and make an empty private directory in SelfUpdateCopy:
+	// the shell copies a backup of the installation there and checks its
+	// hash before a rollback uses it (security audit M-3).
+	SelfUpdatePrivate bool
+	// SelfUpdateTrustDir: the directory the shell keeps its record of the
+	// installation and the backups in (Windows: outside the data
+	// directory); checked too (selfupdate.CheckTrustDir), every mode.
+	// SelfUpdateTrustCheck: check nothing else (ok trusted).
+	SelfUpdateTrustDir   string
+	SelfUpdateTrustCheck bool
+	// SelfUpdateInstallDir: the installation directory (the Windows
+	// installation set up by the installer; security audit M-4); checked
+	// too (selfupdate.CheckInstallDir), every mode.
+	SelfUpdateInstallDir string
+	// InstallDir, desktop mode: the installation directory the shell names
+	// (as SelfUpdateInstallDir; "" = none: development, the portable build,
+	// macOS). The diagnostics' install_dir row and the in-app update look at
+	// it.
+	InstallDir string
+	// NoSelfUpdate, desktop mode (-no-self-update): the desktop shell found
+	// that this copy of the app cannot replace itself (lib/updatefiles.js
+	// describeInstallation: unsupported); selfupdate.Options.NoInstall.
+	NoSelfUpdate bool
 	// DataKeyStdin: the line after the token is the data key of the stored
 	// credentials (the macOS desktop shell keeps it in the Keychain;
 	// secrets_setup.go).
@@ -162,9 +186,15 @@ func parseArgs(args []string, stderr io.Writer) (cliOptions, error) {
 	fs.StringVar(&o.LauncherBlocked, "launcher-blocked", "", "desktop mode on macOS: why there is no -launcher (translocated | dmg: the app runs from a place that disappears; the diagnostics ask to move it to Applications)")
 	fs.BoolVar(&o.Portable, "portable", false, "portable build: copy the browser extension's host to a stable place before registering it")
 	fs.StringVar(&o.NMEndpoint, "nm-endpoint", "", "browser extension endpoint: a named pipe or a socket path, \"off\" = none (default: LECTUREFLOW_NM_ENDPOINT, else per user)")
-	fs.StringVar(&o.SelfUpdateVerify, "selfupdate-verify", "", "verify the pending update of this updates directory with the built-in key, print one line and exit (0 valid, 1 invalid, 2 not configured, 3 other accounts can change the data directory)")
+	fs.StringVar(&o.SelfUpdateVerify, "selfupdate-verify", "", "verify the pending update of this updates directory with the built-in key, print one line and exit (0 valid, 1 invalid, 2 not configured, 3 other accounts can change the data directory or the installation)")
 	fs.BoolVar(&o.SelfUpdatePrevious, "selfupdate-previous", false, "with -selfupdate-verify: verify the package of previous.json (the version a rollback returns to) instead")
 	fs.StringVar(&o.SelfUpdateCopy, "selfupdate-copy", "", "with -selfupdate-verify: copy the package, while hashing it, into a new private directory in this directory and name it on the ok line (copy=<path>)")
+	fs.BoolVar(&o.SelfUpdatePrivate, "selfupdate-private", false, "with -selfupdate-verify and -selfupdate-copy: verify no package; check the data directory's permissions, make an empty private directory in the -selfupdate-copy directory and name it (ok private=<path>)")
+	fs.StringVar(&o.SelfUpdateTrustDir, "selfupdate-trust-dir", "", "with -selfupdate-verify: the directory the desktop shell keeps its update record in; refused (exit 3) unless it lies outside the data directory and only this account can change it (made privately when missing)")
+	fs.StringVar(&o.SelfUpdateInstallDir, "selfupdate-install-dir", "", "with -selfupdate-verify: the installation directory; refused (exit 3, untrusted_install_dir) unless only this account (and the system) can change it and every folder above it stays in its place")
+	fs.StringVar(&o.InstallDir, "install-dir", "", "desktop mode: the installation directory set up by the Windows installer (the diagnostics and the in-app update check who else can change it)")
+	fs.BoolVar(&o.NoSelfUpdate, "no-self-update", false, "desktop mode: this copy of the app cannot replace itself (an unpacked or copied folder, not the installer's installation or the portable build): the in-app update only tells about new versions; a pending update in the data directory is another copy's")
+	fs.BoolVar(&o.SelfUpdateTrustCheck, "selfupdate-trust-check", false, "with -selfupdate-verify: verify no package; check the data directory's permissions (and -selfupdate-trust-dir) only (ok trusted)")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -275,7 +305,8 @@ func runMain(env runEnv) int {
 	desktop = opts.Desktop
 	if opts.SelfUpdateVerify != "" {
 		return runSelfUpdateVerify(selfUpdateVerifyArgs{Dir: opts.SelfUpdateVerify, Current: opts.AppVersion,
-			Previous: opts.SelfUpdatePrevious, CopyDir: opts.SelfUpdateCopy}, env.stdout)
+			Previous: opts.SelfUpdatePrevious, CopyDir: opts.SelfUpdateCopy, Private: opts.SelfUpdatePrivate,
+			TrustDir: opts.SelfUpdateTrustDir, TrustCheck: opts.SelfUpdateTrustCheck, InstallDir: opts.SelfUpdateInstallDir}, env.stdout)
 	}
 
 	stop := newStopper()
@@ -326,7 +357,8 @@ func runMain(env runEnv) int {
 	if err := os.MkdirAll(filepath.Join(cfg.DataDir, "logs"), 0o755); err != nil {
 		return fail(err)
 	}
-	logFile, err := os.OpenFile(filepath.Join(cfg.DataDir, "logs", "lectureflow.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	// Rotated by size (logrotate.go, T067): lectureflow.log.1 … .5.
+	logFile, err := newRotatingLog(filepath.Join(cfg.DataDir, "logs", "lectureflow.log"), logRotateMaxBytes, logRotateKeep)
 	if err != nil {
 		return fail(err)
 	}
@@ -367,12 +399,14 @@ func runMain(env runEnv) int {
 	appOpts := env.appOpts
 	appOpts.Version = opts.AppVersion
 	appOpts.Portable = opts.Portable
+	appOpts.NoSelfUpdate = opts.NoSelfUpdate
 	if opts.Desktop {
 		appOpts.Desktop = &api.DesktopOptions{
 			Token:        token,
 			Port:         port,
 			ResourcesDir: cfg.ResourcesDir,
 			LocationFile: absOrEmpty(opts.LocationFile),
+			InstallDir:   opts.InstallDir, // as named: a relative path is not vouched for
 			Shutdown:     func() { stop.request(exitOK) },
 			Restart:      func() { stop.request(exitRestart) },
 		}
@@ -453,7 +487,9 @@ func runMain(env runEnv) int {
 	}
 
 	slog.Info("shutting down", "exit_code", code)
-	withLimit(shutdownLimit, code, env.exit, func(deadline time.Time) {
+	// A stop past the limit dumps the goroutines into the log file only
+	// (stopdump.go, T063).
+	withLimit(shutdownLimit, code, env.exit, logFile, func(deadline time.Time) {
 		nm.Close() // no new extension requests while the app stops
 		app.Shutdown(deadline, srv)
 		cancel()
@@ -465,10 +501,14 @@ func runMain(env runEnv) int {
 // withLimit runs the graceful stop f under the hard limit of SPEC-v3 V1.1:
 // when f has not returned after limit, exit(code) ends the process at once
 // (the interrupted jobs are left to startup recovery, §4.7). f gets a
-// deadline a little before the limit for its own bounded waits.
-func withLimit(limit time.Duration, code int, exit func(int), f func(deadline time.Time)) {
+// deadline a little before the limit for its own bounded waits. Before that
+// exit, the stacks of all goroutines go to dump (nil: none), so a stop that
+// hangs shows where (test-upgrade F8); a stop within the limit writes
+// nothing there.
+func withLimit(limit time.Duration, code int, exit func(int), dump io.Writer, f func(deadline time.Time)) {
 	watchdog := time.AfterFunc(limit, func() {
 		slog.Warn("graceful stop exceeded its time limit: exiting now", "limit", limit)
+		writeStackDump(dump, limit, stackDumpMaxBytes)
 		exit(code)
 	})
 	defer watchdog.Stop()

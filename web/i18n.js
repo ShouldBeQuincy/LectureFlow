@@ -96,9 +96,77 @@ function pluralRules(locale) {
   return plurals[locale];
 }
 
+// {name:lc} (round 9, T28 suggestion 10): the value of a string param with
+// the first letter of each word that starts with a capital letter of a
+// script other than Latin followed by a small letter (Cyrillic "Ждёт",
+// "Перевод") lower-cased in the UI language, for a fragment (a stage's name,
+// what a stage waits for, why a lecture is out of date) placed after a colon
+// or a dash of a Russian template: "Расшифровка: ждёт …", a list joined
+// before ("этапы: исправление, перевод, экспорт"). Everything else is left
+// as it is: words that start with a Latin letter ("LLM", "Colab",
+// "DeepSeek"), all-capital abbreviations ("ГПУ"), numbers, a param that is
+// not a string. A fragment shown alone keeps its capital, so the modifier is
+// the translator's, in templates whose fragments name nothing proper in
+// such a script. The test of web/i18n_check_test.go counts {name:lc} as
+// {name}, and knows no other modifier: {name:other} is left as written.
+// The ru catalog's first use (round 9) asked for two more rules:
+//   - a word of one capital letter is lower-cased too when a space and a
+//     word that starts with a small letter follow ("В очереди" -> "в
+//     очереди"); before a capital or a digit it is left alone (part of an
+//     abbreviation, "В ГПУ");
+//   - what is quoted is a name quoted as written (a settings section
+//     «Компоненты», a device «Моя Карта» the user named): from an opening
+//     quote (« „ “ " ‘ ' where a word may start, not after a letter or a
+//     digit: an apostrophe is not one) to its closing one (» “ ” " ’ ')
+//     nothing is changed, quotes inside it included; without a closing
+//     quote, to the end.
+const LC_QUOTES = { '«': '»', '„': '“”', '“': '”', '"': '"', '‘': '’', "'": "'’" };
+const LC_WORDCHAR = /[\p{L}\p{M}\p{N}_]/u;
+const LC_CAPITAL = /^(?!\p{Script=Latin})\p{Lu}$/u;
+const LC_SMALL = /^\p{Ll}$/u;
+const LC_SPACE = /^\s$/u;
+
+function lowerWords(s) {
+  const locale = current === PSEUDO ? 'en' : current;
+  const ch = Array.from(s);
+  const closers = []; // the closing quotes awaited, innermost last
+  let out = '';
+  for (let i = 0; i < ch.length; i++) {
+    const c = ch[i];
+    const wordStart = i === 0 || !LC_WORDCHAR.test(ch[i - 1]);
+    if (closers.length && closers[closers.length - 1].includes(c)) {
+      closers.pop();
+      out += c;
+      continue;
+    }
+    if (LC_QUOTES[c] && wordStart) {
+      closers.push(LC_QUOTES[c]);
+      out += c;
+      continue;
+    }
+    if (!closers.length && wordStart && LC_CAPITAL.test(c)) {
+      const next = ch[i + 1];
+      const word = next !== undefined && LC_SMALL.test(next);
+      const letter = next !== undefined && LC_SPACE.test(next) && ch[i + 2] !== undefined && LC_SMALL.test(ch[i + 2]);
+      if (word || letter) {
+        out += c.toLocaleLowerCase(locale);
+        continue;
+      }
+    }
+    out += c;
+  }
+  return out;
+}
+
 function interpolate(s, params) {
   if (!params) return s;
-  return s.replace(/\{(\w+)\}/g, (m, name) => (params[name] === undefined || params[name] === null ? m : String(params[name])));
+  return s.replace(/\{(\w+)(?::(\w+))?\}/g, (m, name, mod) => {
+    const v = params[name];
+    if (v === undefined || v === null) return m;
+    if (mod === undefined) return String(v);
+    if (mod === 'lc') return typeof v === 'string' ? lowerWords(v) : String(v);
+    return m;
+  });
 }
 
 function warnOnce(id, message) {
@@ -157,9 +225,9 @@ export function has(key) {
 const ACCENTS = { a: 'á', e: 'é', i: 'í', o: 'ö', u: 'ü', c: 'ç', n: 'ñ', y: 'ý', A: 'Å', E: 'É', I: 'Î', O: 'Ø', U: 'Û', C: 'Ç', N: 'Ñ' };
 
 function pseudo(s) {
-  // Keep {params} intact; accent letters; stretch by ~40%.
-  const parts = s.split(/(\{\w+\})/);
-  const out = parts.map((p) => (/^\{\w+\}$/.test(p) ? p : p.replace(/[aeiouycnAEIOUCN]/g, (ch) => ACCENTS[ch] || ch))).join('');
+  // Keep {params} (and {param:lc}) intact; accent letters; stretch by ~40%.
+  const parts = s.split(/(\{\w+(?::\w+)?\})/);
+  const out = parts.map((p) => (/^\{\w+(?::\w+)?\}$/.test(p) ? p : p.replace(/[aeiouycnAEIOUCN]/g, (ch) => ACCENTS[ch] || ch))).join('');
   const pad = Math.ceil(s.length * 0.4);
   return `[${out}${pad > 0 ? ' ' + '~'.repeat(pad) : ''}]`;
 }

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -98,6 +99,11 @@ func TestInstanceLockHelperProcess(t *testing.T) {
 	}
 	fmt.Println("locked")
 	bufio.NewReader(os.Stdin).ReadString('\n') // until killed
+	// l is not used after the check above: without this the collector may
+	// finalize its *os.File, closing the handle and so ending the lock
+	// while the other process still expects it held (the flaky refusal
+	// that came back nil under load).
+	runtime.KeepAlive(l)
 	os.Exit(0)
 }
 
@@ -123,9 +129,10 @@ func TestInstanceLockReleasedWhenProcessEnds(t *testing.T) {
 		t.Fatalf("helper: %q", line)
 	}
 	shortLockWait(t, 200*time.Millisecond)
-	_, err = acquireInstanceLock(dir)
+	stray, err := acquireInstanceLock(dir)
 	var sf *startFailure
 	if !errors.As(err, &sf) || sf.Params["pid"] != cmd.Process.Pid {
+		stray.Release() // so the temporary directory can still be removed
 		t.Fatalf("while the other process holds it: %v (helper pid %d)", err, cmd.Process.Pid)
 	}
 	if err := cmd.Process.Kill(); err != nil {

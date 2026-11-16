@@ -10,6 +10,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -338,8 +339,13 @@ func TestUsageCountsWhateverTheJobStatus(t *testing.T) {
 			return ctx.Err()
 		}
 	}}
+	// The scheduler's clock stands still until the test moves it, so the
+	// retry backoff lasts until the test has read the usage in it (polling
+	// for a 300 ms state can miss it on a loaded machine).
+	clk := &gpuTestClock{t: time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)}
 	e = newEnvOpts(t, nil, func(o *Options) {
 		o.RetryBackoff = []time.Duration{300 * time.Millisecond, 300 * time.Millisecond}
+		o.Now = clk.Now
 	}, instant(model.StageMaterialExtract, ResourceCPU), terms)
 	m := model.Material{ID: db.NewID(), CourseID: e.course.ID, Filename: "a.pdf", Path: "p"}
 	e.st.CreateMaterial(e.ctx, m)
@@ -353,10 +359,17 @@ func TestUsageCountsWhateverTheJobStatus(t *testing.T) {
 	}
 	e.start()
 	// 1) failed and requeued (in backoff): the first attempt's tokens count.
-	e.waitFor("queued for retry", 5*time.Second, func() bool { j := tj(); return j.Status == model.StatusQueued && j.Attempt == 1 })
+	e.waitFor("queued for retry", 5*time.Second, func() bool {
+		j := tj()
+		return j.Status == model.StatusQueued && j.Attempt == 1 && strings.HasPrefix(e.s.WaitingFor(j), model.WaitRetryBackoffPrefix)
+	})
 	if u := usage(); u != 1000 {
 		t.Fatalf("usage while in retry backoff = %d, want 1000", u)
 	}
+	if n := runs.Load(); n != 1 {
+		t.Fatalf("runs during the backoff = %d", n)
+	}
+	clk.Advance(300 * time.Millisecond) // the backoff ends
 	// 2) running: flushed within the flush interval.
 	e.waitFor("second run counted", 5*time.Second, func() bool { return usage() == 2000 })
 	close(g.release)
@@ -458,13 +471,18 @@ func (e *env) seedSentences(lectureID string) {
 }
 
 func TestIncrementalTranslateDebounce(t *testing.T) {
+	// The debounce runs on the scheduler's clock (Options.Now), which only
+	// moves when the test moves it: real sleeps of 25 ms between requests
+	// could last longer than the 60 ms debounce on a loaded machine. The
+	// real sleeps left below only give a wrongly started run time to show.
+	clk := &gpuTestClock{t: time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)}
 	var mu sync.Mutex
 	var trStarts []time.Time
 	hold := make(chan struct{})
 	var holdThird atomic.Bool
 	tr := &fakeStage{name: model.StageTranslate, res: ResourceAPI, run: func(ctx context.Context, id string, p func(float64)) error {
 		mu.Lock()
-		trStarts = append(trStarts, time.Now())
+		trStarts = append(trStarts, clk.Now())
 		n := len(trStarts)
 		mu.Unlock()
 		if n == 2 && holdThird.Load() {
@@ -476,7 +494,7 @@ func TestIncrementalTranslateDebounce(t *testing.T) {
 		}
 		return nil
 	}}
-	e := newEnv(t, nil, allInstant(tr)...) // debounce 60ms
+	e := newEnvOpts(t, nil, func(o *Options) { o.Now = clk.Now }, allInstant(tr)...) // debounce 60ms
 	l := e.lecture()
 	e.start()
 	e.waitStatus(l.ID, model.StageExport, model.StatusDone)
@@ -487,13 +505,21 @@ func TestIncrementalTranslateDebounce(t *testing.T) {
 	holdThird.Store(true)
 	var last time.Time
 	for i := 0; i < 3; i++ {
-		last = time.Now()
+		last = clk.Now()
 		e.s.RequestIncrementalTranslate(l.ID)
-		time.Sleep(25 * time.Millisecond)
+		clk.Advance(25 * time.Millisecond)
+		time.Sleep(25 * time.Millisecond) // several scans
 		if count() != 1 {
 			t.Fatal("incremental translate started before the debounce interval")
 		}
 	}
+	// 50 ms since the last request: still within the debounce.
+	clk.Advance(25 * time.Millisecond)
+	time.Sleep(25 * time.Millisecond)
+	if count() != 1 {
+		t.Fatal("incremental translate started before the debounce interval")
+	}
+	clk.Advance(10 * time.Millisecond) // 60 ms: due
 	e.waitFor("incremental run", 5*time.Second, func() bool { return count() == 2 })
 	mu.Lock()
 	if d := trStarts[1].Sub(last); d < 60*time.Millisecond {
@@ -504,6 +530,7 @@ func TestIncrementalTranslateDebounce(t *testing.T) {
 	// A request while that run is in progress is kept and served after it.
 	e.waitStatus(l.ID, model.StageTranslate, model.StatusRunning)
 	e.s.RequestIncrementalTranslate(l.ID)
+	clk.Advance(60 * time.Millisecond) // past the debounce
 	time.Sleep(120 * time.Millisecond)
 	if count() != 2 {
 		t.Fatal("request must wait for the running translate")
@@ -518,6 +545,7 @@ func TestIncrementalTranslateDebounce(t *testing.T) {
 	// Nothing stale → a request is dropped without a run.
 	e.st.SetZhStatus(e.ctx, l.ID, []int{1}, model.ZhOK)
 	e.s.RequestIncrementalTranslate(l.ID)
+	clk.Advance(60 * time.Millisecond) // past the debounce
 	time.Sleep(150 * time.Millisecond)
 	if count() != 3 {
 		t.Fatal("no stale sentence: no incremental run expected")
@@ -607,9 +635,9 @@ func TestVRAMCalibrationIgnoresOverlappingRuns(t *testing.T) {
 		}
 		d := v.(int)
 		e.gpu.set(20000-d, 24000, 1000+d)
-		time.Sleep(60 * time.Millisecond)
+		err := e.waitSampledPeak(id, d) // not a fixed sleep: it may see no sample under load
 		e.gpu.set(20000, 24000, 1000)
-		return nil
+		return err
 	}}
 	e = newEnv(t, func(c *config.Config) { c.ASR.MaxParallel = 2 }, instant(model.StagePrep, ResourceCPU), asr)
 	key := model.KVVRAMObservedPrefix + "large-v3:float16"
@@ -629,7 +657,13 @@ func TestVRAMCalibrationIgnoresOverlappingRuns(t *testing.T) {
 	e.start()
 	e.waitFor("both asr running", 5*time.Second, func() bool { return cur.Load() == 2 })
 	e.gpu.set(11400, 24000, 1000+8600)
-	time.Sleep(60 * time.Millisecond) // several 5ms samples
+	// Both runs' samplers saw the combined use (not a fixed sleep: under
+	// load it could pass without a sample).
+	for _, l := range []model.Lecture{l1, l2} {
+		if err := e.waitSampledPeak(l.ID, 8600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	close(release)
 	j1 := e.waitStatus(l1.ID, model.StageASR, model.StatusDone)
 	e.waitStatus(l2.ID, model.StageASR, model.StatusDone)

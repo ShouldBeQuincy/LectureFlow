@@ -42,8 +42,9 @@ func (s *Server) janitorConfigured(ctx context.Context) bool {
 // (glossary.LastRun, also a run that changed nothing); LastChanges counts
 // the changes not undone in the latest report that changed something
 // (glossary.LatestReport), the one "查看整理报告" lists for undo. Unreadable
-// runs or reports are logged and left out, like missing ones.
-func (s *Server) janitorStatus(ctx context.Context, courseID string, review model.Job, has, configured bool) JanitorStatus {
+// runs or reports are logged and left out, like missing ones. kv is the
+// store the runs and reports are read from (courseReads.kv).
+func (s *Server) janitorStatus(ctx context.Context, kv db.Store, courseID string, review model.Job, has, configured bool) JanitorStatus {
 	js := JanitorStatus{Configured: configured}
 	if has && (review.Status == model.StatusQueued || review.Status == model.StatusRunning) {
 		js.Running = true
@@ -57,12 +58,12 @@ func (s *Server) janitorStatus(ctx context.Context, courseID string, review mode
 		}
 		return false
 	}
-	run, err := glossary.LastRun(ctx, s.st, courseID)
+	run, err := glossary.LastRun(ctx, kv, courseID)
 	if !soft("janitor last run", err) {
 		return js
 	}
 	js.LastAt, js.LastVersion, js.LastFallback, js.LastModel = run.CreatedAt, run.Version, run.Fallback, runModel(run)
-	rep, err := glossary.LatestReport(ctx, s.st, courseID)
+	rep, err := glossary.LatestReport(ctx, kv, courseID)
 	if !soft("janitor report", err) {
 		return js
 	}

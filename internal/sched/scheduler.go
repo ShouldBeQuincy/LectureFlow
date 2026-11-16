@@ -36,6 +36,7 @@ import (
 	"lectureflow/internal/config"
 	"lectureflow/internal/db"
 	"lectureflow/internal/devices"
+	"lectureflow/internal/media"
 	"lectureflow/internal/model"
 	"lectureflow/internal/settings"
 	"lectureflow/internal/state"
@@ -55,6 +56,10 @@ type Options struct {
 	Pool *Pool
 	// GPUQuery reads GPU memory; nil = nvidia-smi (Config.NvidiaSMI).
 	GPUQuery GPUQueryFunc
+	// GPUComputeCap reads the first GPU's compute capability (r2
+	// T-PERF-02: below 7.0 the per-model VRAM table is not used); nil =
+	// nvidia-smi when GPUQuery is nil too, else none (unknown: the table).
+	GPUComputeCap GPUComputeCapFunc
 	// Now is the clock for retry backoff and the incremental-translate debounce (default time.Now).
 	Now func() time.Time
 
@@ -125,6 +130,10 @@ type GPUStatus struct {
 	SlotsUsed      int
 	SlotsMax       int
 	EstimatedJobMB int
+	// EstimateRaised: EstimatedJobMB is the in-memory raise after a run
+	// ran out of VRAM (raiseVRAMAfterOOM), which a restart or another
+	// model or precision on cuda:0 drops.
+	EstimateRaised bool
 	Error          string
 }
 
@@ -138,8 +147,12 @@ type run struct {
 	userCancel bool // guarded by Scheduler.mu
 
 	// GPU accounting (SPEC §17.2), guarded by Scheduler.mu
-	estimateMB  int
+	estimateMB int
+	// legacyEstMB is the estimate by the formula before T-PERF-02 (gpu.go
+	// vramEstimates): a job joining it on the card must fit by it too.
+	legacyEstMB int
 	baseUsedMB  int
+	admitFreeMB int // free VRAM when admitted (the bound of raiseVRAMAfterOOM)
 	sample      bool
 	peakMB      int
 	computeType string
@@ -193,6 +206,14 @@ type run struct {
 	stats      model.JobStats
 	statsDirty bool
 	cfgCost    func(model.JobStats) (float64, bool)
+
+	// v3.2.x P1-c (llmstats.go), guarded by smu: the LLM calls that are not
+	// over, by call id, and when the run last showed life. now is the
+	// scheduler's clock (set before the run starts, then read only).
+	calls    map[string]*llmCall
+	callSeq  uint64
+	activity time.Time
+	now      func() time.Time
 }
 
 // Scheduler moves jobs pending → queued → running → done|failed|cancelled
@@ -206,6 +227,7 @@ type Scheduler struct {
 	pool    *Pool
 	dataDir string
 	gpuQ    GPUQueryFunc
+	capQ    GPUComputeCapFunc
 	now     func() time.Time
 
 	scanInterval   time.Duration
@@ -223,6 +245,10 @@ type Scheduler struct {
 	// and file cleanup are complete, and by DeleteLecture until the rows and
 	// directories are gone, so no job of that lecture can start in between.
 	scanMu sync.Mutex
+	// resumePending: Start left the incremental-translate resume to the
+	// first scan (control.go resumeIncremental). Set before the loop
+	// starts, then guarded by scanMu.
+	resumePending bool
 
 	mu       sync.Mutex
 	stages   map[string]Stage
@@ -238,8 +264,24 @@ type Scheduler struct {
 	dispatchHolds int
 	vramObs       map[string]int
 	lastGPU       GPUStatus
-	started       bool
-	stopped       bool
+	// The first GPU's compute capability (gpu.go preVolta): capKnown once
+	// read, capOld below 7.0, capTried the last attempt.
+	capKnown, capOld bool
+	capTried         time.Time
+	// vramBump: the estimates raised after a run ran out of VRAM, by
+	// vramKey, in memory only, for cuda:0's model and precision
+	// vramBumpTgt (gpu.go raiseVRAMAfterOOM, syncVRAMBumps).
+	vramBump    map[string]int
+	vramBumpTgt string
+	started     bool
+	stopped     bool
+
+	// GPUStatus's cache of the nvidia-smi reading (perf-fix, control.go
+	// readGPUCached; GPUStatusTTL). Not guarded by mu: gpuReadMu is held
+	// while nvidia-smi runs, so concurrent callers share one run, and it
+	// guards gpuReadAt, when the last reading ended (zero: none yet).
+	gpuReadMu sync.Mutex
+	gpuReadAt time.Time
 
 	kick       chan struct{}
 	baseCtx    context.Context
@@ -351,7 +393,11 @@ func New(o Options) (*Scheduler, error) {
 	}
 	if s.gpuQ == nil {
 		s.gpuQ = NvidiaSMIQuery(o.Config.NvidiaSMI)
+		if o.GPUComputeCap == nil {
+			o.GPUComputeCap = NvidiaSMIComputeCap(o.Config.NvidiaSMI)
+		}
 	}
+	s.capQ = o.GPUComputeCap
 	if s.scanInterval <= 0 {
 		s.scanInterval = time.Second
 	}
@@ -549,6 +595,21 @@ type scanState struct {
 	remotePending    []model.Job
 }
 
+// draftHeldStages are the lecture stages whose pending job state.Deps holds
+// with "not_started" on a draft lecture before checking anything else
+// (DepsWith for the six pipeline stages, auxDeps for title, chapters and
+// stream; v1.1 A3.1). For such a job the scan did nothing but that lookup:
+// it stayed pending, got no reason (WaitingFor computes a pending job's
+// from Deps itself), and its asr job's entry in remotePending could not
+// make remoteImminent keep Colab, since a draft's prep never leaves
+// pending. ListScanJobs leaves them out. filename_rule (course scope, no
+// draft check) is not listed; a stage left out here is only scanned as
+// before. TestDraftHeldStagesMatchDeps keeps the list in step with Deps.
+var draftHeldStages = []string{
+	model.StagePrep, model.StageASR, model.StageSummary, model.StageRepair, model.StageTranslate, model.StageExport,
+	model.StageTitle, model.StageChapters, model.StageStream,
+}
+
 func (s *Scheduler) scan() {
 	s.scanMu.Lock()
 	defer s.scanMu.Unlock()
@@ -559,11 +620,18 @@ func (s *Scheduler) scan() {
 	if ctx.Err() != nil || s.dispatchHeld() {
 		return
 	}
+	s.resumeDeferred(ctx) // the first scan: what Start left to it, before anything else
 	s.readPower()
+	s.syncVRAMBumps() // another model or precision on cuda:0 drops the raises after out of memory
 	s.processIncremental(ctx)
 	s.retryDeferred(ctx)
 	s.processFilenameRules(ctx)
-	jobs, err := s.st.ListCurrentJobsByStatus(ctx, model.StatusPending, model.StatusQueued)
+	// The pending and queued jobs, without the pending jobs of drafts
+	// (draftHeldStages): no per-job lookup for a lecture that is known not
+	// to start (performance audit F08). Read fresh on every scan, nothing is
+	// cached: a draft launched before this listing is in it, one launched
+	// during the scan is in the next one (Launch kicks the loop).
+	jobs, err := s.st.ListScanJobs(ctx, draftHeldStages)
 	if err != nil {
 		if ctx.Err() == nil {
 			slog.Error("scheduler scan", "err", err)
@@ -717,7 +785,7 @@ func (s *Scheduler) tryStart(ctx context.Context, j model.Job, depsOK bool, sc *
 		}
 	}
 	// The pool: the stage's, the CPU for a "修复断句" asr job (textrepair.go).
-	r := &run{job: j, stage: stg, res: resourceOf(stg, j)}
+	r := &run{job: j, stage: stg, res: resourceOf(stg, j), now: s.now}
 	switch r.res {
 	case ResourceCPU:
 		if sc.cpuFull || s.countRunning(ResourceCPU) >= s.cpuSlots {
@@ -901,6 +969,13 @@ func (s *Scheduler) start(ctx context.Context, r *run) {
 		r.stats.Warning, r.stats.WarningInfo = "", nil
 		r.statsDirty = true
 	}
+	// v3.2.x P1-c: nothing is in flight when a run starts (a run cut off by a
+	// crash may have left its current attempt in the database); the finished
+	// attempts and the retry count of earlier runs stay.
+	if l := r.stats.LLM; l != nil && (l.InFlight != 0 || l.Current != nil) {
+		r.stats.LLM, r.statsDirty = settledLLM(l), true
+	}
+	r.touchLocked(s.now())
 	// Power management: a job the policy suspended (power_wait_ac) starts
 	// again: the stage card and a notice say "已恢复" (power-brief §3.4) —
 	// only on AC, the text says "已接通电源" (backend Gate round 1, fix 6).
@@ -984,6 +1059,9 @@ func (s *Scheduler) execute(ctx context.Context, r *run) {
 		if r.job.Stage == model.StageSummary {
 			s.queueTitle(r.job.ScopeID) // v2 P13.5: title and blurb from the new summary
 		}
+		if r.job.Stage == model.StageExport && r.job.Scope == model.ScopeLecture {
+			s.queueChaptersAfterExport(r.job.ScopeID, r.job.ID) // v3.2.x P3
+		}
 	}
 	s.reviewEndedAfterRun(r, final) // v2: one more glossary review for terms that arrived meanwhile
 	s.Kick()
@@ -998,6 +1076,9 @@ func (s *Scheduler) runStage(ctx context.Context, r *run) (err error) {
 	}()
 	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+	if err := s.checkScopeIDs(ctx, r.job); err != nil {
+		return err
 	}
 	h, err := r.stage.InputHash(ctx, r.job.ScopeID)
 	if err != nil {
@@ -1017,6 +1098,65 @@ func (s *Scheduler) runStage(ctx context.Context, r *run) (err error) {
 	return r.stage.Run(s.withRemotes(WithStatsSink(WithJob(ctx, j), r)), j.ScopeID, r.progress)
 }
 
+// checkScopeIDs is the start check of every run, before its stage reads or
+// writes anything (R77b "not covered", SEC44 low-2): the stages build the
+// directory of the job's lecture, material or course from ids the
+// database holds — an imported library supplies them — so a record whose
+// course or own id names no directory of its own (media.IDElement: "..",
+// "x." that Win32 opens as "x", a device name) fails the job with the
+// existing internal error, permanently (no automatic retry), through the
+// usual failure path (running → failed in finish; §4 unchanged). So does a
+// record directory with a link at any folder on its way down from the data
+// directory (media.PlainPath; SEC49 L1: the stage would read and write
+// behind the link). A record that does not exist is left to the stage,
+// which fails reading it. Any other read error ends the run unchecked with
+// a retryable error, not a permanent one (SEC49 information-2): a database
+// busy for a moment must not fail a good lecture for good; the usual
+// automatic retry (backoff, counted attempts) runs the check again.
+func (s *Scheduler) checkScopeIDs(ctx context.Context, j model.Job) error {
+	readErr := func(err error) error {
+		if errors.Is(err, db.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("checking the record's directory before the run: %w", err)
+	}
+	var ids []string
+	var dir func() string
+	switch j.Scope {
+	case model.ScopeLecture:
+		l, err := s.st.GetLecture(ctx, j.ScopeID)
+		if err != nil {
+			return readErr(err)
+		}
+		ids = []string{l.CourseID, l.ID}
+		dir = func() string { return model.LectureDir(s.dataDir, l.CourseID, l.ID) }
+	case model.ScopeMaterial:
+		m, err := s.st.GetMaterial(ctx, j.ScopeID)
+		if err != nil {
+			return readErr(err)
+		}
+		ids = []string{m.CourseID, m.ID}
+		dir = func() string { return model.MaterialDir(s.dataDir, m.CourseID, m.ID) }
+	case model.ScopeCourse:
+		ids = []string{j.ScopeID}
+		dir = func() string { return model.CourseDir(s.dataDir, j.ScopeID) }
+	}
+	for _, id := range ids {
+		if !media.IDElement(id) {
+			// no id in the log: it is the path-like value itself
+			slog.Warn("job not started: its record's id names no directory of its own", "job", j.ID, "stage", j.Stage)
+			return Permanent(model.Errorf("server.internal", nil,
+				errors.New("the record's id names no directory of its own (the library was changed outside LectureFlow); no file was read or written")))
+		}
+	}
+	if dir != nil && s.dataDir != "" && !media.PlainPath(s.dataDir, dir()) {
+		slog.Warn("job not started: a folder on the way to its record's directory is a link", "job", j.ID, "stage", j.Stage)
+		return Permanent(model.Errorf("server.internal", nil,
+			errors.New("a folder on the way to the record's directory is not an ordinary directory (a link); no file was read or written")))
+	}
+	return nil
+}
+
 // progress is the callback handed to Stage.Run: it only records the latest
 // value in memory. It never blocks on I/O (the flusher writes it).
 func (r *run) progress(p float64) {
@@ -1029,10 +1169,14 @@ func (r *run) progress(p float64) {
 		r.latest, r.dirty = p, true
 	}
 	r.pmu.Unlock()
+	r.touch() // v3.2.x P1-c: a progress call is a sign of life
 }
 
-// flusher writes the progress of running jobs (at most once per interval
-// per job, SPEC §8.2) and adds their token usage to the daily ledger.
+// flusher writes the progress and the stats of running jobs and announces
+// them (Events.Job), at most once per interval per job (SPEC §8.2). Since
+// v3.2.x P1-c (Q8a) a job is also announced when only its stats changed
+// (tokens, the request details of stats.llm, the last activity): the event's
+// job carries the stats just written.
 func (s *Scheduler) flusher() {
 	defer s.wg.Done()
 	t := time.NewTicker(s.flushEvery)
@@ -1066,17 +1210,27 @@ func (s *Scheduler) flushRun(r *run) {
 	r.dirty = false
 	r.pmu.Unlock()
 	ctx := context.Background()
+	announce := false
 	if dirty && p != r.lastFlush {
-		if err := s.st.SetJobProgress(ctx, r.job.ID, p); err != nil {
-			slog.Warn("progress write", "job", r.job.ID, "err", err)
+		err := s.st.SetJobProgress(ctx, r.job.ID, p)
+		writeResult(r, progressWriteLog, err, false) // logged with restraint (review R51)
+		if err != nil {
+			// Tried again on the next flush (one flush interval later, not
+			// at once), unless the stage reports a newer value first.
+			r.pmu.Lock()
+			r.dirty = true
+			r.pmu.Unlock()
 		} else {
 			r.lastFlush = p
-			j := r.job
-			j.Status, j.Progress = model.StatusRunning, p
-			s.ev.Job(j)
+			announce = true
 		}
 	}
-	s.persistStatsLocked(ctx, r, nil)
+	st, changed := s.persistStats(ctx, r, nil)
+	if announce || changed {
+		j := r.job
+		j.Status, j.Progress, j.Stats = model.StatusRunning, r.lastFlush, st
+		s.ev.Job(j)
+	}
 }
 
 func (s *Scheduler) sampleVRAM(ctx context.Context, r *run) {
@@ -1141,7 +1295,8 @@ func (s *Scheduler) finish(r *run, runErr error, took time.Duration) string {
 	r.wmu.Lock()
 	final := s.persistStatsLocked(ctx, r, func(st *model.JobStats) {
 		st.DurationMS = took.Milliseconds()
-		st.Status = "" // transient worker status (e.g. downloading_model)
+		st.Status = ""              // transient worker status (e.g. downloading_model)
+		st.LLM = settledLLM(st.LLM) // v3.2.x P1-c: nothing in flight any more; the attempts stay
 		if peak > 0 {
 			st.VRAMPeakMB = int64(peak)
 		}
@@ -1168,6 +1323,7 @@ func (s *Scheduler) finish(r *run, runErr error, took time.Duration) string {
 		}
 	})
 	r.finished = true
+	endProgressWriteLog(r) // no flush comes after this
 	r.wmu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -1189,6 +1345,9 @@ func (s *Scheduler) finish(r *run, runErr error, took time.Duration) string {
 		// Leave it running: §4.7 recovery requeues it on the next start.
 		slog.Info("job interrupted by shutdown", "job", id, "stage", r.job.Stage)
 		return model.StatusRunning
+	}
+	if runErr != nil && !userCancel && isCUDAOOM(runErr) {
+		s.raiseVRAMAfterOOM(r) // before the retry is queued (R37 S5)
 	}
 	empty := ""
 	switch {

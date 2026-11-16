@@ -135,18 +135,19 @@ func (b *Backend) probeArgs(set Settings, job Job) []string {
 	return args
 }
 
-// probeMemory runs the memory probe in kernel kid and logs the decision.
-// A probe that prints nothing means disk mode (memoryReasonProbeFailed);
-// anything but exactly one valid memory event is CodeContractViolation.
-func (b *Backend) probeMemory(ctx context.Context, rt *runtimeClient, kid string, set Settings, job Job, src []byte) (memoryDecision, error) {
+// probeMemory runs the memory probe in kernel kid and logs the decision;
+// its connections take their proxy token from client (execCell). A probe
+// that prints nothing means disk mode (memoryReasonProbeFailed); anything
+// but exactly one valid memory event is CodeContractViolation.
+func (b *Backend) probeMemory(ctx context.Context, client clientSource, kid string, set Settings, job Job, src []byte) (memoryDecision, error) {
 	var buf strings.Builder
-	_, err := rt.kernelExec(ctx, kid, probeCode(src, b.probeArgs(set, job)), func(s string) error {
+	_, err := execCell(ctx, client, kid, probeCode(src, b.probeArgs(set, job)), func(s string) error {
 		if buf.Len()+len(s) > 2*maxEventLine {
 			return violation("memory probe output too long")
 		}
 		buf.WriteString(s)
 		return nil
-	}, b.o.Sleep, nil)
+	}, b.newReconnector(nil), nil)
 	if err != nil {
 		return memoryDecision{}, err
 	}

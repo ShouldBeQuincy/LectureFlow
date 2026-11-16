@@ -12,9 +12,15 @@ package main
 // 3.2.0): then nothing is wired, the device table leaves ssh:* rows out,
 // /api/remote/* and use-remote answer 404, and migration 014's table stays
 // unused. The lf-agent builds come only from the packaged resources
-// (resources/agent/<platform>/lf-agent, plan step 2) or, in a development
-// build (no version set), from tools/lf-agent next to the executable
-// (make.ps1 agent); never from the working directory.
+// (resources/agent/<platform>/lf-agent, when the installer carries them)
+// or, in a development build (no version set), from tools/lf-agent next to
+// the executable (make.ps1 agent); never from the working directory. When
+// neither has a build for a server's platform, the servers can still be
+// added, connected and trusted, but installing the agent there fails
+// (remote.agent_missing) and the server cannot transcribe. The installers
+// leave lf-agent out while the feature is experimental (desktop/scripts/
+// stage.js, LECTUREFLOW_BUNDLE_LF_AGENT).
+// ssh-1b: the servers' cards go to the resource bar (sshCards).
 
 import (
 	"context"
@@ -26,6 +32,7 @@ import (
 	"lectureflow/internal/config"
 	"lectureflow/internal/db"
 	"lectureflow/internal/devices"
+	"lectureflow/internal/remote"
 	"lectureflow/internal/sched"
 	"lectureflow/internal/sshremote"
 )
@@ -75,8 +82,12 @@ func wireSSH(ctx context.Context, cfg *config.Config, st db.Store, reg *devices.
 		slog.Warn("ssh servers: the store has no remote_server table")
 		return
 	}
+	agents := agentDir(cfg, appVersion, exe)
+	if agents == "" {
+		slog.Warn("ssh servers: this installation has no lf-agent builds; servers can be added but not used (remote.agent_missing)")
+	}
 	m, err := sshremote.New(ctx, sshremote.Options{
-		Store: store, Devices: reg, AgentDir: agentDir(cfg, appVersion, exe), Manifest: cfg.ComponentsManifest,
+		Store: store, Devices: reg, AgentDir: agents, Manifest: cfg.ComponentsManifest,
 		WorkerDir: cfg.WorkerDir, FFmpeg: cfg.FFmpeg, AgentVersion: appVersion,
 		OnChange: func() {
 			hub.Changed("devices", "")
@@ -89,6 +100,16 @@ func wireSSH(ctx context.Context, cfg *config.Config, st db.Store, reg *devices.
 	}
 	reg.EnableSSH() // the ssh:* rows are in the table from now on
 	s.SetSSH(m)
+}
+
+// sshCards is the resource service's RemoteCards (ssh-1b): the servers'
+// cards, or nil while the SSH servers are off (wireSSH built no manager).
+func sshCards(s *sched.Scheduler) func(context.Context) []remote.Card {
+	m, ok := s.SSH().(*sshremote.Manager)
+	if !ok || m == nil {
+		return nil
+	}
+	return m.Cards
 }
 
 // closeSSH ends the servers' connections (graceful stop; the agents keep

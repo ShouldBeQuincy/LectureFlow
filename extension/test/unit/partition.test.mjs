@@ -151,7 +151,7 @@ test('Chrome 132+ with a frame key but no tab address (access to the site, not t
   assert.deepEqual(values(got), ['sid=PLAIN-SID', 'cf=LMS-CF', 'lms_only=LMS-ONLY@/v']);
 });
 
-test('Chrome without getPartitionKey (119–131), or refused it (no access to the LMS): every partition read once, only the tab’s site kept', async () => {
+test('Chrome without getPartitionKey (119–131), or refused it (no host access to the LMS’s site origin, the usual case): every partition read once, only the tab’s site kept', async () => {
   for (const partitionKeys of [undefined, { 0: 'throw', 3: 'throw' }]) {
     const api = fakeApi({ partitionKeys });
     const got = await readCookiesWith(api, [MEDIA], cookieScope({ tabId: 7, topUrl: LMS_PAGE, tracks: [{ frameIds: [3] }] }));

@@ -5,7 +5,8 @@
 // scripting.executeScript({ func }). The browser serialises each function
 // on its own, so each must be self-contained: no imports, no outside
 // variables. They only read: media elements, resource timing, the nodes a
-// profile's selectors hit; and pageFetch requests the manifest URLs the
+// profile's selectors hit, the frame's own title (frameTitle, generic
+// detection only); and pageFetch requests the manifest URLs the
 // player itself requested, with the page's own credentials. Interpretation
 // happens in src/lib (pure, tested).
 
@@ -26,6 +27,17 @@ export function scanFrame(reads) {
   const MAX_TEXT = 1000;
   const MAX_HISTORY = 50;
   const out = { url: location.href, elements: [], resources: [], reads: [], encryptedEvents: 0, observed: [], opaque: [], docs: [], ancestors: [] };
+  // A mark of this document in the extension's isolated world (the page
+  // cannot see or set it; it goes with the document): pageFetch checks it
+  // to tell this document from the next one in the frame (SEC36 低-9).
+  try {
+    if (typeof globalThis.__lectureflowScan !== 'string') {
+      globalThis.__lectureflowScan = Array.from(crypto.getRandomValues(new Uint32Array(4)), (n) => n.toString(36)).join('-');
+    }
+    out.token = globalThis.__lectureflowScan;
+  } catch {
+    // no mark: the address is checked instead
+  }
   const docs = [];
   const seen = new Set();
 
@@ -161,6 +173,9 @@ export function scanFrame(reads) {
     for (const rec of obs.observed || []) {
       if (rec) out.observed.push({ key: rec.key, index: rec.index, url: rec.url, values: JSON.parse(JSON.stringify(rec.values || {})) });
     }
+    // The profile whose regexes the observer stopped as too slow on this
+    // page, if any (src/lib/observe.js: combineObserved).
+    if (typeof obs.stopped === 'string') out.observeStopped = obs.stopped.slice(0, 1000);
   }
 
   const clean = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().slice(0, MAX_TEXT);
@@ -194,42 +209,137 @@ export function scanFrame(reads) {
 }
 
 /**
+ * This frame's own title (document.title: the line the browser shows on
+ * the tab), for generic detection to name the lecture with
+ * (src/lib/profile.js pageTitleFor). The background injects it only after
+ * the scan was screened for the do-not-handle list, only into the frame
+ * detection runs in, and only when no profile matched
+ * (src/background/detector.js). The frame's address, the addresses its
+ * document showed and location.ancestorOrigins come with it so that the
+ * background can check again that this is still the frame it screened and
+ * that it is not, and is not inside, a blocked site
+ * (src/lib/blockedframes.js titleOfFrame). Never part of a report.
+ *
+ * expectedUrl: the address the screened scan saw. Unless the frame still
+ * shows it (compared without the fragment, in the same synchronous run as
+ * the read), the title is not read at all: a page that moved on to a
+ * blocked site in between is never read (SEC15 L3).
+ */
+export function frameTitle(expectedUrl) {
+  const MAX_TEXT = 1000;
+  const MAX_HISTORY = 50;
+  const out = { url: '', title: '', history: [], ancestors: [] };
+  const bare = (u) => String(u).split('#')[0];
+  try {
+    out.url = String(location.href);
+  } catch {
+    return out;
+  }
+  if (typeof expectedUrl !== 'string' || bare(out.url) !== bare(expectedUrl)) return out;
+  try {
+    const nav = performance.getEntriesByType('navigation')[0];
+    if (nav && typeof nav.name === 'string') out.history.push(nav.name);
+  } catch {
+    // no navigation timing
+  }
+  try {
+    const api = globalThis.navigation;
+    if (api && typeof api.entries === 'function') {
+      for (const e of api.entries()) {
+        if (out.history.length >= MAX_HISTORY) break;
+        if (e && e.sameDocument && typeof e.url === 'string' && !out.history.includes(e.url)) out.history.push(e.url);
+      }
+    }
+  } catch {
+    // no Navigation API
+  }
+  try {
+    const list = location.ancestorOrigins;
+    if (list) out.ancestors = [...list].slice(0, 64).map(String);
+  } catch {
+    // none
+  }
+  try {
+    out.title = String(document.title || '').replace(/\s+/g, ' ').trim().slice(0, MAX_TEXT);
+  } catch {
+    out.title = '';
+  }
+  return out;
+}
+
+/**
  * Fetches URLs from the page, with the page's credentials (cookies go only
  * where the browser would send them for the page anyway).
  * reqs: [{ url, mode: 'text' | 'probe', maxBytes }]
  * Returns per request { ok, status, contentType, text?, size?, error? }.
+ * One timeout (timeoutMs) covers each request from the first byte sent to
+ * the last byte read; a playlist is read as a stream and abandoned past
+ * maxBytes (security review L-4).
+ *
+ * expected: the document the frame was scanned in — { token }, the mark
+ * scanFrame left in this extension's isolated world of that document
+ * (gone with the document, untouched by pushState / replaceState), or,
+ * from a scan without one, { url }, the address it was scanned at
+ * (compared without the fragment). Unless the frame still shows that
+ * document (checked before anything is sent), nothing is fetched and every
+ * request answers error 'moved': the frame went on to another page while
+ * detection ran, and the addresses the page before gave are never fetched
+ * from this one (SEC33 信-1, SEC36 低-9; Chrome also pins the injection to
+ * the scanned document). timeoutMs other than a positive number is the
+ * default.
  */
-export async function pageFetch(reqs) {
-  const TIMEOUT = 10000;
-  const run = async (url, init) => {
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), TIMEOUT);
-    try {
-      return { res: await fetch(url, { ...init, signal: ctl.signal, redirect: 'follow', cache: 'no-store' }), ctl };
-    } finally {
-      clearTimeout(timer);
+export async function pageFetch(reqs, timeoutMs = 10000, expected = null) {
+  const TIMEOUT = typeof timeoutMs === 'number' && timeoutMs > 0 ? timeoutMs : 10000;
+  if (expected && typeof expected === 'object') {
+    let same = true;
+    if (typeof expected.token === 'string' && expected.token !== '') {
+      let mark;
+      try {
+        mark = globalThis.__lectureflowScan;
+      } catch {
+        mark = undefined;
+      }
+      same = mark === expected.token;
+    } else if (typeof expected.url === 'string') {
+      const bare = (u) => String(u).split('#')[0];
+      let here = '';
+      try {
+        here = String(location.href);
+      } catch {
+        here = '';
+      }
+      same = bare(here) === bare(expected.url);
     }
-  };
-  // First as the page's own same-origin request would go (cookies only to
-  // the page's origin; signed CDN URLs need none). A cross-origin server
-  // that refuses that (401/403, or CORS) is asked once more with the
-  // browser's cookies for it, as a player using credentials would.
-  const withCreds = async (url, init) => {
-    let first;
+    if (!same) return reqs.map(() => ({ ok: false, status: 0, contentType: '', text: '', size: -1, error: 'moved' }));
+  }
+  const tooLarge = () => Object.assign(new Error('too large'), { name: 'TooLargeError' });
+  // The request's body as text, at most max bytes; stops when signal aborts.
+  const readCapped = async (res, max, signal) => {
+    if (!res.body || typeof res.body.getReader !== 'function') {
+      const t = await res.text();
+      if (new TextEncoder().encode(t).length > max) throw tooLarge();
+      return t;
+    }
+    const reader = res.body.getReader();
+    const stop = new Promise((_, reject) => {
+      const fail = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      if (signal.aborted) fail();
+      else signal.addEventListener('abort', fail, { once: true });
+    });
+    stop.catch(() => {});
+    const dec = new TextDecoder();
+    let total = 0;
+    let text = '';
     try {
-      first = await run(url, { ...init, credentials: 'same-origin' });
-      if (first.res.status !== 401 && first.res.status !== 403) return first;
+      for (;;) {
+        const { done, value } = await Promise.race([reader.read(), stop]);
+        if (done) return text + dec.decode();
+        total += value.byteLength;
+        if (total > max) throw tooLarge();
+        text += dec.decode(value, { stream: true });
+      }
     } catch (e) {
-      if (e && e.name === 'AbortError') throw e;
-    }
-    if (new URL(url, location.href).origin === location.origin) {
-      if (first) return first;
-      throw new TypeError('failed');
-    }
-    try {
-      return await run(url, { ...init, credentials: 'include' });
-    } catch (e) {
-      if (first) return first;
+      reader.cancel().catch(() => {});
       throw e;
     }
   };
@@ -239,6 +349,32 @@ export async function pageFetch(reqs) {
   };
   const out = [];
   for (const r of reqs) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), TIMEOUT);
+    const run = (url, init) => fetch(url, { ...init, signal: ctl.signal, redirect: 'follow', cache: 'no-store' });
+    // First as the page's own same-origin request would go (cookies only to
+    // the page's origin; signed CDN URLs need none). A cross-origin server
+    // that refuses that (401/403, or CORS) is asked once more with the
+    // browser's cookies for it, as a player using credentials would.
+    const withCreds = async (url, init) => {
+      let first;
+      try {
+        first = await run(url, { ...init, credentials: 'same-origin' });
+        if (first.status !== 401 && first.status !== 403) return first;
+      } catch (e) {
+        if (e && e.name === 'AbortError') throw e;
+      }
+      if (new URL(url, location.href).origin === location.origin) {
+        if (first) return first;
+        throw new TypeError('failed');
+      }
+      try {
+        return await run(url, { ...init, credentials: 'include' });
+      } catch (e) {
+        if (first) return first;
+        throw e;
+      }
+    };
     try {
       if (r.mode === 'probe') {
         let size = -1;
@@ -246,7 +382,7 @@ export async function pageFetch(reqs) {
         let type = '';
         let ok = false;
         try {
-          const { res } = await withCreds(r.url, { method: 'HEAD' });
+          const res = await withCreds(r.url, { method: 'HEAD' });
           status = res.status;
           type = res.headers.get('content-type') || '';
           if (res.ok) {
@@ -254,11 +390,12 @@ export async function pageFetch(reqs) {
             const len = Number(res.headers.get('content-length'));
             if (Number.isFinite(len) && len > 0) size = len;
           }
-        } catch {
+        } catch (e) {
+          if (e && e.name === 'AbortError') throw e;
           // HEAD refused or blocked; try a one-byte range below
         }
         if (size < 0) {
-          const { res, ctl } = await withCreds(r.url, { method: 'GET', headers: { Range: 'bytes=0-0' } });
+          const res = await withCreds(r.url, { method: 'GET', headers: { Range: 'bytes=0-0' } });
           status = res.status;
           type = res.headers.get('content-type') || type;
           if (res.status === 206) {
@@ -269,11 +406,11 @@ export async function pageFetch(reqs) {
             const len = Number(res.headers.get('content-length'));
             if (Number.isFinite(len) && len > 0) size = len;
           }
-          ctl.abort(); // never read a whole file
+          // never read a whole file: the finally below aborts the body
         }
         out.push({ ok, status, contentType: type, size });
       } else {
-        const { res } = await withCreds(r.url, { method: 'GET' });
+        const res = await withCreds(r.url, { method: 'GET' });
         const type = res.headers.get('content-type') || '';
         if (!res.ok) {
           out.push({ ok: false, status: res.status, contentType: type, text: '' });
@@ -284,12 +421,18 @@ export async function pageFetch(reqs) {
           out.push({ ok: false, status: res.status, contentType: type, text: '', error: 'too large' });
           continue;
         }
-        const text = await res.text();
-        if (text.length > r.maxBytes) out.push({ ok: false, status: res.status, contentType: type, text: '', error: 'too large' });
-        else out.push({ ok: true, status: res.status, contentType: type, text });
+        try {
+          out.push({ ok: true, status: res.status, contentType: type, text: await readCapped(res, r.maxBytes, ctl.signal) });
+        } catch (e) {
+          if (!e || e.name !== 'TooLargeError') throw e;
+          out.push({ ok: false, status: res.status, contentType: type, text: '', error: 'too large' });
+        }
       }
     } catch (e) {
       out.push({ ok: false, status: 0, contentType: '', text: '', size: -1, error: String((e && e.name) || 'error') });
+    } finally {
+      clearTimeout(timer);
+      ctl.abort(); // whatever was not read (a refused first try, a range body) is dropped
     }
   }
   return out;

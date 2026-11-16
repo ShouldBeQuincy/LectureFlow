@@ -27,9 +27,10 @@
 
 import { h, clear, btn, toast, preserveFocus, confirmDialog } from './dom.js';
 import { icon } from './icons.js';
-import { t, getLocale } from './i18n.js';
+import { t, has, getLocale } from './i18n.js';
 import { localeChoices, chooseLocale, langAttr } from './language.js';
 import * as U from './util.js';
+import { api } from './api.js';
 import { obApi, setErrorHandler, desktop } from './onboarding_api.js';
 import { computerStep } from './onboarding_computer.js';
 import { providersStep } from './onboarding_providers.js';
@@ -38,6 +39,7 @@ import { asrModeStep } from './onboarding_mode.js';
 import { storageStep } from './onboarding_storage.js';
 import { remoteStep } from './onboarding_remote.js';
 import { asrNotice } from './asr_ready.js';
+import { keepChildren } from './components_ui.js';
 
 export const STEPS = ['welcome', 'privacy', 'computer', 'asr_mode', 'storage', 'providers', 'download', 'selftest', 'first_course'];
 
@@ -270,7 +272,10 @@ export function mountOnboarding(main, ctx, route = {}) {
     if (how === 'course') setTimeout(() => ctx.newCourse(), 0);
   }
 
+  // r7 (T22 G10): leaving before the end says where the guide goes on from
+  // (the settings page's "continue setup", view_settings.js)
   function leave() {
+    if (!S.done && !S.loading && !S.loadError) toast(t('onboarding.leave_toast'), 'info');
     location.hash = '#/';
   }
 
@@ -297,15 +302,46 @@ export function mountOnboarding(main, ctx, route = {}) {
         );
         return;
       }
-      page.append(stepper(), card());
+      const c = card();
+      keepChildren(c.body, c.kids);
+      page.append(stepper(), c.el);
     });
   }
 
+  // A step is entered with the focus on its title (go). Steps 3-7 draw
+  // themselves again as their data comes (loading, then the content); the
+  // focused title stays the same node through these redraws (T23 general
+  // 16): the card's other parts are replaced around it, so the focus is not
+  // lost to the page and a screen reader does not read the title again.
+  // R81 L8: likewise a node the step keeps across its redraws (the
+  // download's task view with its status line and alert, the Colab
+  // sign-in's install): the card and its body stay, and the body's other
+  // parts are replaced around that node, which is never taken out and put
+  // back.
   function rerender() {
     if (!alive || !cur) return;
     const old = page.querySelector('.ob-card');
     if (!old) return render();
-    preserveFocus(() => old.replaceWith(card()));
+    preserveFocus(() => {
+      const next = card();
+      const sameStep = old.dataset.step === next.el.dataset.step;
+      const keep = old.querySelector('.ob-title');
+      const fresh = next.el.querySelector('.ob-title');
+      const oldBody = old.querySelector('.ob-body');
+      const titleStays = sameStep && !!keep && !!fresh && document.activeElement === keep;
+      const bodyStays = sameStep && !!oldBody && next.kids.some((k) => k instanceof Node && k.parentNode === oldBody);
+      if (!titleStays && !bodyStays) {
+        keepChildren(next.body, next.kids);
+        old.replaceWith(next.el);
+        return;
+      }
+      if (titleStays && keep.textContent !== fresh.textContent) keep.textContent = fresh.textContent;
+      keepChildren(bodyStays ? oldBody : next.body, next.kids);
+      keepChildren(
+        old,
+        [...next.el.childNodes].map((c) => (titleStays && c === fresh ? keep : bodyStays && c === next.body ? oldBody : c)),
+      );
+    });
   }
 
   function topBar() {
@@ -345,19 +381,36 @@ export function mountOnboarding(main, ctx, route = {}) {
     );
   }
 
+  // r7 (T22 G13): what "skip" does on this step, next to a main action that
+  // may look the same (its title, also the button's description): the
+  // steps that only explain, or whose main action also just goes on, say
+  // that skipping goes on the same way; the others what is left for later.
+  // A step whose skip depends on its branch or state says it itself
+  // (cur.skipTip: the remote branch's sign-in, the download; R75 M5).
+  function skipTip(step) {
+    if (cur && typeof cur.skipTip === 'function') return cur.skipTip();
+    return has(`onboarding.skip_tip.${step}`) ? t(`onboarding.skip_tip.${step}`) : t('onboarding.skip_tip.same');
+  }
+
+  // The step's card → {el, body, kids}: its body is empty, kids are what
+  // the step has in it (the caller puts them in: keepChildren).
   function card() {
     const step = S.step;
     const i = steps().indexOf(step);
     const primary = cur.primary ? cur.primary() : null;
     const secondary = cur.secondary ? cur.secondary() : [];
     const last = step === 'first_course';
-    return h(
+    const titleText = cur.title();
+    const descText = cur.desc();
+    const kids = [cur.body()].flat(Infinity);
+    const body = h('div', { class: 'ob-body' });
+    const el = h(
       'section',
       { class: 'ob-card', dataset: { step }, 'aria-labelledby': 'ob-title' },
       h('div', { class: 'ob-icon', 'aria-hidden': 'true' }, icon(STEP_ICONS[step], { size: 22 })),
-      h('h1', { class: 'ob-title', id: 'ob-title', tabindex: '-1' }, cur.title()),
-      h('p', { class: 'ob-desc' }, cur.desc()),
-      h('div', { class: 'ob-body' }, cur.body()),
+      h('h1', { class: 'ob-title', id: 'ob-title', tabindex: '-1' }, titleText),
+      h('p', { class: 'ob-desc' }, descText),
+      body,
       h(
         'footer',
         { class: 'ob-foot' },
@@ -366,11 +419,12 @@ export function mountOnboarding(main, ctx, route = {}) {
           'div',
           { class: 'ob-foot-r' },
           secondary,
-          btn(last ? t('onboarding.later') : t('onboarding.skip'), { kind: 'quiet', fkey: 'ob:skip', onclick: skip }),
+          btn(last ? t('onboarding.later') : t('onboarding.skip'), { kind: 'quiet', fkey: 'ob:skip', title: last ? undefined : skipTip(step), onclick: skip }),
           primary ? btn(primary.label, { kind: 'primary', icon: primary.icon, disabled: primary.disabled, fkey: 'ob:primary', onclick: primary.onclick }) : null,
         ),
       ),
     );
+    return { el, body, kids };
   }
 
   return {
@@ -409,6 +463,7 @@ function welcomeStep(env) {
     }
     if (!path || !env.alive()) return;
     const ok = await confirmDialog({ title: t('onboarding.import.confirm_title'), message: t('onboarding.import.confirm', { path }), okText: t('onboarding.import.confirm_ok') });
+    if (!ok) api.forgetFolderPick(path); // declined: the pick is given up, not left to expire
     if (!ok || !env.alive()) return;
     imp.path = path;
     imp.state = 'starting';
@@ -428,6 +483,9 @@ function welcomeStep(env) {
       imp.state = 'failed';
       imp.error = e.message;
       forgetImport();
+      // refused: the service returned the pick's grant, and "import again"
+      // asks for the folder again, so the pick is given up
+      api.forgetFolderPick(path);
     }
     if (!env.alive()) return;
     env.rerender();

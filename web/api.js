@@ -45,8 +45,13 @@ export function setHandlers(h) {
   onError = h.onError || null;
 }
 
+// err.reported: the error was handed to onError (the app toasts it), so
+// who would tell it elsewhere need not (dom.js: a dialog's busy request).
 function report(err) {
-  if (onError && err.status !== -1 && !err.needsModelChoice) onError(err);
+  if (onError && err.status !== -1 && !err.needsModelChoice) {
+    err.reported = true;
+    onError(err);
+  }
   return err;
 }
 
@@ -116,7 +121,13 @@ function forgetShared() {
 // AbortError (name === 'AbortError') and is never toasted (a request with a
 // signal is never shared).
 async function request(method, path, body, opts = {}) {
-  const fail = (err) => (opts.quiet ? err : report(err));
+  // err.method: the request's HTTP method (upper case), so a read's failure
+  // can be told apart from an action's (round 8: app.js onRequestError,
+  // dom.js tellFailure: while the connection is lost only actions are told)
+  const fail = (err) => {
+    err.method = method;
+    return opts.quiet ? err : report(err);
+  };
   const init = { method, cache: 'no-store', headers: {}, signal: opts.signal };
   if (body !== undefined) {
     init.headers['Content-Type'] = 'application/json';
@@ -161,7 +172,7 @@ export const api = {
   recheck: () => post('/api/system/recheck'), // System
   // sec-update M2: the data folder made private; quiet, system_datadir.js
   // toasts the failure itself (data_dir.restrict_failed, kept until closed)
-  restrictDataDir: () => post('/api/system/data-dir/restrict', undefined, { quiet: true }), // {check: SystemCheck}
+  restrictDataDir: () => post('/api/system/data-dir/restrict', undefined, { quiet: true }), // {check: SystemCheck, rollback_reset?: true}; errors may carry rollback_reset too
   setGPU: (paused, cancelRunning = false) => post('/api/system/gpu', { paused, cancel_running: cancelRunning }), // System
 
   // v1.1 A9, A10, A5. The dashboard, resources and settings reads are
@@ -211,11 +222,15 @@ export const api = {
 
   // lectures
   lectures: (courseId) => get(`/api/courses/${enc(courseId)}/lectures`), // []Lecture
-  lecture: (id, opts) => get(`/api/lectures/${enc(id)}`, opts), // Lecture; opts {quiet, signal}
+  lecture: (id, opts) => get(`/api/lectures/${enc(id)}${opts && opts.usageTotal ? '?usage_total=1' : ''}`, opts), // Lecture; opts {quiet, signal, usageTotal (also its usage_total, T25 S1: it scans the jobs, so asked for only now and then)}
   patchLecture: (id, p, opts) => patch(`/api/lectures/${enc(id)}`, p, opts), // Lecture | 409 RenumberConflict; p: LecturePatch {title?, title_zh?, recorded_at?, confirm?}
   renameLecture: (id, title) => patch(`/api/lectures/${enc(id)}`, { title }), // Lecture
   deleteLecture: (id, force = false, opts) => del(`/api/lectures/${enc(id)}${force ? '?force=1' : ''}`, opts), // 204 | 409; opts {quiet}
-  lectureStageAction: (id, stage, action, choice) => post(`/api/lectures/${enc(id)}/stages/${enc(stage)}/${enc(action)}`, choiceBody(choice)), // Lecture | 409
+  lectureStageAction: (id, stage, action, choice, opts) => post(`/api/lectures/${enc(id)}/stages/${enc(stage)}/${enc(action)}`, choiceBody(choice), opts), // Lecture | 409
+  // v3.2.x P1-b: a retry of summary / repair / translate with a model named
+  // for this retry only: manual {provider_id, model, thinking?, max_tokens?}
+  // (C10 contract; 400 model_choice.* / settings.*). opts: {quiet}
+  lectureRetryManual: (id, stage, manual, opts) => post(`/api/lectures/${enc(id)}/stages/${enc(stage)}/retry`, { model_choice: 'manual', manual }, opts), // Lecture | 400
   // "修复断句" (textrepair-int): the asr rerun with text_only
   lectureTextRepair: (id, choice) => post(`/api/lectures/${enc(id)}/stages/asr/rerun`, { text_only: true, ...choiceBody(choice) }), // Lecture | 409
   launchLecture: (id) => post(`/api/lectures/${enc(id)}/launch`), // Lecture
@@ -228,6 +243,8 @@ export const api = {
   sentenceEdit: (id, idx, text) => post(`/api/lectures/${enc(id)}/sentences/${idx}/edit`, { text }), // Sentence
   sentenceReset: (id, idx) => post(`/api/lectures/${enc(id)}/sentences/${idx}/reset`), // Sentence
   sentenceRetranslate: (id, idx) => post(`/api/lectures/${enc(id)}/sentences/${idx}/retranslate`), // Sentence
+  // v3.2.x P1-b: a pending sentence to the current translate model; 409 when that setting is unusable
+  sentenceRetranslateCurrent: (id, idx, opts) => post(`/api/lectures/${enc(id)}/sentences/${idx}/retranslate`, { use_current: true }, opts), // RetranslateResult
   patches: (id, review) => get(`/api/lectures/${enc(id)}/patches${review ? '?review=' + enc(review) : ''}`), // []Patch
   review: (patchId, action, text) => post(`/api/patches/${enc(patchId)}/review`, text == null ? { action } : { action, text }), // Patch
   audioURL: (id, startMs, endMs) => withMock(`/api/lectures/${enc(id)}/audio?start_ms=${startMs}&end_ms=${endMs}`),
@@ -323,7 +340,20 @@ export const api = {
   appUpdate: (opts) => get('/api/app/update', opts), // UpdateStatus {state, version, percent, error, download_requested, install_on_quit}
   downloadUpdate: (opts) => post('/api/app/update/download', undefined, opts), // 202 UpdateStatus | 409 update.not_available
   installUpdateOnQuit: (enabled, opts) => post('/api/app/update/install-on-quit', { enabled: !!enabled }, opts), // UpdateStatus
+
+  // r6 path-grants (internal/api/handlers_datadir.go; desktop app). The
+  // folder the user picked (window.lectureflow.pickFolder) will not be used:
+  // they declined the confirmation, the check refused it, or the service
+  // refused the move or the import (every page then asks again). The service
+  // forgets the pick now instead of when it expires (10 minutes). Callers do
+  // not wait for it: it never rejects and never toasts, a pick that could
+  // not be given up just expires.
+  forgetFolderPick: (path) => request('DELETE', '/api/app/folder-pick', { path }, { quiet: true }).then(noAnswer, noAnswer), // 204
 };
+
+function noAnswer() {
+  return null;
+}
 
 // ---- SSE "components" (v3-brief §7.2): {tasks: [TaskStatus]}, at most once a second ----
 //

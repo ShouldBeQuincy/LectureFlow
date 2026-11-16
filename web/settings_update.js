@@ -14,8 +14,11 @@
 //                with the time of the next automatic check; and the
 //                outcome of the last installation (result.json: installed,
 //                rolled back to the previous version, failed) with its reason
-//                under "查看详情". Buttons: check now, download, cancel the
-//                download, discard the pending update. A privacy note.
+//                under "查看详情"; a version whose installation failed is
+//                not offered again until a newer one appears (install_failed:
+//                "安装 x.y.z 没有成功" and "重新下载" to try it again).
+//                Buttons: check now, download, cancel the download, discard
+//                the pending update. A privacy note.
 //   从文件更新   update.json, update.json.minisig and the package, or one zip
 //                holding them: the system dialog or a drop (desktop app: the
 //                local paths are sent, nothing is uploaded)
@@ -39,6 +42,7 @@ import { icon } from './icons.js';
 import { t } from './i18n.js';
 import * as U from './util.js';
 import { MOCK, MOCK_SCENARIO, ApiError, errorText, localPath } from './api.js';
+import { externalLinkFailed } from './onboarding_api.js';
 
 // States of selfupdate.Status during which an operation runs.
 const BUSY = new Set(['checking', 'downloading', 'importing']);
@@ -143,6 +147,17 @@ function errorInfoText(info) {
   return U.errorInfoText(info, t('common.unknown_error'));
 }
 
+/**
+ * R75 M4: an offline update refused for its size or SHA-256 (the files the
+ * user chose do not belong together, or one is incomplete or too large;
+ * internal/selfupdate importer.go) has nothing to download again: its own
+ * words, {text, detail}. null for any other error (the shared text).
+ */
+export function importErrorInfo(e) {
+  if (!e || e.code !== 'selfupdate.checksum') return null;
+  return { text: t('settings.update.file_checksum', { file: (e.params && e.params.file) || '' }), detail: e.detail || '' };
+}
+
 /** True when Status.error is that of a check (a note next to an update that can be installed). */
 export const checkError = (st) => !!(st && st.error && !downloadError(st));
 
@@ -187,7 +202,7 @@ function extLink(url, text, fkey) {
         const lf = window.lectureflow;
         if (lf && typeof lf.openExternal === 'function') {
           e.preventDefault();
-          Promise.resolve(lf.openExternal(url)).catch(() => {});
+          Promise.resolve(lf.openExternal(url)).catch(externalLinkFailed);
         }
       },
     },
@@ -346,6 +361,19 @@ export function createUpdateSection(ui) {
 
   const check = () => act('check', () => suRequest('POST', '/api/selfupdate/check'));
   const download = () => act('download', () => suRequest('POST', '/api/selfupdate/download'));
+  // "Try again" for the version whose installation failed: downloading it
+  // is the retry (the server forgets the failure then). Without that
+  // version at hand (no check since), a check first; one that finds a
+  // newer version just shows it.
+  const retryFailed = () =>
+    act('download', async () => {
+      const f = st && st.install_failed;
+      let s = st;
+      const same = (x) => !!(f && x && x.available && x.available.version === f.version);
+      if (!same(s)) s = await suRequest('POST', '/api/selfupdate/check');
+      if (same(s) && s.state === 'install_failed' && s.available.direct && s.available.file) return suRequest('POST', '/api/selfupdate/download');
+      return s;
+    });
   const cancelDownload = () => act('cancel', () => suRequest('DELETE', '/api/selfupdate/download'));
 
   async function discard() {
@@ -382,7 +410,7 @@ export function createUpdateSection(ui) {
         if (s.pending) toast(t('settings.update.file_done', { version: s.pending.version }), 'success');
       }
     } catch (e) {
-      if (alive) importError = errInfo(e);
+      if (alive) importError = importErrorInfo(e) || errInfo(e);
     }
     acting = '';
     redraw();
@@ -471,10 +499,14 @@ export function createUpdateSection(ui) {
     const text = failed ? t('settings.update.state.download_failed', { version: a.version }) : t('settings.update.state.available', { version: a.version });
     out.push(line(failed ? 'circle-alert' : 'download', [text, a.channel === 'beta' ? h('span', { class: 'chip chip-quiet su-chip' }, t('settings.app.channel.beta')) : null], tools));
     out.push(releaseLine(a));
+    // r7 (T24 G8): "download it from the release page" comes with the link
+    // to it (the version's notes page, as on the workbench: update_hint.js)
+    const release = httpsURL(a.notes_url);
+    const manual = (text) => sub([text, release ? [' ', extLink(release, t('update.open_release'), 'set:upd:release')] : null], 'is-warn');
     if (!a.direct) {
-      out.push(sub(U.errorInfoText({ code: 'selfupdate.too_old', params: { current: st.current_version, min_version: a.min_version } }), 'is-warn'));
+      out.push(manual(U.errorInfoText({ code: 'selfupdate.too_old', params: { current: st.current_version, min_version: a.min_version } })));
     } else if (!a.file) {
-      out.push(sub(U.errorInfoText({ code: 'selfupdate.no_package', params: { platform: st.platform, kind: st.kind } }), 'is-warn'));
+      out.push(manual(U.errorInfoText({ code: 'selfupdate.no_package', params: { platform: st.platform, kind: st.kind } })));
     }
     return out;
   }
@@ -524,6 +556,24 @@ export function createUpdateSection(ui) {
     return h('div', { class: 'su-err' }, sub(t('settings.update.last_check_failed', { error: errorInfoText(st.error) }), 'is-warn'), details(st.error.detail, 'set:upd:errdetail'));
   }
 
+  // The version whose installation failed (install_failed): not offered
+  // again until a newer one appears, its package removed; "Download again"
+  // tries it once more (available is that version, or none until a check).
+  function failedLines(f, a) {
+    if (!f) return [];
+    const same = !!a && a.version === f.version;
+    const canRetry = !a || (same && a.direct && !!a.file);
+    const tools = [];
+    if (canRetry) tools.push(btn(t('settings.update.retry_download'), { size: 'sm', icon: 'rotate-cw', disabled: busy(), onclick: retryFailed, fkey: 'set:upd:retry' }));
+    tools.push(checkBtn());
+    return [
+      line('circle-alert', t('settings.update.state.install_failed', { version: f.version }), tools),
+      same ? releaseLine(a) : null,
+      sub(t('settings.update.install_failed_note')),
+      checkNote(),
+    ];
+  }
+
   function stateLines() {
     const a = st.available;
     switch (st.state) {
@@ -541,6 +591,8 @@ export function createUpdateSection(ui) {
         return [line('loader-circle', t('settings.update.state.importing'), null, true)];
       case 'pending':
         return st.pending ? [...pendingLines(st.pending, true), checkNote()] : [];
+      case 'install_failed':
+        return failedLines(st.install_failed, a);
       case 'error': {
         const dl = downloadError(st) && a;
         const err = st.error || {};

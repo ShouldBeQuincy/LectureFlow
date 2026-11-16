@@ -20,7 +20,9 @@ import (
 
 // The example files of the device endpoints (SPEC-v2 I6-I10, phase 3b task
 // E) for the front end: testdata/api/asr_devices.json (GET
-// /api/asr/devices) and openvino.json (System.openvino). They are written
+// /api/asr/devices), openvino.json (System.openvino) and
+// system_devices_lowvram*.json (System.devices with cuda:0's vram_hint, r2
+// N15 and T-PERF-02). They are written
 // by the real view code from fixed data; regenerate them with
 // LECTUREFLOW_UPDATE_EXAMPLES=1 go test ./internal/api -run TestDeviceExampleFiles.
 // Like the other examples they must decode into the frozen types without
@@ -97,12 +99,39 @@ func exampleDeviceServer(t *testing.T) *Server {
 func TestDeviceExampleFiles(t *testing.T) {
 	s := exampleDeviceServer(t)
 	ctx := context.Background()
+	// r2 N15: System.devices on a 4 GB NVIDIA card (cuda:0 runs large-v3,
+	// auto: its vram_hint; the per-task estimate of large-v3 int8_float16
+	// is 3100 MB since T-PERF-02, which fits the card: this server has no
+	// settings, so no reserve and no extra sentence)
+	lowVRAM := s.deviceViews(ctx)
+	s.vramHints(ctx, lowVRAM, GPUInfo{TotalMB: 4096, EstimatedJobMB: 3100})
+	// T-PERF-02: the same card with cuda:0 at float16 (5000 MB, more than
+	// the card): the sentence suggesting large-v3-turbo int8_float16
+	lowVRAMFP16 := s.deviceViews(ctx)
+	for i := range lowVRAMFP16 {
+		if lowVRAMFP16[i].ID == model.DeviceCUDA0 {
+			lowVRAMFP16[i].Precision = model.PrecisionFloat16
+		}
+	}
+	s.vramHints(ctx, lowVRAMFP16, GPUInfo{TotalMB: 4096, EstimatedJobMB: 5000})
+	// the same card after switching cuda:0 to large-v3-turbo (1600 MB): no
+	// hint since T-PERF-02
+	lowVRAMTurbo := s.deviceViews(ctx)
+	for i := range lowVRAMTurbo {
+		if lowVRAMTurbo[i].ID == model.DeviceCUDA0 {
+			lowVRAMTurbo[i].Model = "large-v3-turbo"
+		}
+	}
+	s.vramHints(ctx, lowVRAMTurbo, GPUInfo{TotalMB: 4096, EstimatedJobMB: 1600})
 	files := map[string]struct {
 		v   any
 		dst func() any
 	}{
-		"asr_devices.json": {s.deviceViews(ctx), func() any { return &[]ASRDeviceView{} }},
-		"openvino.json":    {s.openVINOInfo(), func() any { return &OpenVINOInfo{} }},
+		"asr_devices.json":                  {s.deviceViews(ctx), func() any { return &[]ASRDeviceView{} }},
+		"openvino.json":                     {s.openVINOInfo(), func() any { return &OpenVINOInfo{} }},
+		"system_devices_lowvram.json":       {lowVRAM, func() any { return &[]ASRDeviceView{} }},
+		"system_devices_lowvram_fp16.json":  {lowVRAMFP16, func() any { return &[]ASRDeviceView{} }},
+		"system_devices_lowvram_turbo.json": {lowVRAMTurbo, func() any { return &[]ASRDeviceView{} }},
 	}
 	dir := filepath.Join("..", "..", "testdata", "api")
 	for name, f := range files {

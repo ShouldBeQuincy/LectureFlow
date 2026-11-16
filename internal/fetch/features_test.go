@@ -113,19 +113,79 @@ func TestEngineFollowsBuildFeatures(t *testing.T) {
 			t.Fatalf("the macOS build started with options it does not know: %v", err)
 		}
 	})
+	// SEC19 low-4: without its features known aria2c is not started. Its
+	// BitTorrent and Metalink options cannot be given to a build that lacks
+	// them, and without them a build that has them follows a .torrent: the
+	// peers, DHT and UDP trackers are not reached through the guard proxy.
+	// The next start reads --version again (a virus scanner may have held
+	// the first one up).
 	t.Run("version unreadable", func(t *testing.T) {
-		t.Setenv("LF_FAKE_ARIA2C_FEATURES", featuresMac)
+		t.Setenv("LF_FAKE_ARIA2C_FEATURES", featuresWindows)
 		eng := childEngine(t, io.Discard, nil)
-		eng.versionOf = func(string) (string, error) { return "", errors.New("exit status 1") }
+		var launches, probes atomic.Int32
+		launch := eng.launch
+		eng.launch = func(exe string, args []string, out io.Writer) (Process, error) {
+			launches.Add(1)
+			return launch(exe, args, out)
+		}
+		readable := false
+		for _, out := range []string{"", "aria2 version 1.37.0\n"} { // (an error; no features line)
+			eng.versionOf = func(exe string) (string, error) {
+				probes.Add(1)
+				if readable {
+					return runVersion(exe)
+				}
+				if out == "" {
+					return "", errors.New("exit status 1")
+				}
+				return out, nil
+			}
+			_, err := eng.acquire(context.Background())
+			if !errors.Is(err, errFeaturesUnknown) || !strings.Contains(err.Error(), "--version") {
+				t.Fatalf("%q: %v", out, err)
+			}
+			if launches.Load() != 0 {
+				t.Fatalf("%q: aria2c was started", out)
+			}
+			if eng.systemResolver() {
+				t.Errorf("%q: the system's resolver without the features", out)
+			}
+		}
+		readable = true
 		in, err := eng.acquire(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer eng.release()
-		if args := in.proc.(*execProcess).cmd.Args; slices.Contains(args, "--follow-torrent=false") {
+		if args := in.proc.(*execProcess).cmd.Args; !slices.Contains(args, "--follow-torrent=false") || !slices.Contains(args, "--follow-metalink=false") {
 			t.Fatalf("args %v", args)
 		}
+		if n := probes.Load(); n != 3 || launches.Load() != 1 {
+			t.Errorf("--version read %d times, aria2c started %d times", n, launches.Load())
+		}
 	})
+}
+
+// The task of a queue whose aria2c --version cannot be read fails with
+// downloads.engine_failed, saying why, and nothing is downloaded.
+func TestQueueAria2cFeaturesUnknown(t *testing.T) {
+	e := newQEnv(t, func(o *Options) {
+		o.ariaVersion = func(string) (string, error) { return "", errors.New("exit status 1") }
+	})
+	e.media.put("/files/a.m4a", pattern(1, 1000))
+	info := e.wait(e.enqueue(e.request("s1", e.fileTrack(bridge.KindAudio, "/files/a.m4a"))), bridge.StateFailed)
+	if info.Error == nil || info.Error.Code != CodeEngineFailed {
+		t.Fatalf("%+v", info.Error)
+	}
+	if e.aria.running() {
+		t.Error("aria2c was started")
+	}
+	if adds, _, _, _, _ := e.aria.snapshot(); len(adds) != 0 {
+		t.Errorf("aria2c was given %+v", adds)
+	}
+	if !strings.Contains(e.logs.String(), "--version") {
+		t.Errorf("the log does not say why:\n%s", e.logs.String())
+	}
 }
 
 // The whole queue on a macOS build: the download completes, with the
@@ -175,7 +235,10 @@ func TestRealAria2cAcceptsOurOptions(t *testing.T) {
 		t.Skip("no bundled aria2c (stage the desktop resources or set LF_ARIA2C)")
 	}
 	eng := &engine{exe: exe, log: slog.New(slog.NewTextHandler(io.Discard, nil)), hc: &http.Client{}}
-	feats := eng.features(exe)
+	feats, err := eng.features(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Logf("%s: %+v", exe, feats)
 	secret, _ := randomHex(24)
 	conf, err := writeConf(secret)

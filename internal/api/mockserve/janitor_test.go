@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"lectureflow/internal/api"
+	"lectureflow/internal/glossary"
 	"lectureflow/internal/model"
 )
 
@@ -106,6 +107,14 @@ func TestJanitorReviewAndFallback(t *testing.T) {
 	doJSON(t, "POST", cs+"/glossary/review?mock=unset", nil, http.StatusOK, &res)
 	if res.Queued || res.Report == nil || !res.Report.Fallback || res.Report.Note == "" {
 		t.Fatalf("fallback %+v", res)
+	}
+	// the coded note, as internal/glossary writes it (the page shows it in
+	// the interface language)
+	if ni := res.Report.NoteInfo; ni == nil || ni.Code != glossary.CodeNoteFallbackManual {
+		t.Errorf("fallback note_info %+v", ni)
+	}
+	if rep.NoteInfo != nil {
+		t.Errorf("janitor run note_info %+v", rep.NoteInfo)
 	}
 	for _, it := range res.Report.Items {
 		if it.Action != model.JanitorReference && it.Action != model.JanitorDisable {

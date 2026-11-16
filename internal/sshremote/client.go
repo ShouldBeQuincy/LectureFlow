@@ -116,7 +116,7 @@ func connect(ctx context.Context, t target) (*conn, error) {
 		cancel()
 		if err != nil {
 			cleanup()
-			return nil, fmt.Errorf("%w: %v", errOffline, err)
+			return nil, wrapNet(errOffline, err)
 		}
 		hop := i
 		cfg := &ssh.ClientConfig{
@@ -136,6 +136,10 @@ func connect(ctx context.Context, t target) (*conn, error) {
 		if err != nil {
 			raw.Close()
 			cleanup()
+			var mm *keyMismatchError
+			if errors.As(err, &mm) {
+				mm.hop = i // which hop's pinned key it was (Connect shows that hop)
+			}
 			return nil, classifyHandshake(err)
 		}
 		_ = raw.SetDeadline(time.Time{})
@@ -149,7 +153,7 @@ func connect(ctx context.Context, t target) (*conn, error) {
 		go c.keepalive()
 		go func() {
 			err := client.Wait()
-			c.closeWith(fmt.Errorf("%w: %v", errLost, err))
+			c.closeWith(wrapNet(errLost, err))
 		}()
 		return c, nil
 	}
@@ -170,13 +174,13 @@ func classifyHandshake(err error) error {
 	case errors.Is(err, errHostKeyUnknown), errors.Is(err, errHostKeyMismatch):
 		return err
 	case strings.Contains(err.Error(), "unable to authenticate"), strings.Contains(err.Error(), "no supported methods remain"):
-		return fmt.Errorf("%w: %v", errAuth, err)
+		return wrapNet(errAuth, err)
 	}
 	var ne net.Error
 	if errors.As(err, &ne) || errors.Is(err, io.EOF) {
-		return fmt.Errorf("%w: %v", errOffline, err)
+		return wrapNet(errOffline, err)
 	}
-	return fmt.Errorf("%w: %v", errHandshake, err)
+	return wrapNet(errHandshake, err)
 }
 
 // keepalive sends keepalive@openssh.com; keepaliveMisses failures in a row
@@ -237,14 +241,14 @@ func (c *conn) run(ctx context.Context, cmd string, stdin io.Reader, stdout io.W
 	}
 	sess, err := c.client.NewSession()
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", errLost, err)
+		return "", wrapNet(errLost, err)
 	}
 	defer sess.Close()
 	var stderr limitedBuffer
 	stderr.max = 4096
 	sess.Stdin, sess.Stdout, sess.Stderr = stdin, stdout, &stderr
 	if err := sess.Start(cmd); err != nil {
-		return "", fmt.Errorf("%w: %v", errLost, err)
+		return "", wrapNet(errLost, err)
 	}
 	done := make(chan error, 1)
 	go func() { done <- sess.Wait() }()
@@ -265,7 +269,7 @@ func (c *conn) run(ctx context.Context, cmd string, stdin io.Reader, stdout io.W
 		if errors.As(err, &ee) {
 			return stderr.String(), &exitError{code: ee.ExitStatus(), stderr: stderr.String()}
 		}
-		return stderr.String(), fmt.Errorf("%w: %v", errLost, err)
+		return stderr.String(), wrapNet(errLost, err)
 	}
 	return stderr.String(), nil
 }

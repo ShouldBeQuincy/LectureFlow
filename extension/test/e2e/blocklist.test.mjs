@@ -93,6 +93,24 @@ test('YouTube: "LectureFlow 不处理 YouTube", no tracks, no number on the badg
   await page.close();
 });
 
+test('LectureFlow installed but not open: the popup on a do-not-handle site never starts it (T26 G1)', async () => {
+  await H.fakeLectureFlow(worker, { mode: 'stopped' });
+  try {
+    for (const site of ['www.youtube-nocookie.com', 'www.edx.org']) {
+      const page = await openPage(`http://${site}:${port()}/blocked/course.html`);
+      const popup = await openPopup(await tabIdOf(page), 'unsupported');
+      await popup.waitForFunction(() => document.getElementById('conn').dataset.nmState !== 'checking', null, { timeout: 15000 });
+      await popup.waitForTimeout(300);
+      assert.equal(await H.launches(worker), 0, site);
+      assert.ok((await H.hellos(worker)).every((m) => m.noLaunch === true), `${site}: every hello says noLaunch`);
+      await popup.close();
+      await page.close();
+    }
+  } finally {
+    await H.fakeLectureFlow(worker);
+  }
+});
+
 test('a course platform page: "不处理在线课程平台（MOOC、付费课程）", although its video is on a CDN the extension may read', async () => {
   const page = await openPage(`http://www.edx.org:${port()}/blocked/course.html`);
   const tabId = await tabIdOf(page);

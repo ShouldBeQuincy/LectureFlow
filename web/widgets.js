@@ -76,7 +76,8 @@ export function uploadRow(item, { onRetry, onRemove }) {
     'li',
     { class: `upload-row upload-${item.status}`, dataset: { up: item.key } },
     h('span', { class: 'up-name', title: name }, title || name, h('span', { class: 'muted' }, `${title ? ` · ${name}` : ''}${item.file.size == null ? '' : ` · ${U.fmtBytes(item.file.size)}`}`)),
-    item.status === 'failed' ? null : h('progress', { class: 'up-progress', max: '1', value: item.status === 'uploading' ? item.fraction : 0 }),
+    // named by its file (L16); the value (or none: indeterminate) is the element's own
+    item.status === 'failed' ? null : h('progress', { class: 'up-progress', max: '1', 'aria-label': title || name, value: item.status === 'uploading' ? item.fraction : 0 }),
     h('span', { class: 'up-status', text: uploadStatusText(item) }),
     h('span', { class: 'up-actions' }, buttons),
   );

@@ -237,7 +237,8 @@ func TestBrowserReady(t *testing.T) {
 		{mediaInfo{Format: mp4, Video: v("h264", "yuv420p10le"), Audio: a("aac")}, planTranscode}, // High 10: browsers cannot decode
 		{mediaInfo{Format: mp4, Video: v("hevc", "yuv420p"), Audio: a("aac")}, planTranscode},
 		{mediaInfo{Format: mp4, Video: v("h264", "yuv420p"), Audio: a("mp3")}, planTranscode},
-		{mediaInfo{Format: "matroska,webm", Video: v("h264", "yuv420p"), Audio: a("aac")}, planTranscode}, // P8.1: MP4 container only
+		{mediaInfo{Format: "matroska,webm", Video: v("h264", "yuv420p"), Audio: a("aac")}, planRemux}, // test-media I5: the container does not matter
+		{mediaInfo{Format: "matroska,webm", Video: v("h264", "yuv420p"), Audio: a("opus")}, planTranscode},
 		{mediaInfo{Format: "avi", Video: v("mpeg4", "yuv420p"), Audio: a("mp3")}, planTranscode},
 		{mediaInfo{Format: "wav", Audio: a("pcm_s16le")}, planNone},
 		{mediaInfo{Format: mp4, Video: v("h264", "yuv420p")}, planNone}, // no audio: not generated

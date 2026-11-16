@@ -11,6 +11,7 @@ package sshremote
 import (
 	"context"
 	"encoding/json"
+	"sort"
 
 	"lectureflow/internal/remote"
 )
@@ -39,6 +40,7 @@ func (s *Server) Card(context.Context) remote.Card {
 	for _, j := range s.runs {
 		c.Jobs = append(c.Jobs, *j)
 	}
+	sort.Slice(c.Jobs, func(a, b int) bool { return c.Jobs[a].JobID < c.Jobs[b].JobID }) // job ids are ULIDs: by start
 	if s.c != nil {
 		c.Machine = s.samples.Machine()
 		c.Usage = s.samples.Usage(s.m.now())

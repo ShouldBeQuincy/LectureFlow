@@ -451,12 +451,18 @@ func (m *Manager) intact(e Installed) bool {
 	case KindVenv:
 		return venvOK(filepath.Join(dir, "venv"))
 	case KindPythonRuntime:
-		return venvOK(filepath.Join(dir, "venv")) && fileExists(filepath.Join(dir, filepath.FromSlash(e.Exe)))
+		exe, ok := m.exePath(e)
+		return ok && venvOK(filepath.Join(dir, "venv")) && fileExists(exe)
 	case KindTool:
-		return fileExists(filepath.Join(dir, filepath.FromSlash(e.Exe)))
+		exe, ok := m.exePath(e)
+		return ok && fileExists(exe)
 	case KindModel, KindBinary:
 		for _, f := range e.Files {
-			if fi, err := os.Stat(filepath.Join(dir, filepath.FromSlash(f.Path))); err != nil || fi.Size() != f.Size {
+			p, ok := m.filePath(e, f)
+			if !ok {
+				return false
+			}
+			if fi, err := os.Stat(p); err != nil || fi.Size() != f.Size {
 				return false
 			}
 		}
@@ -716,7 +722,9 @@ func (m *Manager) installedFiles(st *state) map[string]string {
 	out := map[string]string{}
 	for _, e := range st.Active {
 		for _, f := range e.Files {
-			out[f.SHA256] = filepath.Join(m.abs(e.Dir), filepath.FromSlash(f.Path))
+			if p, ok := m.filePath(e, f); ok {
+				out[f.SHA256] = p
+			}
 		}
 	}
 	return out
@@ -1288,7 +1296,8 @@ func (m *Manager) CheckManifest(ctx context.Context) (bool, error) {
 	if u == "" {
 		return false, cerr(CodeNoUpdateURL, nil, errors.New("no manifest update URL"))
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	// (with the redirect chain's state, download.go)
+	req, err := http.NewRequestWithContext(withRedirectChain(ctx), http.MethodGet, u, nil)
 	if err != nil {
 		return false, cerr(CodeNetwork, nil, err)
 	}

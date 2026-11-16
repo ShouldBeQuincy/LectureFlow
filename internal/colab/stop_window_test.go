@@ -45,7 +45,7 @@ func checkStoppedAfterResult(t *testing.T, e *testEnv, path string, err error, r
 	if err != nil {
 		t.Fatalf("Transcribe: %v (the result was already written)", err)
 	}
-	if got, _ := os.ReadFile(path); string(got) != e.rs.vars["result_json"] {
+	if got, _ := os.ReadFile(path); !sameResult(got, e.rs.vars["result_json"]) {
 		t.Fatal("result.json differs from the download")
 	}
 	st := e.b.Status(ctx)

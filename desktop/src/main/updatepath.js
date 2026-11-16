@@ -9,6 +9,9 @@
 // state "not_configured" with reason "no_public_key" and the electron-updater
 // path stays exactly as it was. Once a key is built in, electron-updater is
 // never loaded.
+// Since security audit FB1 L-8 the packaged app's loadUpdater (main.js)
+// never loads electron-updater on that path either: there it only means "no
+// automatic updates"; development runs keep the tests' stand-in.
 //
 // Decided once per run, after the service is ready (the shell's poll).
 // Only an answer decides: a service that does not answer (yet) is asked

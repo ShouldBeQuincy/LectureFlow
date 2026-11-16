@@ -251,9 +251,16 @@ func TestCrossSiteWritesRefused(t *testing.T) {
 			t.Errorf("PATCH %v: %d %s", h, res.StatusCode, b)
 		}
 	}
-	for _, h := range refused { // reading stays possible (the browser keeps the answer from the other site)
-		if res, b := e.doHeaders("GET", "/api/app/settings", nil, h); res.StatusCode != http.StatusOK {
-			t.Errorf("GET %v: %d %s", h, res.StatusCode, b)
+	for _, h := range refused {
+		// AUD1 L-3: a read the browser marks as another site's is refused too
+		// (some reads change something); a browser without Fetch Metadata
+		// may still read (its Origin is checked for writes only)
+		want := http.StatusOK
+		if h["Sec-Fetch-Site"] != "" {
+			want = http.StatusForbidden
+		}
+		if res, b := e.doHeaders("GET", "/api/app/settings", nil, h); res.StatusCode != want {
+			t.Errorf("GET %v: %d %s, want %d", h, res.StatusCode, b, want)
 		}
 	}
 	// desktop mode: the same Fetch Metadata check besides the token

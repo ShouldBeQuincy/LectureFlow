@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"lectureflow/internal/bridge"
+	"lectureflow/internal/db"
 )
 
 // Cookies (SPEC-ext 凭据处理): the extension sends the cookies of the track
@@ -56,16 +57,32 @@ func allExpired(cs []bridge.Cookie, now time.Time) bool {
 	return true
 }
 
+// Host names are compared by db.HostKey, the rule of the origins API keys
+// are bound to (SEC8 low-1, SEC9 info-4): ASCII letters lower-cased only. A
+// host or cookie domain with a byte outside ASCII (written as is or
+// percent-encoded) equals only the same bytes: Unicode lower-casing made
+// "cdn.v\u0130deo.example" (U+0130) a subdomain of "video.example", while
+// net/http dials its IDNA form, another (punycode) domain. A URL written in
+// punycode ("xn--...") is ASCII and matches as before.
+
+// sameHost reports whether two hosts as written are one host (db.HostKey).
+func sameHost(a, b string) bool {
+	ka, _ := db.HostKey(a)
+	kb, _ := db.HostKey(b)
+	return ka == kb
+}
+
 // domainMatch is RFC 6265 5.1.3: a host-only cookie goes to its host
 // only, a domain cookie also to its subdomains; an IP address is never a
-// "subdomain" (a cookie of "0.0.1" must not go to 127.0.0.1; fuzz).
+// "subdomain" (a cookie of "0.0.1" must not go to 127.0.0.1; fuzz), nor is
+// a host or domain with a byte outside ASCII (only the same bytes match).
 func domainMatch(host string, c bridge.Cookie) bool {
-	d := strings.ToLower(strings.TrimPrefix(c.Domain, "."))
-	host = strings.ToLower(host)
+	d, dASCII := db.HostKey(strings.TrimPrefix(c.Domain, "."))
+	host, hASCII := db.HostKey(host)
 	if d == "" {
 		return false
 	}
-	if c.HostOnly || net.ParseIP(host) != nil {
+	if c.HostOnly || !dASCII || !hASCII || net.ParseIP(host) != nil {
 		return host == d
 	}
 	return host == d || strings.HasSuffix(host, "."+d)
@@ -115,6 +132,13 @@ func cookieHeader(rawURL string, cs []bridge.Cookie, now time.Time) string {
 // requestHeaders are the extra headers of a request for rawURL: the
 // matching cookies and the page as Referer, as much of it as rawURL may
 // see (refererFor). Never logged.
+//
+// Only Cookie and Referer. A request handed to aria2c must not carry an
+// Authorization header: the guard proxy takes one for the Basic
+// authentication aria2c makes of a URL's user info and refuses the
+// request (guard.go forward: downloads.unusual_host). A platform that
+// needs Bearer authentication, or a mirror with credentials, needs that
+// rule of the guard changed first.
 func requestHeaders(rawURL string, cs []bridge.Cookie, referer string, now time.Time) []string {
 	var h []string
 	if v := cookieHeader(rawURL, cs, now); v != "" {
@@ -152,7 +176,8 @@ func refererFor(page, target string) string {
 	if sameOrigin(p, t) {
 		return cleanReferer(page)
 	}
-	scheme, host := strings.ToLower(p.Scheme), strings.ToLower(p.Hostname())
+	scheme, host := strings.ToLower(p.Scheme), p.Hostname()
+	host, _ = db.HostKey(host)
 	if strings.Contains(host, ":") {
 		host = "[" + host + "]"
 	}
@@ -169,7 +194,8 @@ func trustworthy(u *url.URL) bool {
 	if strings.EqualFold(u.Scheme, "https") {
 		return true
 	}
-	h := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	h, _ := db.HostKey(u.Hostname())
+	h = strings.TrimSuffix(h, ".")
 	if ip, err := netip.ParseAddr(h); err == nil {
 		return ip.Unmap().IsLoopback()
 	}
@@ -187,10 +213,10 @@ func cleanReferer(page string) string {
 	return p.String()
 }
 
-// sameOrigin compares scheme, host and port (the scheme's default port
-// when none is written).
+// sameOrigin compares scheme, host (sameHost) and port (the scheme's
+// default port when none is written).
 func sameOrigin(a, b *url.URL) bool {
-	if !strings.EqualFold(a.Scheme, b.Scheme) || !strings.EqualFold(a.Hostname(), b.Hostname()) {
+	if !strings.EqualFold(a.Scheme, b.Scheme) || !sameHost(a.Hostname(), b.Hostname()) {
 		return false
 	}
 	return effectivePort(a) == effectivePort(b)

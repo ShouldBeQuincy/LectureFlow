@@ -105,6 +105,10 @@ func TestUploadLectureMediaChecks(t *testing.T) {
 		{"rec.MP4", "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\n\\\\server\\share\\x.ts\n", codeUploadPlaylist, map[string]any{"name": "rec.MP4", "kind": "m3u8"}},
 		{"rec.mp3", "ffconcat version 1.0\nfile 'a.wav'\n", codeUploadPlaylist, map[string]any{"name": "rec.mp3", "kind": "ffconcat"}},
 		{"rec.wav", "CONCAT script that only ffprobe recognises", codeUploadMediaFormat, map[string]any{"name": "rec.wav", "format": "concat"}},
+		// test-media I6: an empty file and a web page are refused on import
+		{"Week 5.mp4", "", codeUploadEmpty, map[string]any{"name": "Week 5.mp4"}},
+		{"Week 6.mp4", "<!DOCTYPE html>\n<html><head><title>Sign in</title></head></html>\n", codeUploadHTML, map[string]any{"name": "Week 6.mp4"}},
+		{"Week 7.m4a", "\xef\xbb\xbf\r\n<HTML>\n<body>403 Forbidden</body></HTML>", codeUploadHTML, map[string]any{"name": "Week 7.m4a"}},
 	}
 	for _, tc := range refused {
 		res, b := e.upload("/api/courses/"+c.ID+"/lectures", nil, tc.name, []byte(tc.body))
@@ -169,6 +173,8 @@ func TestReplaceMediaChecks(t *testing.T) {
 		{"rec.mp4", "#EXTM3U\n", codeUploadPlaylist},
 		{"rec.mp4", "CONCAT", codeUploadMediaFormat},
 		{"rec.m3u8", "#EXTM3U\n", codeUploadNotMedia},
+		{"rec.mp4", "", codeUploadEmpty},
+		{"rec.mp4", "<!doctype html><html>", codeUploadHTML},
 	} {
 		res, b := put(tc.name, tc.body)
 		if res.StatusCode != http.StatusBadRequest || errCode(t, b) != tc.code {
@@ -239,8 +245,9 @@ func TestImportDownloadRefusesPlaylist(t *testing.T) {
 	for _, body := range []string{"#EXTM3U\n#EXTINF:1,\n\\\\server\\share\\x.ts\n", "CONCAT"} {
 		src := writeDownload(t, e, body)
 		_, err := e.srv.ImportDownload(ctx, fetch.ImportRequest{CourseID: c.ID, Path: src, Filename: "Lecture 1.mp4", Title: "Lecture 1"})
-		var he *httpError
-		if !errors.As(err, &he) || (he.info.Code != codeUploadPlaylist && he.info.Code != codeUploadMediaFormat) {
+		// the download task shows this code (review R10 M1)
+		var rf *fetch.ImportRefused
+		if !errors.As(err, &rf) || (rf.Code != codeUploadPlaylist && rf.Code != codeUploadMediaFormat) {
 			t.Fatalf("%q: err %v", body, err)
 		}
 		if b, err := os.ReadFile(src); err != nil || string(b) != body {
@@ -254,6 +261,8 @@ func TestImportDownloadRefusesPlaylist(t *testing.T) {
 	if _, err := e.srv.ImportDownload(ctx, fetch.ImportRequest{CourseID: c.ID, Path: src, Filename: "x.mp4", Title: "x",
 		Angles: []fetch.ImportAngle{{Name: fetch.AngleName, Path: angleSrc}}}); err == nil {
 		t.Fatal("a playlist angle was imported")
+	} else if rf := (*fetch.ImportRefused)(nil); !errors.As(err, &rf) || rf.Code != codeUploadPlaylist {
+		t.Fatalf("a playlist angle: err %v", err)
 	}
 	for _, p := range []string{src, angleSrc} {
 		if _, err := os.Stat(p); err != nil {
@@ -262,6 +271,38 @@ func TestImportDownloadRefusesPlaylist(t *testing.T) {
 	}
 	if ls, _ := e.st.ListLectures(ctx, c.ID); len(ls) != 0 {
 		t.Fatalf("lectures created: %+v", ls)
+	}
+}
+
+// test-media I6: a finished download that is empty or a sign-in page is
+// refused with its own code (not media.corrupt later in prep), and the file
+// goes back to the task's directory.
+func TestImportDownloadRefusesEmptyAndHTML(t *testing.T) {
+	probe := &fakeProbe{}
+	e := newEnv(t, func(s *Server) { s.runCmd = probe.run })
+	withFakeFFprobe(t, e)
+	ctx := context.Background()
+	c := e.course("C")
+	for _, tc := range []struct{ body, code string }{
+		{"", codeUploadEmpty},
+		{"<!DOCTYPE html>\n<html lang=\"en\"><head><title>Log in</title>", codeUploadHTML},
+	} {
+		src := writeDownload(t, e, tc.body)
+		_, err := e.srv.ImportDownload(ctx, fetch.ImportRequest{CourseID: c.ID, Path: src, Filename: "Lecture 1.mp4", Title: "Lecture 1"})
+		// the download task shows this code and the file name (review R10 M1)
+		var rf *fetch.ImportRefused
+		if !errors.As(err, &rf) || rf.Code != tc.code || rf.Params["name"] != "Lecture 1.mp4" || len(rf.Params) != 1 {
+			t.Fatalf("%q: err %v", tc.body, err)
+		}
+		if b, err := os.ReadFile(src); err != nil || string(b) != tc.body {
+			t.Fatalf("not given back: %q %v", b, err)
+		}
+	}
+	if ls, _ := e.st.ListLectures(ctx, c.ID); len(ls) != 0 {
+		t.Fatalf("lectures created: %+v", ls)
+	}
+	if len(probe.calls) != 0 {
+		t.Fatalf("ffprobe ran: %v", probe.calls)
 	}
 }
 
@@ -290,6 +331,7 @@ func TestDataImportRefusesNetworkPaths(t *testing.T) {
 	e := newDDEnv(t)
 	src := devDataDir(t)
 	addStoredPaths(t, src, []string{`\\attacker\share\a.mp4`, `//?/UNC/attacker/share/b.mp4`, filepath.Join(src, "courses", "C1", "lectures", "L2", "media.mp4")}, `\\attacker\share\slides.pdf`)
+	e.pick(src)
 	res, b := e.req("POST", "/api/app/import", map[string]string{"path": src})
 	if res.StatusCode != http.StatusBadRequest || errCode(t, b) != codeImportNetworkPath {
 		t.Fatalf("import: %d %s", res.StatusCode, b)
@@ -324,6 +366,7 @@ func TestDataImportStagedNetworkPaths(t *testing.T) {
 		_, err = d.Exec(`UPDATE lecture SET media_path = '\\attacker\share\x.mp4'`)
 		return err
 	}
+	e.pick(src)
 	res, b := e.req("POST", "/api/app/import", map[string]string{"path": src})
 	if res.StatusCode != http.StatusAccepted {
 		t.Fatalf("%d %s", res.StatusCode, b)

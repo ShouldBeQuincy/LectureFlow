@@ -60,6 +60,22 @@ export function formatMessage(entry, subs) {
   return named.replace(/\$(\$|[1-9])/g, (m, d) => (d === '$' ? '$' : list[Number(d) - 1] === undefined ? '' : String(list[Number(d) - 1])));
 }
 
+/**
+ * The message key for "N tracks found": _locales has no plural rules, so
+ * exactly one track takes its own key (English "1 track found").
+ */
+export function tracksFoundKey(n) {
+  return Number(n) === 1 ? 'tracksDetectedOne' : 'tracksDetected';
+}
+
+/**
+ * The message key for the options page's "<host> · N tracks" row, chosen
+ * by count the same way (English "example.org · 1 track").
+ */
+export function reportRowKey(n) {
+  return Number(n) === 1 ? 'reportRowOne' : 'reportRow';
+}
+
 /** The catalogs of a chain (most specific first) as one: the first that has a key wins. */
 export function mergeCatalogs(catalogs) {
   const out = {};

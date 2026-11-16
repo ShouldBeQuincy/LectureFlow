@@ -36,6 +36,9 @@ type StageModel struct {
 	// front end can write the label in the interface language; omitted for
 	// asr. Label stays the preformatted fallback.
 	Params *model.RoleParams `json:"params,omitempty"`
+	// Source (v3.2.x P1-b): "manual" when the snapshot was named by hand for
+	// one retry (model.SnapshotSourceManual, "临时指定"); omitted otherwise.
+	Source string `json:"source,omitempty"`
 	// ASR is the structured asr snapshot (as SnapshotView.ASR; 3b Gate
 	// round 2): {auto: true, language} without a device while no device is
 	// chosen yet, so the front end writes that label in the interface
@@ -48,12 +51,27 @@ type StageModel struct {
 // ModelChoiceRequest is the optional body of rerun, retry, update and the
 // batch operations that may need a model choice.
 type ModelChoiceRequest struct {
-	ModelChoice string `json:"model_choice,omitempty"` // "" | snapshot | current
+	ModelChoice string `json:"model_choice,omitempty"` // "" | snapshot | current | manual
+	// Manual (v3.2.x P1-b, lead freeze): the target of this one retry, with
+	// model_choice manual only (400 otherwise, and 400 when manual has none).
+	// Retry of summary, repair and translate; written to the retried job's
+	// snapshot, never to the role's setting.
+	Manual *ManualModel `json:"manual,omitempty"`
 	// TextOnly (textrepair-int, an optional field the lead approved): the asr
 	// rerun "修复断句" — the stored transcript is repaired, not transcribed
 	// again (offered as model.ActionRerunTextOnly). Only with stage asr and
 	// action rerun; model_choice then concerns the stages after asr.
 	TextOnly bool `json:"text_only,omitempty"`
+}
+
+// ManualModel is ModelChoiceRequest.manual. Thinking, MaxTokens and
+// Temperature are optional: off, automatic and the role's default.
+type ManualModel struct {
+	ProviderID  string   `json:"provider_id"`
+	Model       string   `json:"model"`
+	Thinking    *string  `json:"thinking,omitempty"`
+	MaxTokens   *int     `json:"max_tokens,omitempty"`
+	Temperature *float64 `json:"temperature,omitempty"`
 }
 
 // SnapshotView describes one side of a model diff.
@@ -161,6 +179,13 @@ type ProviderView struct {
 	// (settings.SupportsThinking: DeepSeek and Anthropic; other
 	// OpenAI-compatible providers only "off").
 	SupportsThinking bool `json:"supports_thinking"`
+	// DefaultBatchClaude: the translate role's sentences per request on
+	// this provider for a Claude model when the role leaves the batch empty
+	// (settings.ClaudeBatch: 10 on Anthropic, not DeepSeek; 1 otherwise;
+	// user 2026-11-11). Any other model is 1: the settings page applies the
+	// model rule (provider_rules.js defaultBatch, settings.DefaultBatch) to
+	// the role's current model and shows the result next to the field.
+	DefaultBatchClaude int `json:"default_batch_claude"`
 	// cred-enc: the stored key cannot be decrypted with this installation's
 	// key (the data directory came from another computer or account); it
 	// has to be entered again. key_hint is then "", key_error_info is
@@ -170,6 +195,42 @@ type ProviderView struct {
 	// sec3 L2: the key is stored in the clear (saved while there was no data
 	// key); key_error_info is then settings.provider_key_unprotected.
 	KeyUnprotected bool `json:"key_unprotected,omitempty"`
+	// RateLimits: the account limits the provider's answers reported
+	// since the application started (Anthropic only; absent before the
+	// first answer with them), with the suggested settings (T-PERF-03).
+	RateLimits *ProviderRateLimits `json:"rate_limits,omitempty"`
+}
+
+// ProviderRateLimits is what the provider's most recent answers said about
+// the account's limits, per minute (llm.RateLimits: of the model with the
+// smallest request limit), and the settings suggested from it
+// (llm.AdviseLimits). Observed, not guaranteed; never a key or a raw
+// header.
+type ProviderRateLimits struct {
+	Model             string `json:"model"`
+	RequestsPerMinute int64  `json:"requests_per_minute"`
+	// The token limits, absent when not reported.
+	InputTokensPerMinute  *int64 `json:"input_tokens_per_minute,omitempty"`
+	OutputTokensPerMinute *int64 `json:"output_tokens_per_minute,omitempty"`
+	TokensPerMinute       *int64 `json:"tokens_per_minute,omitempty"`
+	ObservedAt            string `json:"observed_at"` // RFC 3339, UTC
+	// Advice: the values the settings page fills in (never below the
+	// current ones; rpm 0 = no per-minute limit stays so) and whether the
+	// current settings are clearly below the suggestion.
+	Advice ProviderLimitAdvice `json:"advice"`
+}
+
+// ProviderLimitAdvice is llm.LimitAdvice on the wire: below = either of
+// concurrency_below / rpm_below (rpm_below never without a per-minute
+// limit); measured = the suggestion rests on measured answers (time and
+// tokens), not only on the request limit.
+type ProviderLimitAdvice struct {
+	MaxConcurrency   int  `json:"max_concurrency"`
+	RPM              int  `json:"rpm"`
+	Below            bool `json:"below"`
+	ConcurrencyBelow bool `json:"concurrency_below"`
+	RPMBelow         bool `json:"rpm_below"`
+	Measured         bool `json:"measured"`
 }
 
 // ProviderInput is the body of POST /api/providers and PATCH /api/providers/{id}.
@@ -221,6 +282,12 @@ type RoleView struct {
 	// high or max (model.RoleParams.Thinking). Saved with
 	// RoleInput.params.thinking.
 	Thinking string `json:"thinking"`
+	// MaxTokens and Batch (v3.2.x D1, P2): the values the user set
+	// (RoleInput.params.max_tokens, params.batch), absent while unset —
+	// automatic output limit, one sentence per request. Batch is the
+	// translate role's only.
+	MaxTokens *int `json:"max_tokens,omitempty"`
+	Batch     *int `json:"batch,omitempty"`
 }
 
 // RoleInput is the body of PUT /api/settings/roles/{role}.
@@ -377,6 +444,7 @@ type CourseCard struct {
 	StaleCount     int     `json:"stale_count"`
 	RunningCount   int     `json:"running_count"`
 	PatchesPending int     `json:"patches_pending"`
+	FailedCount    int     `json:"failed_count"`     // as Course.failed_count (v3.2.x r7, T24 S2)
 	LastActivityAt string  `json:"last_activity_at"` // latest job finish / lecture creation (UTC RFC3339)
 	// CourseActions for the course-card context menu (A12.2): launch_drafts,
 	// update_stale, export_cite (rendered only when listed).
@@ -407,6 +475,10 @@ type Dashboard struct {
 	// DevicePrompts are the open "检测到新的转写设备，测试一下它的速度？"
 	// prompts (SPEC-v2 I9, phase 3b freeze); omitted when there is none.
 	DevicePrompts []DevicePrompt `json:"device_prompts,omitempty"`
+	// EarlierFailedTotal (v3.2.x r7, T24 S2): launched lectures with a
+	// failed stage none of which is in Failures (they failed more than 24 h
+	// ago and are still failed): "还有 N 节更早失败". Always present.
+	EarlierFailedTotal int `json:"earlier_failed_total"`
 }
 
 // ---------- A10 resources ----------

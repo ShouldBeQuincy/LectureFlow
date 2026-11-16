@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"lectureflow/internal/llm"
 	"lectureflow/internal/model"
 	"lectureflow/internal/resources"
+	"lectureflow/internal/settings"
 	"lectureflow/internal/stages"
 	"lectureflow/internal/tariff"
 )
@@ -164,6 +166,7 @@ var (
 	dsTrans   = snap{pidDeepSeek, "DeepSeek", "deepseek-chat", 0.3, 3, priceDS}
 	anTrans   = snap{pidAnthropic, "Anthropic", "claude-sonnet-4-5", 0.3, 3, priceAN}
 	orTrans   = snap{pidOpenRouter, "OpenRouter", "deepseek/deepseek-chat", 0.3, 3, nil}
+	anOpus    = snap{pidAnthropic, "Anthropic", "claude-opus-5-5", 0.2, 0, priceAN} // v3.2.x: named by hand for a retry
 
 	// snapshot sets: before 10-20 translate used DeepSeek; 10-20..10-21
 	// OpenRouter (key since removed); now Anthropic (current settings).
@@ -300,6 +303,77 @@ func (b *lb) add(sv api.StageView) *lb {
 	b.l.Stages = append(b.l.Stages, sv)
 	return b
 }
+
+// llm sets the request details of the last stage added (job.stats.llm and
+// last_activity_at, v3.2.x P1-c) as the real view shows them: fn gets the
+// stage's start time and returns them; the last activity is at offset last.
+func (b *lb) llm(last time.Duration, fn func(start time.Time) model.LLMStats) *lb {
+	sv := &b.l.Stages[len(b.l.Stages)-1]
+	start := mustTime(*sv.StartedAt)
+	s := fn(start)
+	sv.LLM = &s
+	sv.LastActivityAt = tstr(start.Add(last))
+	return b
+}
+
+// manualModel: the stage ran with a model named by hand for one retry
+// (v3.2.x P1-b; StageModel.source manual) with the output limit maxTokens.
+func (b *lb) manualModel(stage string, s snap, maxTokens int) *lb {
+	sv := &b.l.Stages[stageIndex(&b.l, stage)]
+	p := s.params()
+	p.MaxTokens = &maxTokens
+	sv.Model = &api.StageModel{Label: s.label(), ProviderID: s.providerID, ProviderName: s.providerName, Model: s.model, Params: p,
+		Source: model.SnapshotSourceManual}
+	sv.Stats = s.pr.usage(sv.Stats.PromptTokens, sv.Stats.CacheHitTokens, sv.Stats.CompletionTokens) // that provider's prices
+	return b
+}
+
+// pendingSentences: the translate run finished with sentences left without
+// a usable translation (v3.2.x P1): stats.pending_sentences and the
+// warning the stage ends with (job.error and warning_info).
+func (b *lb) pendingSentences(ids ...int) *lb {
+	sv := &b.l.Stages[stageIndex(&b.l, model.StageTranslate)]
+	var hash []string
+	for _, id := range ids {
+		hash = append(hash, fmt.Sprintf("#%d", id))
+	}
+	text := fmt.Sprintf("%d 句待处理（没有得到可用的译文，导出中显示为“%s”）：%s。可以在播放器中对这些句子点击“重翻此句”",
+		len(ids), stages.MissingZh, strings.Join(hash, "、"))
+	sv.Error = &text
+	sv.WarningInfo = &model.ErrorInfo{Code: stages.WarnTranslatePending, Params: map[string]any{"n": len(ids), "ids": strings.Join(hash, ", ")}}
+	sv.Stats.PendingSentences = len(ids)
+	return b
+}
+
+// lowVolume: prep finished with the warning prep.low_volume (round 2 N06),
+// after prep.media_truncated when processed and declared are given ("" =
+// not truncated): the two parts joined as the back end joins them
+// (params.extra, the texts after "；").
+func (b *lb) lowVolume(processed, declared string) *lb {
+	sv := &b.l.Stages[stageIndex(&b.l, model.StagePrep)]
+	low := model.ErrorInfo{Code: stages.WarnPrepLowVolume}
+	text, info := stages.LowVolumeWarning, &low
+	if processed != "" {
+		text = fmt.Sprintf(stages.TruncatedWarning, declared, processed) + "；" + stages.LowVolumeWarning
+		info = &model.ErrorInfo{Code: stages.WarnPrepMediaTruncated,
+			Params: map[string]any{"processed": processed, "declared": declared, "extra": []model.ErrorInfo{low}}}
+	}
+	sv.Error, sv.WarningInfo = &text, info
+	return b
+}
+
+// mixedModels: some of the translate run's sentences were retranslated
+// with another model (v3.2.x P1-b): stats.mixed_models.
+func (b *lb) mixedModels(snaps ...snap) *lb {
+	sv := &b.l.Stages[stageIndex(&b.l, model.StageTranslate)]
+	for _, s := range snaps {
+		sv.Stats.MixedModels = append(sv.Stats.MixedModels, s.providerName+" / "+s.model)
+	}
+	return b
+}
+
+// at3339 is t + d as the stats write it.
+func at3339(t time.Time, d time.Duration) string { return t.Add(d).UTC().Format(time.RFC3339) }
 
 func (b *lb) done(stage string) *lb {
 	sv := b.base(stage, model.StatusDone)
@@ -543,6 +617,8 @@ func buildCoursesAndLectures(t *testing.T) ([]api.Course, []api.Lecture) {
 			named("Introduction and Classical Ciphers", "密码学导论与古典密码", "What cryptography protects, and how substitution and transposition ciphers work and fail.", "密码学要保护什么，以及代换密码和置换密码如何工作、又为何会被破解。").exports(),
 		lecture(c3631, 2, "CSC1003-L01-01 Wed Sep 30 09-35-00 BST 2026", "2026-10-01T20:05:00Z", 48).launch("2026-10-01T20:06:00Z", snapDS).
 			doneAll(model.StagePrep, model.StageASR, model.StageSummary).at("2026-10-07T20:31:00Z").doneAll(model.StageRepair, model.StageTranslate, model.StageExport).counts(3, 1).
+			// v3.2.x P1-b: a pending sentence retranslated with the current setting's model
+			mixedModels(dsTrans, anTrans).
 			orig("CSC1003-L01-01 Wed Sep 30 09-35-00 BST 2026.mp4").rec("2026-09-30T09:35", model.RecordedAtFilename).
 			named("Perfect Secrecy and the One-Time Pad", "完善保密性与一次一密", "Shannon's definition of perfect secrecy, and why the one-time pad achieves it at a steep price.", "香农的完善保密性定义，以及一次一密为何能做到这一点却代价高昂。").exports().stream("pending"),
 		lecture(c3631, 3, "CSC1003-L02-01 Tue Oct 06 12-35-00 BST 2026", "2026-10-06T18:30:00Z", 55).launch("2026-10-06T18:31:00Z", snapDS).
@@ -551,10 +627,13 @@ func buildCoursesAndLectures(t *testing.T) ([]api.Course, []api.Lecture) {
 			named("Stream Ciphers and LFSRs", "流密码与线性反馈移位寄存器", "How stream ciphers generate keystreams, and why linear feedback shift registers alone are insecure.", "流密码如何生成密钥流，以及为什么单独使用线性反馈移位寄存器是不安全的。").exports(),
 		lecture(c3631, 4, "CSC1003-L01-01 Wed Oct 07 09-35-00 BST 2026", "2026-10-08T19:10:00Z", 61).launch("2026-10-08T19:12:00Z", snapDS).
 			doneAll(full...).counts(0, 2).
+			// v3.2.x P1: two sentences got no usable translation
+			pendingSentences(112, 431).
 			orig("CSC1003-L01-01 Wed Oct 07 09-35-00 BST 2026.mp4").rec("2026-10-07T09:35", model.RecordedAtFilename).
 			named("Block Ciphers and DES", "分组密码与 DES", "The Feistel structure, the rounds of DES, and why its 56-bit key is too short today.", "Feistel 结构、DES 的轮函数，以及它的 56 位密钥为何在今天已经太短。").exports(),
 		lecture(c3631, 9, "CSC1003-T01-01 Fri Oct 09 14-35-00 BST 2026", "2026-10-09T17:10:00Z", 47).launch("2026-10-09T17:11:00Z", snapDS).
 			doneAll(full...).counts(0, 0).
+			lowVolume("", ""). // round 2 N06: a very quiet recording
 			orig("CSC1003-T01-01 Fri Oct 09 14-35-00 BST 2026.mp4").rec("2026-10-09T14:35", model.RecordedAtFilename).
 			named("Exercises on Classical and Stream Ciphers", "古典密码与流密码习题", "Worked answers to the week 2 problem sheet: frequency analysis, the one-time pad and LFSR states.", "第 2 周习题讲解：频率分析、一次一密与 LFSR 的状态推导。").exports(),
 		lecture(c3631, 5, "CSC1003-L02-01 Tue Oct 13 12-35-00 BST 2026", "2026-10-13T19:20:00Z", 58).launch("2026-10-13T19:21:00Z", snapDS).
@@ -565,10 +644,28 @@ func buildCoursesAndLectures(t *testing.T) ([]api.Course, []api.Lecture) {
 		// user set the kind (the model had called it a lecture)
 		lecture(c3631, 10, "AES round by hand", "2026-10-16T10:05:00Z", 18).launch("2026-10-16T10:06:00Z", snapDS).
 			doneAll(full...).counts(0, 0).
+			lowVolume("18:00", "25:30"). // round 2 N06: cut off and very quiet, both warnings
 			orig("AES round by hand.mp4").rec("2026-10-14T16:20", model.RecordedAtMetadata).kind("material", api.KindSourceUser).
 			named("One AES Round by Hand", "手算一轮 AES", "A step-by-step screen recording that computes SubBytes, ShiftRows, MixColumns and AddRoundKey for one block.", "逐步演示一个分组的字节代换、行移位、列混淆和轮密钥加。").exports(),
 		lecture(c3631, 6, "CSC1003-S01-01 Thu Oct 15 14-35-00 BST 2026", "2026-10-22T21:10:00Z", 63).launch("2026-10-23T13:44:00Z", snapCur).
-			doneAll(model.StagePrep, model.StageASR, model.StageSummary, model.StageRepair).running(model.StageTranslate, 0.63).pendingRest().counts(5, 0).
+			doneAll(model.StagePrep, model.StageASR, model.StageSummary, model.StageRepair).
+			// v3.2.x: the summary was retried with a model named by hand
+			manualModel(model.StageSummary, anOpus, 32768).
+			// v3.2.x P1-c: requests in flight, one retried after an overload
+			running(model.StageTranslate, 0.63).llm(5*time.Minute+15*time.Second, func(t time.Time) model.LLMStats {
+			return model.LLMStats{
+				InFlight: 4,
+				Current: &model.LLMAttempt{CallID: "c-0412", N: 2, Try: 1, Role: model.RoleTranslate, ProviderID: pidAnthropic, Model: "claude-sonnet-4-5",
+					MaxTokens: 2000, StartedAt: at3339(t, 5*time.Minute+12*time.Second), TimeoutMS: 120000},
+				Attempts: []model.LLMAttempt{
+					{CallID: "c-0412", N: 1, Try: 1, Role: model.RoleTranslate, ProviderID: pidAnthropic, Model: "claude-sonnet-4-5", MaxTokens: 2000,
+						StartedAt: at3339(t, 4*time.Minute+55*time.Second), EndedAt: at3339(t, 5*time.Minute+7*time.Second), TimeoutMS: 120000,
+						Outcome: model.LLMOutcomeHTTPError, Status: 529},
+				},
+				Retries: 1,
+			}
+		}).
+			pendingRest().counts(5, 0).
 			orig("CSC1003-S01-01 Thu Oct 15 14-35-00 BST 2026.mp4").rec("2026-10-15T14:35", model.RecordedAtFilename).
 			named("Block Cipher Modes of Operation", "分组密码的工作模式", "ECB, CBC, CTR and GCM: how each mode chains blocks, and what goes wrong when an IV repeats.", "ECB、CBC、CTR 与 GCM：各种模式如何串联分组，以及 IV 重复时会出什么问题。"),
 		// summary not done yet: the title is still the file name
@@ -633,7 +730,18 @@ func buildCoursesAndLectures(t *testing.T) ([]api.Course, []api.Lecture) {
 			named("Pipelining", "流水线", "Splitting instruction execution into stages, and why the ideal speed-up is never reached.", "把指令执行拆分成多个阶段，以及为什么理想的加速比永远达不到。").exports(),
 		lecture(c3121, 3, "CSC1002-L01-01 Tue Oct 13 13-35-00 BST 2026", "2026-10-14T19:00:00Z", 74).launch("2026-10-23T13:20:00Z", snapCur).
 			doneAll(model.StagePrep, model.StageASR).at("2026-10-23T13:58:40Z").
-			retryQueued(model.StageSummary, model.WaitRetryBackoffPrefix+"18", err503, 2, 36*time.Second).pendingRest().counts(0, 0).
+			retryQueued(model.StageSummary, model.WaitRetryBackoffPrefix+"18", err503, 2, 36*time.Second).
+			// v3.2.x P1-c: the attempts of the failed run (queued: no request
+			// in flight is shown)
+			llm(35*time.Second, func(t time.Time) model.LLMStats {
+				var as []model.LLMAttempt
+				for n, off := range []time.Duration{0, 9 * time.Second, 22 * time.Second} {
+					as = append(as, model.LLMAttempt{CallID: "c-0001", N: n + 1, Try: 1, Role: model.RoleSummary, ProviderID: pidDeepSeek, Model: "deepseek-chat",
+						StartedAt: at3339(t, off), EndedAt: at3339(t, off+4*time.Second), TimeoutMS: 120000, Outcome: model.LLMOutcomeHTTPError, Status: 503})
+				}
+				return model.LLMStats{Attempts: as, Retries: 2}
+			}).
+			pendingRest().counts(0, 0).
 			orig("CSC1002-L01-01 Tue Oct 13 13-35-00 BST 2026.mp4").rec("2026-10-13T13:35", model.RecordedAtFilename),
 		draft(c3121, 4, "CSC1002-T01-01 Fri Oct 16 13-35-00 BST 2026", "2026-10-21T18:40:00Z", 52).
 			orig("CSC1002-T01-01 Fri Oct 16 13-35-00 BST 2026.mp4").rec("2026-10-16T13:35", model.RecordedAtFilename),
@@ -657,7 +765,30 @@ func buildCoursesAndLectures(t *testing.T) ([]api.Course, []api.Lecture) {
 			doneAll(full...).counts(4, 0).orig("db-lecture-3.mp4").rec("2026-10-13T19:00", model.RecordedAtUser).kind("lecture", api.KindSourceLLM).
 			named("Joins and Subqueries", "连接与子查询", "Inner and outer joins, correlated subqueries, and when one can be rewritten as the other.", "内连接与外连接、相关子查询，以及两者何时可以互相改写。").exports(),
 		lecture(c3311, 4, "db-lecture-4", "2026-10-20T20:30:00Z", 51).launch("2026-10-23T13:50:30Z", snapCur).
-			doneAll(model.StagePrep, model.StageASR, model.StageSummary, model.StageRepair).running(model.StageTranslate, 0.09).pendingRest().counts(3, 0).
+			doneAll(model.StagePrep, model.StageASR, model.StageSummary, model.StageRepair).
+			// v3.2.x P1-c: a request waits out a backoff after 429 (retry_at),
+			// an earlier one came back truncated and was retried
+			running(model.StageTranslate, 0.09).llm(38*time.Second, func(t time.Time) model.LLMStats {
+			return model.LLMStats{
+				InFlight: 2,
+				Current: &model.LLMAttempt{CallID: "c-0057", N: 2, Try: 1, Role: model.RoleTranslate, ProviderID: pidAnthropic, Model: "claude-sonnet-4-5",
+					MaxTokens: 2000, StartedAt: at3339(t, 34*time.Second), TimeoutMS: 120000,
+					RetryAt: at3339(t, 46*time.Second)},
+				Attempts: []model.LLMAttempt{
+					{CallID: "c-0031", N: 1, Try: 1, Role: model.RoleTranslate, ProviderID: pidAnthropic, Model: "claude-sonnet-4-5", MaxTokens: 2000,
+						StartedAt: at3339(t, 5*time.Second), EndedAt: at3339(t, 20*time.Second), TimeoutMS: 120000,
+						Outcome: model.LLMOutcomeTruncated, PromptTokens: 1840, CompletionTokens: 2000},
+					{CallID: "c-0031", N: 2, Try: 1, Role: model.RoleTranslate, ProviderID: pidAnthropic, Model: "claude-sonnet-4-5", MaxTokens: 4000,
+						StartedAt: at3339(t, 21*time.Second), EndedAt: at3339(t, 30*time.Second), TimeoutMS: 120000,
+						Outcome: model.LLMOutcomeOK, PromptTokens: 1840, CompletionTokens: 2412},
+					{CallID: "c-0057", N: 1, Try: 1, Role: model.RoleTranslate, ProviderID: pidAnthropic, Model: "claude-sonnet-4-5", MaxTokens: 2000,
+						StartedAt: at3339(t, 34*time.Second), EndedAt: at3339(t, 35*time.Second), TimeoutMS: 120000,
+						Outcome: model.LLMOutcomeHTTPError, Status: 429},
+				},
+				Retries: 2,
+			}
+		}).
+			pendingRest().counts(3, 0).
 			orig("db-lecture-4.mp4").rec("2026-10-20T19:00", model.RecordedAtUser).kind("lecture", api.KindSourceLLM).
 			titleFailed("2026-10-23T13:55:40Z", "模型返回的不是 JSON：Normalization covers functional dependencies and…"),
 	}
@@ -807,8 +938,9 @@ func buildSettings() api.Settings {
 				PriceInput: f64(2), PriceCacheHit: f64(0.5), PriceOutput: f64(8), Currency: &cny,
 				CreatedAt: "2026-09-28T19:00:00Z", UsedByRoles: []string{model.RoleGlossary, model.RoleSummary, model.RoleRepair, model.RoleChapters, model.RoleOrganizer},
 				SnapshotRefs: 61, Models: []string{"deepseek-chat", "deepseek-reasoner"}, ModelsProbedAt: &probed,
-				Tariff:           deepSeekTariff(), // v2 P12.2: the preset of a DeepSeek provider
-				SupportsThinking: true,
+				Tariff:             deepSeekTariff(), // v2 P12.2: the preset of a DeepSeek provider
+				SupportsThinking:   true,
+				DefaultBatchClaude: 1,
 			},
 			{
 				ID: pidAnthropic, Name: "Anthropic", Type: model.ProviderAnthropic, BaseURL: "https://api.anthropic.com",
@@ -816,14 +948,20 @@ func buildSettings() api.Settings {
 				PriceInput: f64(3), PriceCacheHit: f64(0.3), PriceOutput: f64(15), Currency: &usd,
 				CreatedAt: "2026-10-21T09:28:00Z", UsedByRoles: []string{model.RoleSyllabusFormat, model.RoleGlossaryJanitor, model.RoleTranslate},
 				SnapshotRefs: 6, Models: []string{"claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-1", "claude-opus-5-5"}, ModelsProbedAt: &probed,
-				SupportsThinking: true,
+				SupportsThinking:   true,
+				DefaultBatchClaude: settings.DefaultAnthropicBatch, // user 2026-11-11
+				// T-PERF-03: what its answers reported (Opus 5.5, Start tier);
+				// 4 at a time / 50 a minute is clearly below the suggestion
+				RateLimits: api.RateLimitsView(mockMeasured(llm.RateLimits{Model: "claude-opus-5-5", Requests: 4000, InputTokens: 2000000, OutputTokens: 400000,
+					ObservedAt: mustTime("2026-10-21T09:41:00Z")}), 4, 50),
 			},
 			{
 				ID: pidOpenRouter, Name: "OpenRouter", Type: model.ProviderOpenAI, BaseURL: "https://openrouter.ai/api/v1",
 				KeyHint: "", MaxConcurrency: 4, RPM: 60, BalanceAPI: model.BalanceNone,
 				CreatedAt: "2026-10-20T16:40:00Z", UsedByRoles: []string{}, SnapshotRefs: 1, Models: []string{},
-				ModelsError:     "探测模型失败：提供商「OpenRouter」没有设置 API key",
-				ModelsErrorInfo: &model.ErrorInfo{Code: "llm.probe.no_api_key", Params: map[string]any{"provider": "OpenRouter"}, Detail: "探测模型失败：提供商「OpenRouter」没有设置 API key"},
+				ModelsError:        "探测模型失败：提供商「OpenRouter」没有设置 API key",
+				ModelsErrorInfo:    &model.ErrorInfo{Code: "llm.probe.no_api_key", Params: map[string]any{"provider": "OpenRouter"}, Detail: "探测模型失败：提供商「OpenRouter」没有设置 API key"},
+				DefaultBatchClaude: 1,
 			},
 		},
 		Roles: []api.RoleView{
@@ -832,9 +970,12 @@ func buildSettings() api.Settings {
 			// v2 appendix D1: filled in automatically (an Anthropic provider with a key exists)
 			{Role: model.RoleGlossaryJanitor, Label: "术语表清道夫", ProviderID: sp(pidAnthropic), Model: sp("claude-opus-5-5"), Temperature: 0.2, Configured: true, Thinking: model.ThinkingOff,
 				Default: true, Hint: "建议选择与术语提取不同的模型，例如 Claude Opus，以便互相纠错。"},
-			{Role: model.RoleSummary, Label: "摘要", ProviderID: sp(pidDeepSeek), Model: sp("deepseek-chat"), Temperature: 0.2, Configured: true, Thinking: model.ThinkingOff},
+			// v3.2.x D1: an output limit set by the user (absent = automatic)
+			{Role: model.RoleSummary, Label: "摘要", ProviderID: sp(pidDeepSeek), Model: sp("deepseek-chat"), Temperature: 0.2, Configured: true, Thinking: model.ThinkingOff,
+				MaxTokens: ip(6000)},
 			{Role: model.RoleRepair, Label: "修复", ProviderID: sp(pidDeepSeek), Model: sp("deepseek-chat"), Temperature: 0.1, Configured: true, Thinking: model.ThinkingOff},
-			{Role: model.RoleTranslate, Label: "翻译", ProviderID: sp(pidAnthropic), Model: sp("claude-sonnet-4-5"), Temperature: 0.3, Window: func() *int { w := 3; return &w }(), Configured: true, Thinking: model.ThinkingOff},
+			{Role: model.RoleTranslate, Label: "翻译", ProviderID: sp(pidAnthropic), Model: sp("claude-sonnet-4-5"), Temperature: 0.3, Window: func() *int { w := 3; return &w }(), Configured: true, Thinking: model.ThinkingOff,
+				Batch: ip(4)}, // v3.2.x P2: sentences per request
 			// v2 appendix D1: the summary role's provider and model, marked as defaults
 			{Role: model.RoleChapters, Label: "章节", ProviderID: sp(pidDeepSeek), Model: sp("deepseek-chat"), Temperature: 0.2, Configured: true, Default: true, Thinking: model.ThinkingOff},
 			{Role: model.RoleOrganizer, Label: "标题与简介", ProviderID: sp(pidDeepSeek), Model: sp("deepseek-chat"), Temperature: 0.2, Configured: true, Default: true, Thinking: model.ThinkingOff},
@@ -842,7 +983,9 @@ func buildSettings() api.Settings {
 		ASR: model.ASRSettings{Model: "large-v2", ComputeType: "auto", Device: "cuda", Language: "en", MaxParallel: 1, VRAMReserveMB: 1024, VRAMPerJobMB: 5000,
 			// phase 3b freeze: the defaults of the new fields (settings.DefaultASR, task B)
 			DeviceMode: model.ASRDeviceModeAuto, MultiDevice: true, BatteryAware: true, MemReserveMB: 2048},
-		General:         model.GeneralSettings{KeepOriginalMedia: true, Notifications: true, DailyBudget: 20},
+		// v3.2.x: llm_idle_timeout_s set by the user; auto_chapters absent
+		// (never set: on)
+		General:         model.GeneralSettings{KeepOriginalMedia: true, Notifications: true, DailyBudget: 20, LLMIdleTimeoutS: ip(300)},
 		DefaultBaseURLs: map[string]string{model.ProviderOpenAI: "https://api.openai.com/v1", model.ProviderAnthropic: "https://api.anthropic.com"},
 		GPUTotalMB:      12227,
 	}

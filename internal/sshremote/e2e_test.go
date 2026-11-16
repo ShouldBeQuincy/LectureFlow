@@ -29,7 +29,7 @@ func addTrusted(t *testing.T, e *testEnv, f *fakeRemote) ServerView {
 	t.Helper()
 	ctx := context.Background()
 	host, port := f.addr()
-	v, err := e.m.Add(ctx, AddRequest{Name: "Test Mac", Host: host, Port: port, Username: "quincy", Group: GroupPrefer})
+	v, err := e.m.Add(ctx, AddRequest{Name: "Test Mac", Host: host, Port: port, Username: "alice", Group: GroupPrefer})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,10 +47,10 @@ func addTrusted(t *testing.T, e *testEnv, f *fakeRemote) ServerView {
 	if len(f.sentCommands()) != 0 {
 		t.Fatalf("commands ran before the host key was confirmed: %v", f.sentCommands())
 	}
-	if _, err := e.m.Trust(ctx, v.ID, res.HostKeyHop, "SHA256:wrong"); err == nil {
+	if _, err := e.m.Trust(ctx, v.ID, TrustRequest{Hop: res.HostKeyHop, Fingerprint: "SHA256:wrong"}); err == nil {
 		t.Fatal("a wrong fingerprint was accepted")
 	}
-	res, err = e.m.Trust(ctx, v.ID, res.HostKeyHop, res.HostKey.Fingerprint)
+	res, err = e.m.Trust(ctx, v.ID, TrustRequest{Hop: res.HostKeyHop, Fingerprint: res.HostKey.Fingerprint})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,7 @@ func TestUnauthorizedKey(t *testing.T) {
 	if err != nil || res.HostKey == nil {
 		t.Fatalf("connect: %v %+v", err, res)
 	}
-	res, err = e.m.Trust(context.Background(), v.ID, res.HostKeyHop, res.HostKey.Fingerprint)
+	res, err = e.m.Trust(context.Background(), v.ID, TrustRequest{Hop: res.HostKeyHop, Fingerprint: res.HostKey.Fingerprint})
 	if err == nil {
 		t.Fatal("connected without an authorized key")
 	}

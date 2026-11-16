@@ -1094,6 +1094,70 @@ func TestSourcesNewestWins(t *testing.T) {
 	}
 }
 
+// recordingDL is a Downloader that keeps the requests it is given.
+type recordingDL struct {
+	inner Downloader
+	mu    sync.Mutex
+	reqs  []DownloadRequest
+}
+
+func (d *recordingDL) Download(ctx context.Context, req DownloadRequest) error {
+	d.mu.Lock()
+	d.reqs = append(d.reqs, req)
+	d.mu.Unlock()
+	return d.inner.Download(ctx, req)
+}
+
+// SEC19 info-5: the downloader is told which package URLs come from the
+// user's own sources (a directory, a {url} template), whose hosts may be
+// on this computer or the local network; GitHub's and update.json's own
+// URLs (its mirror rules too) are not among them. Everything here is the
+// fake GitHub on 127.0.0.1.
+func TestDownloadRequestUserURLs(t *testing.T) {
+	f := newFakeGH(t)
+	k := newTestKey(t)
+	rel := makeRelease(t, f, k, "3.3.0", ChannelStable, func(m *Manifest) {
+		m.Mirrors = []MirrorRule{{Prefix: f.srv.URL + "/", Replace: f.srv.URL + "/cdn/"}}
+	})
+	f.publishLatest(rel)
+	rec := &recordingDL{inner: &HTTPDownloader{Backoff: time.Millisecond}}
+	u := newTestUpdater(t, f, k, func(o *Options) { o.Downloader = rec })
+	if _, err := u.UpdateSettings(bg, SettingsPatch{Sources: &[]string{f.srv.URL + "/mirror/lf", f.srv.URL + "/proxy/{url}"}}); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := u.Check(bg); st.State != StateAvailable || st.Available.Version != "3.3.0" {
+		t.Fatalf("check %+v", st)
+	}
+	a, _ := rel.m.Asset(PlatformWindowsX64, KindInstaller)
+	want := []string{f.srv.URL + "/mirror/lf/" + a.Name, f.srv.URL + "/proxy/" + a.URL}
+	all := u.assetURLs(bg, u.avail, a)
+	user := u.userAssetURLs(bg, u.avail, a)
+	if strings.Join(user, " ") != strings.Join(want, " ") {
+		t.Fatalf("user URLs %q, want %q (all: %q)", user, want, all)
+	}
+	for _, x := range user {
+		found := false
+		for _, y := range all {
+			found = found || x == y
+		}
+		if !found || x == a.URL || strings.Contains(x, "/cdn/") {
+			t.Errorf("user URL %q (all: %q)", x, all)
+		}
+	}
+	if _, err := u.Download(bg); err != nil {
+		t.Fatal(err)
+	}
+	if st := waitFor(t, u, notState(StateDownloading)); st.State != StatePending {
+		t.Fatalf("after download %+v", st)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.reqs) != 1 || strings.Join(rec.reqs[0].UserURLs, " ") != strings.Join(want, " ") ||
+		strings.Join(rec.reqs[0].URLs, " ") != strings.Join(all, " ") {
+		t.Fatalf("requests %+v", rec.reqs)
+	}
+}
+
 func TestParseSourceKinds(t *testing.T) {
 	latest := "https://github.com/o/r/releases/latest/download/update.json"
 	a := Asset{Name: "LectureFlow Setup.exe", URL: "https://github.com/o/r/releases/download/v1.0.0/LectureFlow-Setup.exe"}

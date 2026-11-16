@@ -257,6 +257,7 @@ func (s *Service) Load(ctx context.Context) error {
 			general = DefaultGeneral()
 		}
 	}
+	general = normalizeGeneral(general)
 	roles := make(map[string]model.RoleSetting, len(rows))
 	for _, r := range rows {
 		roles[r.Role] = r
@@ -346,7 +347,7 @@ func (s *Service) ASR() model.ASRSettings {
 func (s *Service) General() model.GeneralSettings {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.general
+	return cloneGeneral(s.general)
 }
 
 // RoleTarget resolves the current setting of role into an LLMSnapshot with
@@ -354,8 +355,25 @@ func (s *Service) General() model.GeneralSettings {
 // model.DefaultTemperature(role); window (translate only) = params.window or
 // model.DefaultTranslateWindow. ErrRoleNotConfigured (wrapped with the
 // Chinese message) when the role has no provider/model or the provider no
-// longer exists.
+// longer exists. The batch size is only what the role sets (no provider
+// default): a request made without a job snapshot (llm.HTTPClient on the
+// role's current setting) is sized as before; SnapshotTarget is what a
+// job's snapshot records.
 func (s *Service) RoleTarget(role string) (model.LLMSnapshot, error) {
+	return s.roleTarget(role, false)
+}
+
+// SnapshotTarget is RoleTarget as a job's snapshot records it (launch and
+// CurrentSnapshots, retranslate with the current setting): a translate role
+// without a batch size gets the default of its provider and model when that
+// is above 1 (resolveRoleParams, DefaultBatch: 10 for a Claude model on an
+// Anthropic provider; user 2026-11-11). The default is fixed
+// in the snapshot when it is written; the stage reads only the snapshot.
+func (s *Service) SnapshotTarget(role string) (model.LLMSnapshot, error) {
+	return s.roleTarget(role, true)
+}
+
+func (s *Service) roleTarget(role string, snapshot bool) (model.LLMSnapshot, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	r, ok := s.roles[role]
@@ -366,16 +384,20 @@ func (s *Service) RoleTarget(role string) (model.LLMSnapshot, error) {
 	if !ok {
 		return model.LLMSnapshot{}, userErr(ErrRoleNotConfigured, CodeRoleProviderDeleted, map[string]any{"role": role}, "「%s」使用的提供商已删除，请先在设置中为它重新选择提供商和模型", RoleLabel(role))
 	}
+	params := ResolveParams(role, parseParams(r.Params))
+	if snapshot {
+		params = resolveRoleParams(role, p, *r.Model, parseParams(r.Params)) // translate: default batch by provider and model
+	}
 	return model.LLMSnapshot{
 		ProviderID:   p.ID,
 		ProviderName: p.Name,
 		Model:        strings.TrimSpace(*r.Model),
-		Params:       ResolveParams(role, parseParams(r.Params)),
+		Params:       params,
 	}, nil
 }
 
 // CurrentSnapshots returns the current settings as the snapshots launch
-// writes (A4.1): summary/repair/translate from RoleTarget, asr from
+// writes (A4.1): summary/repair/translate from SnapshotTarget, asr from
 // CurrentASR (SPEC-v2 I6: the device registry's snapshot; without one the
 // legacy model, compute_type, device, language of ASR()), prep/export
 // model.EmptySnapshot. Error (ErrRoleNotConfigured) when one of the three
@@ -386,7 +408,7 @@ func (s *Service) CurrentSnapshots() (map[string]string, error) {
 		model.StageExport: model.EmptySnapshot,
 	}
 	for _, stage := range []string{model.StageSummary, model.StageRepair, model.StageTranslate} {
-		t, err := s.RoleTarget(model.RoleOfStage(stage))
+		t, err := s.SnapshotTarget(model.RoleOfStage(stage))
 		if err != nil {
 			return nil, err
 		}
@@ -435,7 +457,7 @@ func (s *Service) SnapshotUsableInfo(stage, raw string) (ok bool, reason *model.
 	}
 	if p.APIKey == "" && s.KeyUnreadable(p.ID) { // cred-enc (keys.go)
 		return false, &model.ErrorInfo{Code: CodeSnapshotKeyUnreadable, Params: map[string]any{"provider": p.Name},
-			Detail: fmt.Sprintf("提供商「%s」保存的 API key 无法在这台电脑或这个账户上解密，需要重新输入", p.Name)}
+			Detail: fmt.Sprintf("提供商「%s」保存的 API key 无法在这台电脑或这个账户上解密，需要重新输入。输入之前，请先确认这个提供商的地址是你设置的；如果不是，先把地址改回正确的再输入", p.Name)}
 	}
 	if p.APIKey == "" && !IsLocal(p.BaseURL) {
 		return false, &model.ErrorInfo{Code: CodeSnapshotNoAPIKey, Params: map[string]any{"provider": p.Name},
@@ -484,6 +506,12 @@ func (s *Service) CreateProvider(ctx context.Context, in ProviderInput) (model.P
 		RPM:            DefaultRPM,
 		CreatedAt:      db.Now(),
 	}
+	if strings.TrimSpace(*in.Type) == model.ProviderAnthropic {
+		// v3.2.x P2 (Q13a): a new Anthropic-type provider has no per-minute
+		// limit of its own (the 429 handling lowers the concurrency); an rpm
+		// in the input still wins. Existing providers keep their values.
+		p.MaxConcurrency, p.RPM = DefaultAnthropicMaxConcurrency, DefaultAnthropicRPM
+	}
 	if in.BalanceAPI == nil {
 		// Prefill like the settings page does: DeepSeek has a balance API.
 		b := model.BalanceNone
@@ -516,6 +544,8 @@ func (s *Service) CreateProvider(ctx context.Context, in ProviderInput) (model.P
 // the key — unless the patch moves base_url to another origin (scheme, host
 // or port): the key is then cleared, so it never follows the provider to a
 // host it was not issued for (sec2-app L2); the user enters it again.
+// A changed base_url or type also clears the probe cache
+// (kv provider_models:{id}); the OnChange hooks then tell the front end.
 func (s *Service) UpdateProvider(ctx context.Context, id string, in ProviderInput) (model.Provider, error) {
 	s.wmu.Lock()
 	p, err := s.st.GetProvider(ctx, id)
@@ -524,18 +554,27 @@ func (s *Service) UpdateProvider(ctx context.Context, id string, in ProviderInpu
 		return model.Provider{}, userErr(db.ErrNotFound, CodeProviderNotFound, nil, "提供商不存在（可能已被删除）")
 	}
 	if err == nil {
-		oldBase := p.BaseURL
+		oldBase, oldType := p.BaseURL, p.Type
 		if err = applyInput(&p, in); err != nil {
 			s.wmu.Unlock()
 			return model.Provider{}, err
 		}
 		newKey := in.APIKey != nil && strings.TrimSpace(*in.APIKey) != ""
-		if !newKey && !SameOrigin(oldBase, p.BaseURL) {
+		clearKey := !newKey && !SameOrigin(oldBase, p.BaseURL)
+		if clearKey {
 			p.APIKey = ""
 			slog.Info("provider moved to another host; its API key was cleared", "provider", p.Name)
 		}
-		// cred-enc: a key to enter again stays stored while other fields change
-		err = s.updateProviderRow(ctx, p, !newKey && SameOrigin(oldBase, p.BaseURL))
+		// cred-enc / sec3 I4: a key to enter again stays stored while other
+		// fields change; moving to another origin clears it explicitly
+		err = s.updateProviderRow(ctx, p, clearKey)
+		if err == nil && (p.BaseURL != oldBase || p.Type != oldType) {
+			// T041: the cached "探测模型" result came from the old address or
+			// API type; drop it (as DeleteProvider does) so the settings page
+			// shows no stale model list or probe error. No new probe here:
+			// that would send a request to the new address unasked.
+			err = s.st.SetKV(ctx, model.KVProviderModelsPref+id, "")
+		}
 	}
 	if err == nil {
 		err = s.Load(ctx)
@@ -635,6 +674,9 @@ func (s *Service) SnapshotRefs(ctx context.Context, providerID string) (int, err
 // thinking one of model.ThinkingLevels, and other than off only for a
 // provider that SupportsThinking. Thinking off ("off", "" or absent) is
 // stored as absent, so the row is what it was before the option existed.
+// v3.2.x: max_tokens absent (automatic) or in [1, MaxTokensLimit]; batch
+// (translate only) absent or in [1, MaxBatch] (checkParams, manual.go).
+// The params replace the stored ones, so leaving a field out clears it.
 // It clears the role's appendix D1 default mark (RoleDefault).
 func (s *Service) SetRole(ctx context.Context, role, providerID, modelName string, params model.RoleParams) error {
 	if !validRole(role) {
@@ -648,23 +690,8 @@ func (s *Service) SetRole(ctx context.Context, role, providerID, modelName strin
 	if modelName == "" {
 		return userErr(ErrInvalid, CodeRoleModelMissing, map[string]any{"role": role}, "请为「%s」选择或填写模型名", RoleLabel(role))
 	}
-	if t := params.Temperature; t != nil && !(*t >= 0 && *t <= 2) {
-		return userErr(ErrInvalid, CodeTemperatureInvalid, map[string]any{"min": 0, "max": 2}, "温度必须在 0 到 2 之间")
-	}
-	if role != model.RoleTranslate {
-		params.Window = nil // only translate has a context window
-	} else if w := params.Window; w != nil && (*w < 0 || *w > 10) {
-		return userErr(ErrInvalid, CodeWindowInvalid, map[string]any{"min": 0, "max": 10}, "翻译的上下文窗口必须在 0 到 10 之间")
-	}
-	switch lvl := model.ThinkingOf(params); {
-	case !model.ValidThinking(lvl):
-		return userErr(ErrInvalid, CodeThinkingInvalid, map[string]any{"value": lvl},
-			"深度思考的强度「%s」无效，只能是 off、low、high 或 max", lvl)
-	case lvl == model.ThinkingOff:
-		params.Thinking = nil
-	case !SupportsThinking(prov):
-		return userErr(ErrInvalid, CodeThinkingUnsupported, map[string]any{"provider": prov.Name},
-			"提供商「%s」不支持深度思考，请选择“关闭”", prov.Name)
+	if err := checkParams(role, prov, &params); err != nil {
+		return err
 	}
 	b, _ := json.Marshal(params)
 	row := model.RoleSetting{Role: role, ProviderID: &providerID, Model: &modelName, Params: string(b)}
@@ -693,8 +720,38 @@ func (s *Service) SetRole(ctx context.Context, role, providerID, modelName strin
 // management: device_mode manual with manual_devices, checkDeviceMode) and
 // writes kv settings.asr, normalized (model.NormalizeASRDeviceMode). It
 // replaces the whole value: PUT /api/settings/asr merges the request into
-// ASR() first (lead ruling 15).
+// the current settings with UpdateASR (lead ruling 15).
 func (s *Service) SetASR(ctx context.Context, a model.ASRSettings) error {
+	return s.UpdateASR(ctx, func(cur *model.ASRSettings) error {
+		*cur = a
+		return nil
+	})
+}
+
+// UpdateASR is SetASR on the result of edit applied to the current
+// settings (a copy), read and written under wmu (r4 D9): two requests that
+// change different fields at the same time both keep their change, where a
+// read before the write lock let the later one store its stale copy of the
+// other's field. An error from edit is returned as it is, nothing written.
+// edit runs while other writes wait: it must not block (decode a body read
+// beforehand, never read the request itself).
+func (s *Service) UpdateASR(ctx context.Context, edit func(*model.ASRSettings) error) error {
+	s.wmu.Lock()
+	err := s.updateASRLocked(ctx, edit)
+	s.wmu.Unlock()
+	if err != nil {
+		return err
+	}
+	s.changed()
+	return nil
+}
+
+func (s *Service) updateASRLocked(ctx context.Context, edit func(*model.ASRSettings) error) error {
+	a := s.ASR()
+	oldPerJob := a.VRAMPerJobMB
+	if err := edit(&a); err != nil {
+		return err
+	}
 	a.Model = strings.TrimSpace(a.Model)
 	a.Language = strings.TrimSpace(a.Language)
 	if a.DeviceMode = strings.TrimSpace(a.DeviceMode); a.DeviceMode == "" {
@@ -719,21 +776,43 @@ func (s *Service) SetASR(ctx context.Context, a model.ASRSettings) error {
 		return userErr(ErrInvalid, CodeMemReserveInvalid, map[string]any{"min": 0, "max": MaxMemReserveMB},
 			"保留内存必须在 0 到 %d MB 之间", MaxMemReserveMB)
 	}
+	// The device registry has its own lock and never calls back into the
+	// settings, so checking it under wmu cannot deadlock.
 	if err := s.checkDeviceMode(ctx, a.DeviceMode, a.ManualDevices); err != nil {
 		return err
 	}
 	// Stored normalized (power-brief §3.2): auto without a list, or manual
 	// with the trimmed, de-duplicated list; a 3b single id as manual [id].
 	a = model.NormalizeASRDeviceMode(a)
-	s.wmu.Lock()
 	if a.VRAMPerJobMB == 0 {
-		a.VRAMPerJobMB = s.ASR().VRAMPerJobMB
+		a.VRAMPerJobMB = oldPerJob
 	}
 	b, _ := json.Marshal(a)
-	err := s.st.SetKV(ctx, model.KVSettingsASR, string(b))
-	if err == nil {
-		err = s.Load(ctx)
+	if err := s.st.SetKV(ctx, model.KVSettingsASR, string(b)); err != nil {
+		return err
 	}
+	return s.Load(ctx)
+}
+
+// SetGeneral validates (daily_budget >= 0; v3.2.x: llm_idle_timeout_s 0 or
+// in MinLLMIdleTimeoutS..MaxLLMIdleTimeoutS when set) and writes kv settings.general. A nil
+// auto_chapters or llm_idle_timeout_s is stored as absent (= the default).
+func (s *Service) SetGeneral(ctx context.Context, g model.GeneralSettings) error {
+	return s.UpdateGeneral(ctx, func(cur *model.GeneralSettings) error {
+		*cur = g
+		return nil
+	})
+}
+
+// UpdateGeneral is SetGeneral on the result of edit applied to the current
+// settings (a copy with its own optional values), read and written under
+// wmu (r4 D9, as UpdateASR): PUT /api/settings/general merges the body into
+// the current settings here, so two pages changing different fields at the
+// same time both keep their change. An error from edit is returned as it
+// is, nothing written; edit must not block.
+func (s *Service) UpdateGeneral(ctx context.Context, edit func(*model.GeneralSettings) error) error {
+	s.wmu.Lock()
+	err := s.updateGeneralLocked(ctx, edit)
 	s.wmu.Unlock()
 	if err != nil {
 		return err
@@ -742,36 +821,73 @@ func (s *Service) SetASR(ctx context.Context, a model.ASRSettings) error {
 	return nil
 }
 
-// SetGeneral validates (daily_budget >= 0) and writes kv settings.general.
-func (s *Service) SetGeneral(ctx context.Context, g model.GeneralSettings) error {
+func (s *Service) updateGeneralLocked(ctx context.Context, edit func(*model.GeneralSettings) error) error {
+	g := s.General() // a clone: edit cannot write through to the cache
+	if err := edit(&g); err != nil {
+		return err
+	}
 	if !(g.DailyBudget >= 0) || g.DailyBudget > 1e12 {
 		return userErr(ErrInvalid, CodeBudgetInvalid, nil, "每日预算必须是不小于 0 的数（0 表示不限制）")
 	}
-	b, _ := json.Marshal(g)
-	s.wmu.Lock()
-	err := s.st.SetKV(ctx, model.KVSettingsGeneral, string(b))
-	if err == nil {
-		err = s.Load(ctx)
+	if v := g.LLMIdleTimeoutS; v != nil && !validIdleTimeoutS(*v) {
+		return userErr(ErrInvalid, CodeIdleTimeoutInvalid, map[string]any{"min": MinLLMIdleTimeoutS, "max": MaxLLMIdleTimeoutS},
+			"模型请求的空闲超时必须是 0（关闭）或 %d 到 %d 之间的整数秒", MinLLMIdleTimeoutS, MaxLLMIdleTimeoutS)
 	}
-	s.wmu.Unlock()
-	if err != nil {
+	g = cloneGeneral(g)
+	b, _ := json.Marshal(g)
+	if err := s.st.SetKV(ctx, model.KVSettingsGeneral, string(b)); err != nil {
 		return err
 	}
-	s.changed()
-	return nil
+	return s.Load(ctx)
 }
 
 // SetProbedModels stores a probe result (kv provider_models:{id}).
 func (s *Service) SetProbedModels(ctx context.Context, providerID string, pm model.ProbedModels) error {
+	b, err := marshalProbed(pm)
+	if err != nil {
+		return err
+	}
+	return s.st.SetKV(ctx, model.KVProviderModelsPref+providerID, string(b))
+}
+
+// SetProbedModelsFor stores the result of a probe made against from (the
+// provider as it was read when the probe started), unless the provider has
+// since moved to another type, base_url or key (r4 D3): a probe can take
+// many seconds, and its late result must not bring back a model list (or a
+// probe error) of an address the user has already left — UpdateProvider
+// cleared that cache. stored is false when the result was discarded. The
+// comparison and the write run under wmu, the lock every provider write
+// holds until its cache reload is done, so the cache read here is the
+// committed state. A provider deleted meanwhile is CodeProviderNotFound.
+func (s *Service) SetProbedModelsFor(ctx context.Context, from model.Provider, pm model.ProbedModels) (stored bool, err error) {
+	b, err := marshalProbed(pm)
+	if err != nil {
+		return false, err
+	}
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	cur, ok := s.Provider(from.ID)
+	if !ok {
+		return false, userErr(db.ErrNotFound, CodeProviderNotFound, nil, "提供商不存在（可能已被删除）")
+	}
+	if cur.Type != from.Type || cur.BaseURL != from.BaseURL || cur.APIKey != from.APIKey {
+		slog.Info("probe result discarded: the provider changed while it ran", "provider", cur.Name)
+		return false, nil
+	}
+	if err := s.st.SetKV(ctx, model.KVProviderModelsPref+from.ID, string(b)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// marshalProbed fills the defaults of a probe result (probed_at now, an
+// empty model list) and encodes it.
+func marshalProbed(pm model.ProbedModels) ([]byte, error) {
 	if pm.ProbedAt == "" {
 		pm.ProbedAt = time.Now().UTC().Format(time.RFC3339)
 	}
 	if pm.Models == nil {
 		pm.Models = []string{}
 	}
-	b, err := json.Marshal(pm)
-	if err != nil {
-		return err
-	}
-	return s.st.SetKV(ctx, model.KVProviderModelsPref+providerID, string(b))
+	return json.Marshal(pm)
 }

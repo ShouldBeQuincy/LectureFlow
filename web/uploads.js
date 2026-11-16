@@ -85,6 +85,9 @@ export async function addLectureFiles(courseId, files) {
       choices: group.map((f) => ({ value: f, label: f.name, hint: f.size == null ? '' : U.fmtBytes(f.size) })),
       okText: t('common.upload.same_ok'),
       cancelText: t('common.upload.same_none'),
+      // R62 N1: the queue is global and its cancel means "none": the
+      // question stays when the page changes (not closed as cancelled)
+      route: false,
     });
     keep = keep.filter((f) => !group.includes(f) || f === choice);
   }

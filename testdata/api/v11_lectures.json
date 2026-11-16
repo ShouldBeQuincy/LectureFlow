@@ -391,7 +391,11 @@
      "prompt_tokens": 393600,
      "cache_hit_tokens": 342432,
      "completion_tokens": 24480,
-     "estimated_cost": 0.4694
+     "estimated_cost": 0.4694,
+     "mixed_models": [
+      "DeepSeek / deepseek-chat",
+      "Anthropic / claude-sonnet-4-5"
+     ]
     },
     "display_status": "done",
     "stale_reason": null,
@@ -924,7 +928,14 @@
     "status": "done",
     "progress": 1,
     "attempt": 0,
-    "error": null,
+    "error": "2 句待处理（没有得到可用的译文，导出中显示为“（未翻译）”）：#112、#431。可以在播放器中对这些句子点击“重翻此句”",
+    "warning_info": {
+     "code": "translate.sentences_pending",
+     "params": {
+      "ids": "#112, #431",
+      "n": 2
+     }
+    },
     "allowed_actions": [
      "rerun"
     ],
@@ -935,7 +946,8 @@
      "prompt_tokens": 500200,
      "cache_hit_tokens": 435174,
      "completion_tokens": 31110,
-     "estimated_cost": 0.5965
+     "estimated_cost": 0.5965,
+     "pending_sentences": 2
     },
     "display_status": "done",
     "stale_reason": null,
@@ -1080,7 +1092,10 @@
     "status": "done",
     "progress": 1,
     "attempt": 0,
-    "error": null,
+    "error": "录音音量过低，转写结果可能不准",
+    "warning_info": {
+     "code": "prep.low_volume"
+    },
     "allowed_actions": [
      "rerun"
     ],
@@ -1599,7 +1614,19 @@
     "status": "done",
     "progress": 1,
     "attempt": 0,
-    "error": null,
+    "error": "媒体文件可能不完整：文件标明的时长为 25:30，但只读出了 18:00 的音频，只转写了这一部分。如果这不是完整的录音录像，请重新上传完整的文件；录音音量过低，转写结果可能不准",
+    "warning_info": {
+     "code": "prep.media_truncated",
+     "params": {
+      "declared": "25:30",
+      "extra": [
+       {
+        "code": "prep.low_volume"
+       }
+      ],
+      "processed": "18:00"
+     }
+    },
     "allowed_actions": [
      "rerun"
     ],
@@ -1920,18 +1947,20 @@
      "prompt_tokens": 18220,
      "cache_hit_tokens": 0,
      "completion_tokens": 1262,
-     "estimated_cost": 0.0465
+     "estimated_cost": 0.0736
     },
     "display_status": "done",
     "stale_reason": null,
     "model": {
-     "label": "DeepSeek / deepseek-chat · 温度 0.2",
-     "provider_id": "deepseek",
-     "provider_name": "DeepSeek",
-     "model": "deepseek-chat",
+     "label": "Anthropic / claude-opus-5-5 · 温度 0.2",
+     "provider_id": "01JPRV0000000000000000000A",
+     "provider_name": "Anthropic",
+     "model": "claude-opus-5-5",
      "params": {
-      "temperature": 0.2
-     }
+      "temperature": 0.2,
+      "max_tokens": 32768
+     },
+     "source": "manual"
     }
    },
    {
@@ -1993,7 +2022,39 @@
       "temperature": 0.3,
       "window": 3
      }
-    }
+    },
+    "llm": {
+     "in_flight": 4,
+     "current": {
+      "call_id": "c-0412",
+      "n": 2,
+      "try": 1,
+      "role": "translate",
+      "provider_id": "01JPRV0000000000000000000A",
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 2000,
+      "started_at": "2026-10-23T13:59:52Z",
+      "timeout_ms": 120000
+     },
+     "attempts": [
+      {
+       "call_id": "c-0412",
+       "n": 1,
+       "try": 1,
+       "role": "translate",
+       "provider_id": "01JPRV0000000000000000000A",
+       "model": "claude-sonnet-4-5",
+       "max_tokens": 2000,
+       "started_at": "2026-10-23T13:59:35Z",
+       "ended_at": "2026-10-23T13:59:47Z",
+       "timeout_ms": 120000,
+       "outcome": "http_error",
+       "status": 529
+      }
+     ],
+     "retries": 1
+    },
+    "last_activity_at": "2026-10-23T13:59:55Z"
    },
    {
     "stage": "export",
@@ -2031,7 +2092,7 @@
    "prompt_tokens": 475978,
    "cache_hit_tokens": 383696,
    "completion_tokens": 39773,
-   "estimated_cost": 0.8219
+   "estimated_cost": 0.849
   },
   "seq": 9,
   "label": "W03S1",
@@ -5227,7 +5288,52 @@
      "params": {
       "temperature": 0.2
      }
-    }
+    },
+    "llm": {
+     "attempts": [
+      {
+       "call_id": "c-0001",
+       "n": 1,
+       "try": 1,
+       "role": "summary",
+       "provider_id": "deepseek",
+       "model": "deepseek-chat",
+       "started_at": "2026-10-23T13:58:42Z",
+       "ended_at": "2026-10-23T13:58:46Z",
+       "timeout_ms": 120000,
+       "outcome": "http_error",
+       "status": 503
+      },
+      {
+       "call_id": "c-0001",
+       "n": 2,
+       "try": 1,
+       "role": "summary",
+       "provider_id": "deepseek",
+       "model": "deepseek-chat",
+       "started_at": "2026-10-23T13:58:51Z",
+       "ended_at": "2026-10-23T13:58:55Z",
+       "timeout_ms": 120000,
+       "outcome": "http_error",
+       "status": 503
+      },
+      {
+       "call_id": "c-0001",
+       "n": 3,
+       "try": 1,
+       "role": "summary",
+       "provider_id": "deepseek",
+       "model": "deepseek-chat",
+       "started_at": "2026-10-23T13:59:04Z",
+       "ended_at": "2026-10-23T13:59:08Z",
+       "timeout_ms": 120000,
+       "outcome": "http_error",
+       "status": 503
+      }
+     ],
+     "retries": 2
+    },
+    "last_activity_at": "2026-10-23T13:59:17Z"
    },
    {
     "stage": "repair",
@@ -7040,7 +7146,70 @@
       "temperature": 0.3,
       "window": 3
      }
-    }
+    },
+    "llm": {
+     "in_flight": 2,
+     "current": {
+      "call_id": "c-0057",
+      "n": 2,
+      "try": 1,
+      "role": "translate",
+      "provider_id": "01JPRV0000000000000000000A",
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 2000,
+      "started_at": "2026-10-23T13:59:52Z",
+      "timeout_ms": 120000,
+      "retry_at": "2026-10-23T14:00:04Z"
+     },
+     "attempts": [
+      {
+       "call_id": "c-0031",
+       "n": 1,
+       "try": 1,
+       "role": "translate",
+       "provider_id": "01JPRV0000000000000000000A",
+       "model": "claude-sonnet-4-5",
+       "max_tokens": 2000,
+       "started_at": "2026-10-23T13:59:23Z",
+       "ended_at": "2026-10-23T13:59:38Z",
+       "timeout_ms": 120000,
+       "outcome": "truncated",
+       "prompt_tokens": 1840,
+       "completion_tokens": 2000
+      },
+      {
+       "call_id": "c-0031",
+       "n": 2,
+       "try": 1,
+       "role": "translate",
+       "provider_id": "01JPRV0000000000000000000A",
+       "model": "claude-sonnet-4-5",
+       "max_tokens": 4000,
+       "started_at": "2026-10-23T13:59:39Z",
+       "ended_at": "2026-10-23T13:59:48Z",
+       "timeout_ms": 120000,
+       "outcome": "ok",
+       "prompt_tokens": 1840,
+       "completion_tokens": 2412
+      },
+      {
+       "call_id": "c-0057",
+       "n": 1,
+       "try": 1,
+       "role": "translate",
+       "provider_id": "01JPRV0000000000000000000A",
+       "model": "claude-sonnet-4-5",
+       "max_tokens": 2000,
+       "started_at": "2026-10-23T13:59:52Z",
+       "ended_at": "2026-10-23T13:59:53Z",
+       "timeout_ms": 120000,
+       "outcome": "http_error",
+       "status": 429
+      }
+     ],
+     "retries": 2
+    },
+    "last_activity_at": "2026-10-23T13:59:56Z"
    },
    {
     "stage": "export",

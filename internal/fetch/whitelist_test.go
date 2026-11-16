@@ -102,8 +102,9 @@ func outsidePlaylist(seg string) []byte {
 	return []byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXTINF:1.0,\n" + seg + "\n#EXT-X-ENDLIST\n")
 }
 
-// A "video file" whose URL ends in .m3u8 (the track is saved as t1.m3u8)
-// and holds a playlist naming a file of this computer: ffmpeg refuses it
+// A "video file" whose URL ends in .m3u8 (the track is saved as t1.mp4,
+// fileTrackExt) and holds a playlist naming a file of this computer:
+// ffmpeg refuses it
 // (the fake as the real one does with the whitelists), the task fails and
 // nothing is imported; the same as the second angle.
 func TestPlaylistFromURLRefused(t *testing.T) {
@@ -163,6 +164,11 @@ func realFFmpeg(t *testing.T) string {
 	return p
 }
 
+// ffconcat is an ffconcat document naming one file (relative to it).
+func ffconcat(name string) []byte {
+	return []byte("ffconcat version 1.0\nfile '" + name + "'\n")
+}
+
 func makeReal(t *testing.T, ff, out string, args ...string) []byte {
 	t.Helper()
 	all := append([]string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y"}, args...)
@@ -178,11 +184,18 @@ func makeReal(t *testing.T, ff, out string, args ...string) []byte {
 
 const realSine = "sine=frequency=440:duration=3"
 
-// The real ffmpeg with the merge's options: a playlist handed over as a
-// video file or as the second angle is refused before anything is read
-// (the plain ffmpeg would follow it: checked first); real files are
-// combined; real HLS segments, AES-128 encrypted, are joined through the
-// local playlist with the hls whitelist.
+// The real ffmpeg with the merge's options: a list of other files handed
+// over as a video file or as the second angle is refused before anything
+// is read (the plain ffmpeg would follow it: checked first); real files
+// are combined; real HLS segments, AES-128 encrypted, are joined through
+// the local playlist with the hls whitelist.
+//
+// The list is an ffconcat document served as /files/lecture.mp4: the file
+// keeps that media extension (fileTrackExt), and ffmpeg recognises the
+// concat demuxer by the content alone, so only the merge's whitelist
+// refuses it (SEC43 info-3: a playlist saved as .mp4 is no longer taken
+// for HLS by an ffmpeg from 7.1 on, which then tested nothing of ours).
+// It names the audio track downloaded next to it.
 func TestRealMergeWhitelists(t *testing.T) {
 	ff := realFFmpeg(t)
 	gen := t.TempDir()
@@ -195,6 +208,19 @@ func TestRealMergeWhitelists(t *testing.T) {
 	if b, err := exec.Command(ff, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", pl, "-c", "copy", "-f", "mpegts", filepath.Join(gen, "leak.ts")).CombinedOutput(); err != nil {
 		t.Fatalf("ffmpeg without the whitelists did not follow the playlist: %v\n%s", err, b)
 	}
+	// an ffconcat document named .mp4: the plain ffmpeg reads the file it
+	// names (relative, as the concat demuxer's safe mode allows)
+	concat := filepath.Join(gen, "concat.mp4")
+	if err := os.WriteFile(concat, ffconcat(filepath.Base(seg)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	leak := filepath.Join(gen, "leak2.ts")
+	if b, err := exec.Command(ff, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", concat, "-c", "copy", "-f", "mpegts", leak).CombinedOutput(); err != nil {
+		t.Fatalf("ffmpeg without the whitelists did not follow the ffconcat document: %v\n%s", err, b)
+	}
+	if fi, err := os.Stat(leak); err != nil || fi.Size() == 0 {
+		t.Fatalf("ffmpeg without the whitelists read nothing through the ffconcat document: %v", err)
+	}
 	video := makeReal(t, ff, filepath.Join(gen, "v.mp4"), "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=3", "-c:v", "mpeg4")
 	audio := makeReal(t, ff, filepath.Join(gen, "a.m4a"), "-f", "lavfi", "-i", realSine, "-c:a", "aac")
 
@@ -203,10 +229,10 @@ func TestRealMergeWhitelists(t *testing.T) {
 			e := newQEnv(t, func(o *Options) { o.FFmpeg = ff })
 			e.media.put("/files/a.m4a", audio)
 			e.media.put("/files/v.mp4", video)
-			e.media.put("/files/lecture.m3u8", outsidePlaylist(seg))
-			tracks := []bridge.Track{e.fileTrack(bridge.KindAudio, "/files/a.m4a"), e.fileTrack(bridge.KindVideo, "/files/lecture.m3u8")}
+			e.media.put("/files/lecture.mp4", ffconcat("t0.m4a"))
+			tracks := []bridge.Track{e.fileTrack(bridge.KindAudio, "/files/a.m4a"), e.fileTrack(bridge.KindVideo, "/files/lecture.mp4")}
 			if angle {
-				v2 := e.fileTrack(bridge.KindVideo, "/files/lecture.m3u8")
+				v2 := e.fileTrack(bridge.KindVideo, "/files/lecture.mp4")
 				v2.Role = "secondary-video"
 				tracks = []bridge.Track{tracks[0], e.fileTrack(bridge.KindVideo, "/files/v.mp4"), v2}
 			}

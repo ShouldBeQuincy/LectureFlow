@@ -139,16 +139,20 @@ func TestMoveCarriesDataKey(t *testing.T) {
 
 // An import seals the imported credentials with this installation's key:
 // plain ones (an older install), and ones sealed with the imported
-// directory's key when that key opens here. Ones no key opens are kept as
-// they are ("需要重新输入").
+// directory's key when that key opens here, in 3.2.0's unbound format or
+// bound (sec3 L3); every value it writes is bound to its row. Ones no key
+// opens are kept as they are ("需要重新输入").
 func TestStageImportResealsCredentials(t *testing.T) {
 	ctx := context.Background()
 	t.Cleanup(secrets.ResetForTest)
+	const base = "https://llm.example.org" // insertProvider's
 	for _, tc := range []struct {
 		name    string
 		srcKey  bool // the source has its own key file
 		keepKey bool // ... and it stays readable (same account)
-	}{{"plain", false, false}, {"same account", true, true}, {"other computer", true, false}} {
+		bound   bool // ... and its values are bound (enc:v2:), else 3.2.0's enc:v1:
+	}{{"plain", false, false, false}, {"same account", true, true, false}, {"same account, bound", true, true, true},
+		{"other computer", true, false, false}, {"other computer, bound", true, false, true}} {
 		t.Run(tc.name, func(t *testing.T) {
 			secrets.ResetForTest()
 			e := newImportEnv(t)
@@ -162,8 +166,13 @@ func TestStageImportResealsCredentials(t *testing.T) {
 				if _, err := secrets.Setup(e.src, nil); err != nil {
 					t.Fatal(err)
 				}
-				stored, _ = secrets.Seal([]byte(relocKeyA))
-				storedCred, _ = secrets.Seal([]byte(cred))
+				if tc.bound {
+					stored, _ = secrets.SealFor(db.SealPurposeProviderKey, db.ProviderKeyBinding("p1", base), []byte(relocKeyA))
+					storedCred, _ = secrets.SealFor(db.SealPurposeKV, colab.KVCredential, []byte(cred))
+				} else {
+					stored, _ = secrets.Seal([]byte(relocKeyA))
+					storedCred, _ = secrets.Seal([]byte(cred))
+				}
 				if !tc.keepKey {
 					os.Remove(filepath.Join(e.src, secrets.KeyFileName))
 				}
@@ -184,8 +193,8 @@ func TestStageImportResealsCredentials(t *testing.T) {
 			staged := filepath.Join(e.cur, StagingDir, DBName)
 			got := providerKey(t, staged, "p1")
 			if !tc.srcKey || tc.keepKey {
-				if b, cur, err := secrets.OpenAny(got); err != nil || !cur || string(b) != relocKeyA {
-					t.Fatalf("staged key not sealed with this installation's key: %v %v", cur, err)
+				if b, cur, err := secrets.OpenAnyFor(db.SealPurposeProviderKey, db.ProviderKeyBinding("p1", base), got); err != nil || !cur || string(b) != relocKeyA {
+					t.Fatalf("staged key not sealed (bound) with this installation's key: %v %v", cur, err)
 				}
 				for _, sfx := range []string{"", "-wal", "-journal"} {
 					if b, err := os.ReadFile(staged + sfx); err == nil && bytes.Contains(b, []byte(relocKeyA)) {

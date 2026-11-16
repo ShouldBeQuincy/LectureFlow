@@ -400,6 +400,44 @@ func TestSetupReportsPlainKeyFile(t *testing.T) {
 	}
 }
 
+// Security review SEC3 T5: a kept key file (secrets.key.unreadable-*)
+// without the system's protection is reported, by its own name (SEC31
+// L5: not as the data key file, which is protected): its key opens values
+// just the same. It is left as it is. One the system protects is not
+// reported.
+func TestSetupReportsPlainKeptKeyFile(t *testing.T) {
+	reset(t)
+	f := &fakeStore{account: "alice"}
+	useFakeStore(t, f)
+	dir := t.TempDir()
+	if _, err := Setup(dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	kept := filepath.Join(dir, KeyFileName+".unreadable-planted")
+	b, _ := json.Marshal(keyFile{Format: keyFileFormat, Version: 1, Protection: string(ProtectionFile), Key: base64.StdEncoding.EncodeToString(testKey(9))})
+	if err := os.WriteFile(kept, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reset(t)
+	st, err := Setup(dir, nil)
+	if err != nil || st.PlainKeptFile != kept || st.PlainKeyFile || st.Recovered != 1 || st.Protection != ProtectionDPAPI {
+		t.Fatalf("plain kept file: %+v %v", st, err)
+	}
+	if now, _ := os.ReadFile(kept); !bytes.Equal(now, b) {
+		t.Fatal("the kept file was rewritten")
+	}
+	// protected by the store: no report
+	blob, _ := f.protect(testKey(9))
+	b, _ = json.Marshal(keyFile{Format: keyFileFormat, Version: 1, Protection: string(ProtectionDPAPI), Key: base64.StdEncoding.EncodeToString(blob)})
+	if err := os.WriteFile(kept, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reset(t)
+	if st, err := Setup(dir, nil); err != nil || st.PlainKeyFile || st.PlainKeptFile != "" || st.Recovered != 1 {
+		t.Fatalf("protected kept file: %+v %v", st, err)
+	}
+}
+
 func TestSetupUnavailableFromShell(t *testing.T) {
 	reset(t)
 	st := SetupUnavailable("access refused")

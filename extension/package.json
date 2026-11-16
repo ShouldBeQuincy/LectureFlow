@@ -1,6 +1,6 @@
 {
   "name": "lectureflow-extension",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "LectureFlow browser extension: finds the media tracks of a lecture recording page and hands them to the local LectureFlow app.",
   "license": "AGPL-3.0-or-later",

@@ -8,6 +8,9 @@
 //
 // A sealed value is Prefix + base64(nonce ‖ AES-256-GCM ciphertext), kept
 // in the same TEXT column the plain value used to be in (no DDL change).
+// Since sec3 L3 the credentials are sealed with SealFor instead (PrefixV2,
+// bound.go): the ciphertext is bound to its purpose and to where it
+// belongs, so it does not open in another row or for another host.
 // Where the data key comes from (Windows DPAPI, the desktop shell's
 // safeStorage, a 0600 file) is the key provider's business; this file is
 // only the frozen API (lead, 2026-10-27): Seal, Open, IsSealed, SetKey,
@@ -24,7 +27,7 @@ import (
 	"sync"
 )
 
-// Prefix marks a sealed value.
+// Prefix marks a value Seal produced (no binding; PrefixV2 for SealFor).
 const Prefix = "enc:v1:"
 
 // KeySize is the data key's length in bytes.
@@ -71,8 +74,10 @@ func HasKey() bool {
 	return aead != nil
 }
 
-// IsSealed reports whether s is a sealed value (it may still fail to open).
-func IsSealed(s string) bool { return strings.HasPrefix(s, Prefix) }
+// IsSealed reports whether s is a sealed value (it may still fail to open):
+// one Seal produced (Prefix) or, since sec3 L3, one SealFor produced
+// (PrefixV2). Every caller treats both as "not a plain credential".
+func IsSealed(s string) bool { return strings.HasPrefix(s, Prefix) || IsBound(s) }
 
 // Seal encrypts plain with the data key.
 func Seal(plain []byte) (string, error) {
@@ -90,8 +95,12 @@ func Seal(plain []byte) (string, error) {
 	return Prefix + base64.RawStdEncoding.EncodeToString(out), nil
 }
 
-// Open decrypts a value Seal produced.
+// Open decrypts a value Seal produced. A value SealFor produced is refused
+// (errBound): it opens only with its purpose and binding (OpenFor).
 func Open(sealed string) ([]byte, error) {
+	if IsBound(sealed) {
+		return nil, errBound
+	}
 	if !IsSealed(sealed) {
 		return nil, errors.New("secrets: not a sealed value")
 	}

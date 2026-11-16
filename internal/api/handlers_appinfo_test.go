@@ -283,3 +283,41 @@ func TestRedactPatterns(t *testing.T) {
 		}
 	}
 }
+
+// SEC13 §13.4-3, SEC14 N31-I3: the user information of a URL (a proxy
+// with an account in a remote server's stderr, a mirror's URL) is
+// redacted, up to the last "@" before the host; what only has an "@"
+// elsewhere stays readable.
+//
+// Known residue (SEC32 L-4): a password with an unescaped "/", "?" or "#"
+// ("https://u:pa/ss@h.example/") is not a URL's user information to the
+// rule at all, so the whole user name and password stay as they are (not
+// only a part of them). Not covered either: a percent-encoded URL inside a
+// parameter. ("user:pass@host" without a scheme, "\/\/" escaped slashes in
+// JSON, "//u:p@h" and "_https://": TestRedactBareUserinfo, v3.2.x r5.)
+func TestRedactURLUserinfo(t *testing.T) {
+	r := &redactor{}
+	cases := map[string]string{
+		// redacted: a user, a user and a password, "@" and ":" in the password
+		`fetch https://mirror-user@mirror.example/simple/ failed`:  `fetch https://<redacted>@mirror.example/simple/ failed`,
+		`proxy http://bob:hunter2@proxy.example:3128 refused`:      `proxy http://<redacted>@proxy.example:3128 refused`,
+		`url=https://a@b:p@ss:w0rd@pkgs.example/x`:                 `url=https://<redacted>@pkgs.example/x`,
+		`"index":"HTTPS://Carol:pa:ss@Index.Example/simple?x=1"`:   `"index":"HTTPS://<redacted>@Index.Example/simple?x=1"`,
+		`git+ssh://dave:s3cret@git.example/repo.git`:               `git+ssh://<redacted>@git.example/repo.git`,
+		`socks5h://erin:token=abc@proxy.example:1080`:              `socks5h://<redacted>@proxy.example:1080`,
+		`two: ftp://u1:p1@a.example/ and ftp://u2@b.example/`:      `two: ftp://<redacted>@a.example/ and ftp://<redacted>@b.example/`,
+		`stderr: Could not fetch URL https://frank:pw@192.0.2.9/x`: `stderr: Could not fetch URL https://<redacted>@<ip>/x`,
+		// kept: no user information
+		`https://pkgs.example/simple/`:                              `https://pkgs.example/simple/`,
+		`https://forum.example/u/@grace/posts?by=@heidi#@top`:       `https://forum.example/u/@grace/posts?by=@heidi#@top`,
+		`https://pkgs.example/x?mail=ivan@mail.example`:             `https://pkgs.example/x?mail=ivan@mail.example`,
+		`contact judy@mail.example or mailto:judy@mail.example`:     `contact judy@mail.example or mailto:judy@mail.example`,
+		`ssh kim@gpu.example (no scheme) and git@git.example:x.git`: `ssh kim@gpu.example (no scheme) and git@git.example:x.git`,
+		`see https://docs.example/a and @mention`:                   `see https://docs.example/a and @mention`,
+	}
+	for in, want := range cases {
+		if got := string(r.apply([]byte(in))); got != want {
+			t.Errorf("redact(%q)\n got %q\nwant %q", in, got, want)
+		}
+	}
+}

@@ -8,10 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"runtime"
 	"sync"
 	"time"
-	"weak"
 
 	"lectureflow/internal/db"
 	"lectureflow/internal/model"
@@ -275,8 +273,52 @@ func (s *Scheduler) retryDeferred(ctx context.Context) {
 
 // resumeIncremental runs at Start: the debounce timers live in memory, so
 // after a restart every lecture whose translate is done but still has stale
-// or untranslated sentences gets its incremental run immediately.
+// or untranslated sentences gets its incremental run (resumeIncrementalNow)
+// before any job is dispatched.
+//
+// r7 perf (P1 report H2): that pass reads every lecture's zh counts, i.e.
+// every sentence (0.4–1 s on a 400-lecture library), and Start, the HTTP
+// server and the ready line used to wait for it. It now runs at the
+// beginning of the scheduler's first scan instead (resumeDeferred), still
+// before anything is dispatched, while the server already answers. Two
+// things keep the outcome the same:
+//   - Start runs resumeReviewFlags right after this. When that may apply a
+//     glossary fallback (fallbackMayRun), whose course invalidation can turn
+//     a done translate stale, the pass runs here, before it, as it always
+//     did.
+//   - The first scan runs it under scanMu once no PauseDispatch is held, so
+//     a data directory copy started meanwhile sees no scheduler write; a
+//     lecture the user edited meanwhile is left to its debounced request
+//     (resumeIncrementalNow), and state.StartIncrementalTranslate decides
+//     in its transaction either way.
 func (s *Scheduler) resumeIncremental(ctx context.Context) error {
+	if s.fallbackMayRun(ctx) {
+		return s.resumeIncrementalNow(ctx)
+	}
+	s.scanMu.Lock()
+	s.resumePending = true
+	s.scanMu.Unlock()
+	return nil
+}
+
+// resumeDeferred runs the resume Start left to the first scan. Caller holds
+// scanMu (scan, after its dispatch-hold check).
+func (s *Scheduler) resumeDeferred(ctx context.Context) {
+	if !s.resumePending {
+		return
+	}
+	s.resumePending = false
+	if err := s.resumeIncrementalNow(ctx); err != nil && ctx.Err() == nil {
+		slog.Error("resume incremental translate", "err", err)
+	}
+}
+
+// resumeIncrementalNow starts the incremental run of every lecture that
+// needs one (startIfNeeded), course by course, lecture by lecture. A
+// lecture with a request since the start (an edit while the first scan's
+// resume runs) is left to processIncremental, so it keeps its debounce
+// (review R73 low 1); that request's startIfNeeded decides the same.
+func (s *Scheduler) resumeIncrementalNow(ctx context.Context) error {
 	courses, err := s.st.ListCourses(ctx)
 	if err != nil {
 		return err
@@ -287,12 +329,47 @@ func (s *Scheduler) resumeIncremental(ctx context.Context) error {
 			return err
 		}
 		for _, l := range lecs {
-			if _, err := s.startIfNeeded(ctx, l.ID); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err() // stopping: the next start resumes the rest
+			}
+			s.mu.Lock()
+			_, requested := s.incrReq[l.ID]
+			s.mu.Unlock()
+			if requested {
+				continue
+			}
+			if _, err := s.startIfNeeded(ctx, l.ID); err != nil && ctx.Err() == nil {
 				slog.Error("resume incremental translate", "lecture", l.ID, "err", err)
 			}
 		}
 	}
 	return nil
+}
+
+// fallbackMayRun reports whether resumeReviewFlags may apply a glossary
+// fallback at this start: some course's current glossary_review has an end
+// without its fallback (reviewFallbackDue, the very check
+// fallbackAfterReview makes; it may still skip, which only keeps the
+// resume before it). A read error counts as yes: the order of Start before
+// r7 is the safe one.
+func (s *Scheduler) fallbackMayRun(ctx context.Context) bool {
+	courses, err := s.st.ListCourses(ctx)
+	if err != nil {
+		return true
+	}
+	for _, c := range courses {
+		j, err := s.st.GetCurrentJob(ctx, model.ScopeCourse, c.ID, model.StageGlossaryReview)
+		if errors.Is(err, db.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return true
+		}
+		if due, err := s.reviewFallbackDue(ctx, j); err != nil || due {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------- waiting_for & status ----------
@@ -391,41 +468,16 @@ func (s *Scheduler) GPUPaused() bool {
 // scan's admission reads nvidia-smi itself, unaffected.
 const GPUStatusTTL = 3 * time.Second
 
-// gpuReading is the GPUStatus cache of one Scheduler. mu is held while
-// nvidia-smi runs, so concurrent callers share one run; at is when the
-// last reading ended (zero: none yet).
-type gpuReading struct {
-	mu sync.Mutex
-	at time.Time
-}
-
-// gpuReadings maps each Scheduler to its gpuReading. It is kept here, not
-// in the Scheduler struct (scheduler.go has another owner; lead may move
-// it there): the key is weak and a cleanup drops the entry, so a scheduler
-// that is no longer used is still collected.
-var gpuReadings sync.Map // weak.Pointer[Scheduler] → *gpuReading
-
-func (s *Scheduler) gpuReadingCache() *gpuReading {
-	k := weak.Make(s)
-	if v, ok := gpuReadings.Load(k); ok {
-		return v.(*gpuReading)
-	}
-	v, loaded := gpuReadings.LoadOrStore(k, &gpuReading{})
-	if !loaded {
-		runtime.AddCleanup(s, func(k weak.Pointer[Scheduler]) { gpuReadings.Delete(k) }, k)
-	}
-	return v.(*gpuReading)
-}
-
 // readGPUCached refreshes lastGPU from nvidia-smi unless GPUStatus read it
-// less than GPUStatusTTL ago. A caller whose context ends during the run
+// less than GPUStatusTTL ago. gpuReadMu is held while nvidia-smi runs, so
+// concurrent callers share one run; gpuReadAt is when the last reading
+// ended (zero: none yet). A caller whose context ends during the run
 // records nothing (the next caller reads again).
 func (s *Scheduler) readGPUCached(ctx context.Context) {
-	c := s.gpuReadingCache()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.at.IsZero() {
-		if age := s.now().Sub(c.at); age >= 0 && age < GPUStatusTTL {
+	s.gpuReadMu.Lock()
+	defer s.gpuReadMu.Unlock()
+	if !s.gpuReadAt.IsZero() {
+		if age := s.now().Sub(s.gpuReadAt); age >= 0 && age < GPUStatusTTL {
 			return
 		}
 	}
@@ -434,7 +486,7 @@ func (s *Scheduler) readGPUCached(ctx context.Context) {
 		return
 	}
 	s.rememberGPU(m, err)
-	c.at = s.now()
+	s.gpuReadAt = s.now()
 }
 
 // GPUStatus returns the GPU row of the diagnostics page: nvidia-smi's
@@ -465,7 +517,12 @@ func (s *Scheduler) GPUStatus(ctx context.Context) GPUStatus {
 	if s.fakeASR() {
 		g.OK, g.Error = false, "fake ASR mode"
 	}
-	g.EstimatedJobMB, _, _ = s.estimate(ctx, g.TotalMB, nil)
+	// the raise is read once: the estimate and EstimateRaised agree; it is
+	// raised when the raise is what the estimate is (a calibration above it
+	// wins)
+	est, _, bump, _, _ := s.estimateBump(ctx, g.TotalMB, nil)
+	g.EstimatedJobMB = est
+	g.EstimateRaised = bump > 0 && bump >= est
 	return g
 }
 

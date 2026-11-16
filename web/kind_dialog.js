@@ -19,7 +19,7 @@ export async function openKindDialog(lec, opts = {}) {
   const cur = kindOf(lec);
   const l = await openDialog(
     t('kind.dialog.title'),
-    (close) => {
+    (close, busy) => {
       const name = 'kind' + Math.random().toString(36).slice(2);
       const err = h('p', { class: 'dlg-field-error', role: 'alert' });
       const save = h('button', { type: 'submit', class: 'btn btn-primary', disabled: true }, t('common.save'));
@@ -44,7 +44,8 @@ export async function openKindDialog(lec, opts = {}) {
         save.disabled = true;
         err.textContent = '';
         try {
-          const updated = await withRenumber((confirm) => api.setLectureKind(lec.id, kind, confirm, { quiet: true }));
+          // busy: a route change while it runs lets it finish (R62 N4)
+          const updated = await busy(withRenumber((confirm) => api.setLectureKind(lec.id, kind, confirm, { quiet: true })));
           if (updated) close(updated);
           else save.disabled = false; // kept the old numbers
         } catch (ex) {

@@ -16,10 +16,11 @@ import { checkProfile, profilePermissionOrigins } from '../lib/profile.js';
 import { requestableOrigin, parseHttpUrl } from '../lib/url.js';
 import { hostCategory } from '../lib/blocklist.js';
 import { blockedText } from '../ui/sendcard.js';
-import { UI_LANGUAGES, LANGUAGE_KEY } from '../lib/i18n.js';
+import { UI_LANGUAGES, LANGUAGE_KEY, reportRowKey } from '../lib/i18n.js';
 import { RESTRICTED_KEY, rememberedList, withoutRemembered } from '../lib/remember.js';
 import { TRUST_KEY, trustedList, withoutTrusted } from '../lib/embed.js';
 import { localEntry, withLocalEntry, confirmedReplacement } from '../lib/localprofiles.js';
+import { HEALTH_KEY, healthKey, isStopped } from '../lib/health.js';
 
 const browser = globalThis.browser;
 const $ = (id) => document.getElementById(id);
@@ -100,16 +101,58 @@ async function grantControl(profile) {
   }, el('span', { text: t('profileGrant') }));
 }
 
-async function profileRow(profile, { reviewed, removable, entry = null, packaged = false }) {
+// Profiles stopped as too slow (src/lib/health.js): their records.
+async function health() {
+  const h = (await browser.storage.local.get(HEALTH_KEY))[HEALTH_KEY];
+  return h && typeof h === 'object' ? h : {};
+}
+
+/** Clears the record of a profile entry; the background tries it again. */
+async function clearHealth(entry) {
+  const h = await health();
+  const key = healthKey(entry);
+  if (!(key in h)) return;
+  delete h[key];
+  await browser.storage.local.set({ [HEALTH_KEY]: h });
+  try {
+    await browser.runtime.sendMessage({ cmd: 'regexReset' });
+  } catch {
+    // the background starts afresh anyway
+  }
+}
+
+async function profileRow(profile, { reviewed, removable, entry = null, packaged = false, problems = [], slow = null }) {
   const status = reviewed ? el('span', { class: 'chip chip-ok', text: t('reviewed') }) : el('span', { class: 'chip chip-idle', text: t('unreviewed') });
   // a local file with a packaged profile's id: in force only when confirmed on import
   let replaces = null;
-  if (entry && packaged) {
+  if (entry && problems.length) {
+    // not in use (src/background/profiles.js skips it), whatever it replaces;
+    // the packaged profile of that id stays in force (SEC18 低-3)
+    const first = problems[0];
+    replaces = el('span', { class: 'chip chip-warn', dataset: { inactive: 'true', invalid: 'true' }, text: t('profileInvalid', [`${first.path} ${first.message}`]) });
+  } else if (slow) {
+    // stopped by the runtime regex guard (src/lib/regexguard.js): a local
+    // file until it is imported again, a packaged one until enabled here
+    // or the extension is updated
+    replaces = el('span', { class: 'chip chip-warn', dataset: { inactive: 'true', slow: 'true' }, text: t(reviewed ? 'profileTooSlowBuiltin' : 'profileTooSlow', [slow.rule, String(slow.ms)]) });
+  } else if (entry && packaged) {
     replaces = confirmedReplacement(entry)
       ? el('span', { class: 'small faint', dataset: { replaces: entry.replaces }, text: t('profileReplaces', [entry.replaces]) })
       : el('span', { class: 'chip chip-warn', dataset: { inactive: 'true' }, text: t('profileInactive') });
   }
   const actions = el('div', { class: 'row-actions' }, await grantControl(profile));
+  if (slow && reviewed) {
+    actions.append(
+      el('button', {
+        class: 'btn btn-sm',
+        dataset: { reenable: profile.id },
+        onclick: async () => {
+          await clearHealth({ profile, source: 'bundled' });
+          renderProfiles();
+        },
+      }, el('span', { text: t('profileReenable') })),
+    );
+  }
   if (removable) {
     actions.append(
       el('button', {
@@ -118,6 +161,7 @@ async function profileRow(profile, { reviewed, removable, entry = null, packaged
         onclick: async () => {
           const rest = (await local()).filter((x) => x.profile.id !== profile.id);
           await browser.storage.local.set({ [LOCAL_KEY]: rest });
+          await clearHealth({ profile, source: 'local' });
           renderProfiles();
         },
       }, icon('trash'), el('span', { text: t('remove') })),
@@ -135,13 +179,30 @@ async function renderProfiles() {
   const rows = [];
   const packaged = await bundled();
   const ids = new Set(packaged.map((p) => p.id));
-  for (const e of await local()) if (e && e.profile) rows.push(await profileRow(e.profile, { reviewed: false, removable: true, entry: e, packaged: ids.has(e.profile.id) }));
-  for (const p of packaged) rows.push(await profileRow(p, { reviewed: true, removable: false }));
+  const sch = await schema();
+  const h = await health();
+  const version = browser.runtime.getManifest().version;
+  const slowOf = (entry) => (isStopped(h[healthKey(entry)], entry, version) ? h[healthKey(entry)] : null);
+  for (const e of await local()) {
+    if (!e || !e.profile) continue;
+    // the same check as loading them (src/background/profiles.js)
+    let problems;
+    try {
+      problems = checkProfile(sch, e.profile, { unreviewed: true });
+    } catch {
+      problems = [{ path: '', message: 'unreadable' }];
+    }
+    const slow = slowOf({ profile: e.profile, source: 'local' });
+    rows.push(await profileRow(e.profile, { reviewed: false, removable: true, entry: e, packaged: ids.has(e.profile.id), problems, slow }));
+  }
+  for (const p of packaged) rows.push(await profileRow(p, { reviewed: true, removable: false, slow: slowOf({ profile: p, source: 'bundled' }) }));
   $('profiles').replaceChildren(...rows);
 }
 
 async function storeLocal(entry) {
   await browser.storage.local.set({ [LOCAL_KEY]: withLocalEntry(await local(), entry) });
+  // a file imported again is tried again (src/lib/health.js)
+  await clearHealth({ profile: entry.profile, source: 'local' });
   note('import-msg', t('importDone', [entry.profile.name]), 'ok');
   renderProfiles();
 }
@@ -187,7 +248,7 @@ async function importFile(file) {
     note('import-msg', t('importNotJson'), 'bad');
     return;
   }
-  const errors = checkProfile(await schema(), profile);
+  const errors = checkProfile(await schema(), profile, { unreviewed: true });
   // A profile for a do-not-handle site (src/lib/blocklist.js): said plainly.
   const blocked = errors.find((e) => e.blocked);
   if (blocked) {
@@ -325,7 +386,7 @@ async function renderReports() {
       el(
         'li',
         { class: 'row', dataset: { tabId: String(tab.tabId) } },
-        el('div', { class: 'row-main' }, icon('world'), el('span', { text: t('reportRow', [tab.host, String(tab.total)]) }), el('span', { class: 'chip chip-outline', text: tab.profile || t('sourceGeneric') })),
+        el('div', { class: 'row-main' }, icon('world'), el('span', { text: t(reportRowKey(tab.total), [tab.host, String(tab.total)]) }), el('span', { class: 'chip chip-outline', text: tab.profile || t('sourceGeneric') })),
         el('button', { class: 'btn btn-sm', onclick: () => exportReport(tab.tabId) }, icon('download'), el('span', { text: t('exportOne') })),
       ),
     ),

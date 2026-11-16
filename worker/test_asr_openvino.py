@@ -799,7 +799,10 @@ def test_can_convert_is_false_without_optimum(monkeypatch):
     assert ov_worker.can_convert() is False
 
 
-# --- real processes (as Go starts them), with the fake packages on PYTHONPATH ---------
+# --- real processes, with the fake packages on PYTHONPATH ---------------------------
+# Not quite as Go starts them: Go adds -s and leaves PYTHONPATH out of the
+# environment (internal/pyenv), while these tests need PYTHONPATH to bring the
+# fakes in.
 
 def _env(tmp_path, **cfg):
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1",

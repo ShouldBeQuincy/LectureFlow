@@ -21,7 +21,7 @@
 import { h, clear } from './dom.js';
 import { t } from './i18n.js';
 import { pIcon } from './player_icons.js';
-import { bindContextMenu } from './menu.js';
+import { bindContextMenu, menuButton } from './menu.js';
 import { diffView } from './widgets.js';
 import { fmtPlayerTime } from './player_util.js';
 import { lastStartingBefore } from './player_subs.js';
@@ -63,6 +63,9 @@ export function createTranscript(opts) {
   let heads = []; // chapter index -> heading element
   const folded = new Set(); // start_ms of the folded chapters
   let curChap = -1;
+  // whether the times were drawn as h:mm:ss (fmtPlayerTime: an hour of media or more)
+  const hourly = () => (Number(opts.duration()) || 0) >= 3600000;
+  let drawnHourly = false;
 
   const input = h('input', {
     type: 'search',
@@ -119,7 +122,9 @@ export function createTranscript(opts) {
         class: 'pl-row' + (isModified(s) ? ' is-mod' : '') + (pending ? ' is-pending' : ''),
         role: 'listitem',
         tabindex: i === focusIdx ? '0' : '-1',
-        dataset: { idx: String(i) },
+        // fkey: a row redrawn while its menu or a copy had it (a refresh)
+        // is found again, as other controls are (menu.js, dom.js)
+        dataset: { idx: String(i), fkey: `pl:s:${s.idx}` },
       },
       h('span', { class: 'pl-row-time' }, fmtPlayerTime(s.start_ms, opts.duration())),
       h('div', { class: 'pl-row-text' }, h('p', { class: 'pl-row-en', lang: 'en' }), h('p', { class: 'pl-row-zh', lang: zhLang() })),
@@ -130,22 +135,69 @@ export function createTranscript(opts) {
             h('span', { class: 'pl-pend-glyph', 'aria-hidden': 'true' }),
           )
         : null,
+      moreButton(i),
     );
     fillText(row, s);
     return row;
   }
 
+  // T22 G15 (round 8 WL-03): the sentence's menu ("修改原文", "重翻此句", …)
+  // from a "⋯" on the row, as the lecture page's transcript has it, not only
+  // by the right click or Shift+F10. The list is one Tab stop (roving): the
+  // button is no Tab stop of its own, and keyboard users keep Shift+F10 / the
+  // menu key on the row. A click opens the menu without playing the
+  // sentence (menuButton stops the click; the list's keys leave it alone).
+  // Shown faintly, fully on the current sentence and on hover (style.css).
+  function moreButton(i) {
+    const s = sentences[i];
+    const b = h(
+      'button',
+      { type: 'button', class: 'icon-btn s-more-btn pl-row-more', tabindex: '-1', title: t('transcript.more_tip'), 'aria-label': t('transcript.more_aria', { n: s.idx + 1 }), dataset: { fkey: `pl:more:${s.idx}` } },
+      pIcon('ellipsis', { size: 16 }),
+    );
+    return menuButton(b, () => opts.menuItems(sentences[i]));
+  }
+
   function render() {
     hideCard();
+    drawnHourly = hourly();
     clear(list);
     rows = sentences.map(renderRow);
     heads = [];
     if (!rows.length) list.append(h('p', { class: 'pl-list-empty' }, t('player.side.empty')));
     else list.append(...rows);
     tabStop = rows[focusIdx] || null;
-    if (current >= 0 && rows[current]) rows[current].classList.add('is-cur');
+    if (current >= 0 && rows[current]) markCur(rows[current], true);
     placeChapters();
     runSearch(false);
+  }
+
+  // One sentence redrawn in place (an edit came back, a refresh): the
+  // current-sentence mark, the search marks, a folded chapter, the tab stop
+  // and the keyboard focus stay.
+  function redrawRow(i, s) {
+    sentences[i] = s;
+    const old = rows[i];
+    const row = renderRow(s, i);
+    if (i === current) markCur(row, true);
+    if (hits.includes(i)) row.classList.add('is-hit');
+    if (hitPos >= 0 && hits[hitPos] === i) row.classList.add('is-hit-cur');
+    row.hidden = old.hidden; // inside a folded chapter
+    if (tabStop === old) tabStop = row;
+    row.setAttribute('tabindex', tabStop === row ? '0' : '-1');
+    if (cardFor === i) hideCard();
+    const focused = old.contains(document.activeElement);
+    old.replaceWith(row);
+    rows[i] = row;
+    if (focused) row.focus({ preventScroll: true });
+  }
+
+  // The sentence playing (T23 general 17): highlighted, and said to a
+  // screen reader (aria-current).
+  function markCur(row, on) {
+    row.classList.toggle('is-cur', on);
+    if (on) row.setAttribute('aria-current', 'true');
+    else row.removeAttribute('aria-current');
   }
 
   // ---- chapters (ext web3) ----
@@ -189,6 +241,11 @@ export function createTranscript(opts) {
       if (before) list.insertBefore(head, before);
       else list.append(head);
     }
+    // R78 low 1: sentences before the first chapter have no heading to fold
+    // them (chapters made again may start later than the folded ones did)
+    chapOf.forEach((k, i) => {
+      if (k < 0 && rows[i]) rows[i].hidden = false;
+    });
     for (let k = 0; k < chapters.length; k++) applyFold(k);
     if (tabStop && tabStop.hidden) {
       const k = chapOf[Number(tabStop.dataset.idx)];
@@ -402,6 +459,9 @@ export function createTranscript(opts) {
   });
 
   list.addEventListener('keydown', (e) => {
+    // a row's "⋯" has the focus (after its menu, or a click): Enter, Space
+    // and ↓ are the button's (its menu), not the row's playback or move
+    if (e.target.closest && e.target.closest('.pl-row-more')) return;
     const item = e.target.closest && e.target.closest('.pl-row, .pl-chap-go');
     if (!item) return;
     const head = item.classList.contains('pl-chap-go');
@@ -490,7 +550,8 @@ export function createTranscript(opts) {
   });
   card.addEventListener('mouseleave', hideCard);
   list.addEventListener('focusin', (e) => {
-    const row = e.target.closest && e.target.closest('.pl-row.is-pending');
+    // (not for its "⋯": the card would cover the menu it opens)
+    const row = e.target.closest && !e.target.closest('.pl-row-more') && e.target.closest('.pl-row.is-pending');
     if (row) showCard(Number(row.dataset.idx), row.querySelector('.pl-row-pend'));
     else hideCard();
   });
@@ -585,8 +646,35 @@ export function createTranscript(opts) {
 
   return {
     el,
-    setSentences(list) {
-      sentences = list || [];
+    setSentences(next) {
+      const fresh = next || [];
+      // P2 hotspot 2: a "changed sentences" refresh, or the one after an
+      // edit, reads every sentence again; rebuilding the whole list took
+      // 0.5–1 s at 1500 sentences (x4). The same sentences at the same
+      // times, with the rows on the page: only those that changed are
+      // redrawn (their marks, the search and the focus stay, redrawRow).
+      // Another number of sentences, or a time moved (the chapters follow
+      // the times): the whole list, as before.
+      // (R78 low 2: the times are "mm:ss", or "h:mm:ss" from an hour of
+      // media on: when that changed, the whole column is drawn again)
+      const same =
+        rows.length > 0 &&
+        rows.length === fresh.length &&
+        rows[0].parentNode === list &&
+        hourly() === drawnHourly &&
+        fresh.every((s, i) => sentences[i] && s.idx === sentences[i].idx && s.start_ms === sentences[i].start_ms);
+      if (same) {
+        let changed = false;
+        for (let i = 0; i < fresh.length; i++) {
+          if (JSON.stringify(fresh[i]) === JSON.stringify(sentences[i])) continue;
+          redrawRow(i, fresh[i]);
+          changed = true;
+        }
+        sentences = fresh;
+        if (changed && query) runSearch(false); // a changed text may match or not now
+        return;
+      }
+      sentences = fresh;
       if (current >= sentences.length) current = -1;
       if (focusIdx >= sentences.length) focusIdx = 0;
       render();
@@ -606,11 +694,14 @@ export function createTranscript(opts) {
     },
     setCurrent(i, { force = false } = {}) {
       if (i === current && !force) return;
-      if (rows[current]) rows[current].classList.remove('is-cur');
+      if (rows[current]) markCur(rows[current], false);
       const before = curTarget();
       current = i;
       const row = rows[i];
-      if (row) row.classList.add('is-cur');
+      if (row) markCur(row, true);
+      // T23 general 17: Tab into the list lands on the sentence playing,
+      // unless the keyboard is in the list already (its place stays)
+      if (row && !row.hidden && !list.contains(document.activeElement)) setTabStop(row);
       const k = i >= 0 && i < chapOf.length ? chapOf[i] : -1;
       if (k !== curChap) {
         curChap = k;
@@ -654,15 +745,17 @@ export function createTranscript(opts) {
     },
     updateSentence(s) {
       const i = sentences.findIndex((x) => x.idx === s.idx);
-      if (i < 0) return;
-      sentences[i] = s;
-      const row = renderRow(s, i);
-      if (i === current) row.classList.add('is-cur');
-      if (hits.includes(i)) row.classList.add('is-hit');
-      row.hidden = rows[i].hidden; // inside a folded chapter
-      if (tabStop === rows[i]) tabStop = row;
-      rows[i].replaceWith(row);
-      rows[i] = row;
+      if (i < 0 || !rows[i]) return;
+      if (hourly() !== drawnHourly) {
+        // the time format changed meanwhile: one format for the column
+        sentences[i] = s;
+        render();
+        return;
+      }
+      redrawRow(i, s);
+      // R78 medium 1: the edited text may match the search or not now; the
+      // refresh that follows reads the same data and redraws nothing
+      if (query) runSearch(false);
     },
     destroy() {
       clearTimeout(resumeTimer);

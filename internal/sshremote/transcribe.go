@@ -75,7 +75,7 @@ func (s *Server) Transcribe(ctx context.Context, job remote.Job, progress func(r
 		s.mu.Unlock()
 		return "", busy(remote.CodeBusy, p, "", errors.New("every slot is in use"))
 	}
-	cj := &remote.CardJob{LectureID: job.LectureID, Stage: remote.StepConnect}
+	cj := &remote.CardJob{LectureID: job.LectureID, JobID: job.ID, Stage: remote.StepConnect}
 	s.runs[job.ID] = cj
 	s.mu.Unlock()
 	s.m.changed()
@@ -109,7 +109,7 @@ func (s *Server) Transcribe(ctx context.Context, job remote.Job, progress func(r
 				// Nothing ran: back to the queue as it was (the scheduler's
 				// admission sees the server's state).
 				_, code, wf := connError(err)
-				return "", busy(code, p, wf, err)
+				return "", busy(code, connErrParams(label, err), wf, err)
 			}
 			if lostAt.IsZero() {
 				lostAt = time.Now()
@@ -276,7 +276,7 @@ wait:
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-ctl.dead:
-			return "", fmt.Errorf("%w: %v", errLost, ctl.Err())
+			return "", wrapNet(errLost, ctl.Err())
 		case ev := <-events:
 			switch ev.Type {
 			case remote.EvProgress:
@@ -345,7 +345,7 @@ func (s *Server) mapCallErr(err error, p map[string]any) error {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
-		return fmt.Errorf("%w: %v", errLost, err)
+		return wrapNet(errLost, err)
 	case remote.AgentNoSpace:
 		var f *agentFail
 		errors.As(err, &f)

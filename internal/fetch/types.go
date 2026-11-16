@@ -5,6 +5,7 @@ package fetch
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"lectureflow/internal/db"
@@ -71,6 +72,28 @@ type ImportResult struct {
 
 // ImportFunc creates the lecture of a finished download and launches it.
 type ImportFunc func(ctx context.Context, req ImportRequest) (ImportResult, error)
+
+// ImportRefused is an ImportFunc's error when the lecture import's media
+// checks refuse the downloaded file itself (internal/api upload_media.go:
+// an empty file, a web page such as a sign-in or error page, a playlist, a
+// format outside the whitelist). Code is one of the API's "upload.media_*"
+// codes and Params its params (the file name only, never a path or URL).
+// The task fails with this code instead of CodeImportFailed, so that the
+// download list shows the reason (review R10 M1). The same file would be
+// refused again: the extension sending the recording again downloads it
+// anew (Enqueue) instead of reusing the file.
+type ImportRefused struct {
+	Code   string
+	Params map[string]any
+}
+
+func (e *ImportRefused) Error() string {
+	return "the lecture import refused the downloaded file: " + e.Code
+}
+
+// RefusedFile reports a task error code of ImportRefused: the downloaded
+// file is not a recording, and a retry with the same file fails again.
+func RefusedFile(code string) bool { return strings.HasPrefix(code, "upload.media_") }
 
 // Settings keys (kv) of the download queue, read and written by
 // /api/app/settings (both modes).

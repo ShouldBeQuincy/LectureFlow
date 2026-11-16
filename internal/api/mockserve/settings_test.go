@@ -277,7 +277,10 @@ func TestSettingsASRAndGeneral(t *testing.T) {
 	bad(func(a *model.ASRSettings) { a.VRAMReserveMB = -1 }, "保留显存必须在 0 到 65536 MB 之间")
 
 	doJSON(t, "PUT", u+"general", model.GeneralSettings{KeepOriginalMedia: false, Notifications: false, DailyBudget: 12.5}, http.StatusOK, &s)
-	if s.General != (model.GeneralSettings{DailyBudget: 12.5}) {
+	// v3.2.x: the body (without the new optional fields) is merged into the
+	// current settings, so the example's llm_idle_timeout_s stays.
+	if g := s.General; g.KeepOriginalMedia || g.Notifications || g.DailyBudget != 12.5 || g.AutoChapters != nil ||
+		g.LLMIdleTimeoutS == nil || *g.LLMIdleTimeoutS != 300 {
 		t.Errorf("general = %+v", s.General)
 	}
 	wantError(t, "PUT", u+"general", model.GeneralSettings{DailyBudget: -1}, 400, "每日预算必须是不小于 0 的数（0 表示不限制）")

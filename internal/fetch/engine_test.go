@@ -114,6 +114,8 @@ func (q *Queue) hasCredsOf(id int64) bool {
 }
 
 // Not enough room for the data directory's reserve: failed, retryable.
+// Nothing downloaded yet, so no_space itself, without task_bytes (not
+// no_space_kept: removing the task would free nothing).
 func TestNoSpace(t *testing.T) {
 	e := newQEnv(t, func(o *Options) {
 		o.MinFree = 2 << 30
@@ -124,7 +126,7 @@ func TestNoSpace(t *testing.T) {
 	id := e.enqueue(e.request("s1", tr))
 	info := e.wait(id, bridge.StateFailed)
 	if info.Error == nil || info.Error.Code != CodeNoSpace || info.Error.Params["free_bytes"] != float64(1<<30) ||
-		info.Error.Params["keep_bytes"] != float64(2<<30) {
+		info.Error.Params["keep_bytes"] != float64(2<<30) || info.Error.Params["task_bytes"] != nil {
 		t.Fatalf("%+v", info.Error)
 	}
 }

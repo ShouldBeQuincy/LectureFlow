@@ -382,7 +382,7 @@ func (m *Manager) runTask(ctx context.Context, t *task) {
 		final = TaskFailed
 		i := m.withDiskFree(ErrorInfoOf(failed))
 		info = &i
-		m.log.Warn("components: task failed", "task", t.id, "code", i.Code, "error", failed)
+		m.log.Warn("components: task failed", "task", t.id, "code", i.Code, "error", redactText(failed.Error()))
 	}
 	// clean up before the final state is visible: a finished task leaves
 	// nothing behind

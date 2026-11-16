@@ -955,7 +955,7 @@ func TestGPUChecksFollowCUDADevice(t *testing.T) {
 	}
 	failCmd := func(s *Server) {
 		s.runCmd = func(ctx context.Context, name string, args ...string) (string, string, error) {
-			if len(args) > 1 && args[1] == "--selftest" {
+			if isScriptRun(args, "--selftest") {
 				return "", "RuntimeError: CUDA failed", errUnknownCmd
 			}
 			return fakeCmd(ctx, name, args...)

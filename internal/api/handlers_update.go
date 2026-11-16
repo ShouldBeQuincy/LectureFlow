@@ -10,7 +10,7 @@ package api
 // preload whitelist unchanged (v3-brief §3). Desktop mode only (404 in web
 // mode, like /api/app/shutdown); the state lives in memory.
 //
-//	POST /api/app/update/state           main process: {state, version, percent, error}
+//	POST /api/app/update/state           main process (with PathGrantHeader): {state, version, percent, error}
 //	GET  /api/app/update                 UpdateStatus (web page and main process)
 //	POST /api/app/update/download        web page: download the available update
 //	POST /api/app/update/install-on-quit web page: {"enabled": bool} (default true)
@@ -125,8 +125,18 @@ func validateUpdateReport(in UpdateStateReport) string {
 	return ""
 }
 
+// postUpdateState takes the main process's report. The page's requests
+// carry the access token too, so the report also needs the grant only the
+// main process can compute (PathGrantHeader, the one POST
+// /api/app/path-grants checks; desktop/src/main/apiclient.js sends it):
+// without it a script in the page could show "a new version is ready"
+// (AUD1 I-1, SEC44 information-1). 403 auth.token_required otherwise.
 func (s *Server) postUpdateState(w http.ResponseWriter, r *http.Request) {
 	if !s.updateDesktopOnly(w, r) {
+		return
+	}
+	if !s.desktop.pathGrantOK(r.Header.Get(PathGrantHeader)) {
+		writeError(w, http.StatusForbidden, "auth.token_required", nil)
 		return
 	}
 	var in UpdateStateReport

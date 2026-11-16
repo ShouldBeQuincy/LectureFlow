@@ -4,7 +4,9 @@
 package stages
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"os"
@@ -16,6 +18,7 @@ import (
 
 	"lectureflow/internal/colab"
 	"lectureflow/internal/model"
+	"lectureflow/internal/remote"
 	"lectureflow/internal/sched"
 )
 
@@ -205,5 +208,51 @@ func TestASRColabCancelDoesNotWaitForTheRelease(t *testing.T) {
 	r := <-done
 	if took := time.Since(start); took > 2*time.Second || !errors.Is(r.err, context.Canceled) {
 		t.Fatalf("cancel took %v, err %v", took, r.err)
+	}
+}
+
+// v3.2.x: the backend's reconnect state reaches stats.remote at once (a
+// change, not throttled), each attempt too, and the next event without one
+// clears it; the stats hold a copy of the event's value.
+func TestASRColabReconnectInStats(t *testing.T) {
+	rec := &sched.StatsRecorder{}
+	rep := &remoteReporter{ctx: sched.WithStatsSink(context.Background(), rec), acc: "T4", progress: func(float64) {}}
+	remoteOf := func() *model.RemoteStats { return rec.Snapshot().Remote }
+	tr := colab.Event{Step: colab.StepRemoteTranscribe, Stage: "transcribe", Fraction: 0.4, Overall: 0.4, ETASec: 300}
+	rep.report(tr, true)
+	if rs := remoteOf(); rs == nil || rs.Reconnect != nil {
+		t.Fatalf("before: %+v", rs)
+	}
+	next := time.Date(2026, 11, 11, 9, 0, 5, 0, time.UTC)
+	rc := &remote.Reconnect{Attempt: 1, Of: 4, NextAt: next}
+	ev := tr
+	ev.Reconnect = rc
+	rep.report(ev, false) // within remoteStatsEvery of the last write: still written
+	rs := remoteOf()
+	if rs == nil || rs.Reconnect == nil || *rs.Reconnect != *rc || rs.Step != model.RemoteStepRemoteTranscribe {
+		t.Fatalf("reconnecting: %+v", rs)
+	}
+	rc.Attempt = 9 // the backend's value changes later: the stats keep theirs
+	if remoteOf().Reconnect.Attempt != 1 {
+		t.Fatal("stats.remote.reconnect shares the event's value")
+	}
+	ev.Reconnect = &remote.Reconnect{Attempt: 2, Of: 4, NextAt: next.Add(15 * time.Second)}
+	rep.report(ev, false)
+	if rs := remoteOf(); rs.Reconnect == nil || rs.Reconnect.Attempt != 2 || !rs.Reconnect.NextAt.Equal(next.Add(15*time.Second)) {
+		t.Fatalf("second attempt: %+v", rs.Reconnect)
+	}
+	// the same state again within the interval: not written again
+	rec.Update(func(st *model.JobStats) { st.Remote.EtaSec = 7 })
+	rep.report(ev, false)
+	if remoteOf().EtaSec != 7 {
+		t.Fatal("an unchanged reconnect state was written again within remoteStatsEvery")
+	}
+	rep.report(tr, false) // the runtime answers again
+	if rs := remoteOf(); rs == nil || rs.Reconnect != nil || rs.EtaSec != 300 {
+		t.Fatalf("after the reconnect: %+v", rs)
+	}
+	b, _ := json.Marshal(remoteOf())
+	if bytes.Contains(b, []byte("reconnect")) {
+		t.Fatalf("stats.remote after the reconnect: %s", b)
 	}
 }

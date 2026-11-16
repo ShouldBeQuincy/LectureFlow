@@ -56,9 +56,45 @@ func spdxExcluded(rel string) bool {
 	return false
 }
 
-// gitTrackedFiles lists the files tracked by git (relative, slash form).
+// gitTrackedFiles lists the files that a release publishes (relative, slash
+// form): the files tracked by git (git ls-files) minus those that are
+// tracked but match an ignore rule (git ls-files -ci --exclude-standard).
+// .claude/release/make-release.sh removes exactly that second set from the
+// published tree; these are the agent and process files that the
+// development history keeps (.agent-log/, .claude/, PROGRESS.md, spikes/
+// and the like; see .gitignore), so the header checks look at the files
+// that are published and at nothing else. On a published tree, where no
+// tracked file is ignored, the set is the whole of git ls-files, as before.
+//
+// When git is missing or root is not inside a work tree, git ls-files
+// fails and so does this function; the audit exits with status 2, as it
+// did before the ignored files were left out. The same holds should the
+// second call fail: no silent fallback to a set that would skip files.
 func gitTrackedFiles(root string) ([]string, error) {
-	cmd := exec.Command("git", "ls-files", "-z")
+	tracked, err := gitLsFiles(root)
+	if err != nil {
+		return nil, err
+	}
+	ignored, err := gitLsFiles(root, "-ci", "--exclude-standard")
+	if err != nil {
+		return nil, err
+	}
+	skip := make(map[string]bool, len(ignored))
+	for _, f := range ignored {
+		skip[f] = true
+	}
+	var files []string
+	for _, f := range tracked {
+		if !skip[f] {
+			files = append(files, f)
+		}
+	}
+	return files, nil
+}
+
+// gitLsFiles runs git ls-files -z with the extra arguments in root.
+func gitLsFiles(root string, args ...string) ([]string, error) {
+	cmd := exec.Command("git", append([]string{"ls-files", "-z"}, args...)...)
 	cmd.Dir = root
 	out, err := cmd.Output()
 	if err != nil {

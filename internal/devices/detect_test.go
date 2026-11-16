@@ -35,7 +35,8 @@ func init() {
 	if mode == "" {
 		return
 	}
-	if len(os.Args) < 3 || os.Args[2] != "--probe" {
+	// python -s asr_openvino.py --probe (pyenv.ScriptArgs)
+	if len(os.Args) != 4 || os.Args[1] != "-s" || filepath.Base(os.Args[2]) != "asr_openvino.py" || os.Args[3] != "--probe" {
 		fmt.Fprintln(os.Stderr, "ERROR: fake probe: unexpected arguments", os.Args[1:])
 		os.Exit(7)
 	}
@@ -61,6 +62,26 @@ func init() {
 	case "env": // pyenv_test.go: the probe's environment goes to the file of fakeProbeEnvOut
 		b, _ := json.Marshal(os.Environ())
 		if os.WriteFile(os.Getenv(fakeProbeEnvOut), b, 0o644) != nil {
+			os.Exit(8)
+		}
+		fmt.Println("PROBE " + fakeProbeJSON)
+		os.Exit(0)
+	case "argsenv": // probe_isolation_test.go: the arguments and the environment
+		b, _ := json.Marshal(map[string][]string{"args": os.Args[1:], "env": os.Environ()})
+		if os.WriteFile(os.Getenv(fakeProbeEnvOut), b, 0o644) != nil {
+			os.Exit(8)
+		}
+		fmt.Println("PROBE " + fakeProbeJSON)
+		os.Exit(0)
+	case "cwd": // r9_probe_dir_test.go: the working directory
+		// as a real interpreter: the script is opened from this process's
+		// own working directory (SEC52 L-3: a relative path would fail here)
+		if fi, err := os.Stat(os.Args[2]); err != nil || fi.IsDir() {
+			fmt.Fprintln(os.Stderr, "ERROR: fake probe: cannot open the script", os.Args[2])
+			os.Exit(6)
+		}
+		wd, err := os.Getwd()
+		if err != nil || os.WriteFile(os.Getenv(fakeProbeEnvOut), []byte(wd), 0o644) != nil {
 			os.Exit(8)
 		}
 		fmt.Println("PROBE " + fakeProbeJSON)

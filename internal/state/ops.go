@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"lectureflow/internal/db"
@@ -261,6 +262,14 @@ func rerun(ctx context.Context, st db.Store, dataDir, scope, scopeID, stage stri
 		return err
 	}
 	if scope == model.ScopeLecture {
+		// The ids come from the database (an imported library supplies
+		// them): only a lecture directory of its own, with no link on its
+		// way, is cleaned (LectureFilesOK; R77b, SEC44 low-2, SEC49 L1). The
+		// rows are rerun anyway.
+		if !LectureFilesOK(dataDir, lec) {
+			slog.Warn("rerun: the lecture's directory is not one of its own (its ids, or a link on the way); no file removed")
+			return nil
+		}
 		dir := model.LectureDir(dataDir, lec.CourseID, lec.ID)
 		if stage == model.StagePrep {
 			if err := os.Remove(filepath.Join(dir, model.AudioFile)); err != nil && !os.IsNotExist(err) {
@@ -350,7 +359,10 @@ func StartIncrementalTranslate(ctx context.Context, st db.Store, lectureID strin
 		if tr.InputHash != nil && *tr.InputHash != "" {
 			note += ":" + *tr.InputHash
 		}
-		if err := newPending(ctx, tx, model.ScopeLecture, lectureID, model.StageTranslate, &tr, snapshotOf(&tr), model.JobStats{Note: note}); err != nil {
+		// The translations are kept, so are the models they come from
+		// (stats.mixed_models, v3.2.x P1-b).
+		stats := model.JobStats{Note: note, MixedModels: slices.Clone(tr.Stats.MixedModels)}
+		if err := newPending(ctx, tx, model.ScopeLecture, lectureID, model.StageTranslate, &tr, snapshotOf(&tr), stats); err != nil {
 			return err
 		}
 		if err := newPending(ctx, tx, model.ScopeLecture, lectureID, model.StageExport, exp, snapshotOf(exp), model.JobStats{}); err != nil {

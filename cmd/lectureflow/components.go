@@ -82,34 +82,46 @@ func componentCheck(req components.SelfTestRequest, cuda bool) stages.ComponentC
 	return c
 }
 
-// componentPythons is the set of backend interpreters the device detection
-// depends on: a change (an ASR environment installed, updated or removed)
-// calls for a new detection.
-func componentPythons(m *components.Manager) [3]string {
-	var out [3]string
-	for i, b := range []string{model.BackendFasterWhisper, model.BackendOpenVINO, model.BackendMLX} {
-		out[i], _ = m.Python(b)
+// detectionInputs is what the device detection depends on: the backend
+// interpreters (an ASR environment installed, updated or removed) and the
+// installed models (next-33: after the detection, the CPU device of a
+// computer without an accelerator gets an installed model, which the
+// recommended install puts in after the environment; devices
+// cpu_fallback.go). A change calls for a new detection.
+func detectionInputs(m *components.Manager) string {
+	var b strings.Builder
+	for _, backend := range []string{model.BackendFasterWhisper, model.BackendOpenVINO, model.BackendMLX} {
+		py, _ := m.Python(backend)
+		b.WriteString(py)
+		b.WriteByte(0)
 	}
-	return out
+	for _, s := range m.List() {
+		if s.Kind == components.KindModel && s.Installed && !s.Broken {
+			b.WriteString(s.ID + "@" + s.InstalledVersion)
+			b.WriteByte(0)
+		}
+	}
+	return b.String()
 }
 
 // subscribeRedetect asks for a device detection (non-blocking send on
 // redetect) whenever an event of m changed the installed backend
-// environments, so a newly installed backend appears in the device table
-// (and a removed one disappears) without a restart. The callback runs on
-// the manager's event goroutine, in order, so last needs no lock.
+// environments or models, so a newly installed backend appears in the
+// device table (and a removed one disappears) without a restart. The
+// callback runs on the manager's event goroutine, in order, so last needs
+// no lock.
 func subscribeRedetect(m *components.Manager, redetect chan<- struct{}) (cancel func()) {
-	last := componentPythons(m)
+	last := detectionInputs(m)
 	return m.Subscribe(func(e components.Event) {
 		if e.Type != components.EventComponents {
 			return
 		}
-		cur := componentPythons(m)
+		cur := detectionInputs(m)
 		if cur == last {
 			return
 		}
 		last = cur
-		slog.Info("components: backend environments changed; detecting the transcription devices again")
+		slog.Info("components: backend environments or models changed; detecting the transcription devices again")
 		select {
 		case redetect <- struct{}{}:
 		default: // one detection is already pending

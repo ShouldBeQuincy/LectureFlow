@@ -46,24 +46,34 @@ func SetFallbackKeys(keys ...[]byte) error {
 	return nil
 }
 
-// openWith decrypts sealed (IsSealed) with g.
+// openWith decrypts sealed (a Seal value: Prefix) with g.
 func openWith(g cipher.AEAD, sealed string) ([]byte, error) {
-	raw, err := base64.RawStdEncoding.DecodeString(sealed[len(Prefix):])
+	return openAAD(g, sealed[len(Prefix):], []byte(Prefix))
+}
+
+// openAAD decrypts body (base64 of nonce ‖ ciphertext, the part after the
+// prefix) with g and the additional data aad.
+func openAAD(g cipher.AEAD, body string, aad []byte) ([]byte, error) {
+	raw, err := base64.RawStdEncoding.DecodeString(body)
 	if err != nil || len(raw) < g.NonceSize()+g.Overhead() {
 		return nil, ErrUndecryptable
 	}
-	plain, err := g.Open(nil, raw[:g.NonceSize()], raw[g.NonceSize():], []byte(Prefix))
+	plain, err := g.Open(nil, raw[:g.NonceSize()], raw[g.NonceSize():], aad)
 	if err != nil {
 		return nil, ErrUndecryptable
 	}
 	return plain, nil
 }
 
-// OpenAny decrypts a sealed value with the data key or, failing that, with
-// a fallback key (SetFallbackKeys). current is false when only a fallback
+// OpenAny decrypts a Seal value with the data key or, failing that, with
+// a fallback key (SetFallbackKeys); a SealFor value is refused (errBound,
+// see OpenAnyFor). current is false when only a fallback
 // key opened it: the caller seals it again. ErrNoKey without a data key;
 // ErrUndecryptable when no key opens it.
 func OpenAny(sealed string) (plain []byte, current bool, err error) {
+	if IsBound(sealed) {
+		return nil, false, errBound
+	}
 	if !IsSealed(sealed) {
 		return nil, false, errors.New("secrets: not a sealed value")
 	}
@@ -84,10 +94,13 @@ func OpenAny(sealed string) (plain []byte, current bool, err error) {
 	return nil, false, ErrUndecryptable
 }
 
-// OpenWith decrypts a sealed value with key instead of the process's data
-// key (the import of another data directory: its values are sealed again
+// OpenWith decrypts a Seal value with key instead of the process's data
+// key (a SealFor value: OpenWithFor) (the import of another data directory: its values are sealed again
 // with this installation's key).
 func OpenWith(key []byte, sealed string) ([]byte, error) {
+	if IsBound(sealed) {
+		return nil, errBound
+	}
 	if !IsSealed(sealed) {
 		return nil, errors.New("secrets: not a sealed value")
 	}

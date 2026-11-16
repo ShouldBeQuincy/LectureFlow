@@ -49,6 +49,8 @@ func connError(err error) (state, code, waitingFor string) {
 		return StateAuth, remote.CodeAuthFailed, model.WaitRemoteAuth
 	case errors.Is(err, remote.ErrContract):
 		return StateError, remote.CodeProtocol, model.WaitRemoteOffline
+	case errors.Is(err, errAgentMissing): // before errAgent: a missing build is wrapped in it
+		return StateError, remote.CodeAgentMissing, model.WaitRemoteSetup
 	case errors.Is(err, errAgent):
 		return StateError, remote.CodeAgentFailed, model.WaitRemoteSetup
 	}
@@ -58,6 +60,10 @@ func connError(err error) (state, code, waitingFor string) {
 var (
 	errSetup = errors.New("the server's environment is not installed")
 	errAgent = errors.New("lf-agent could not be installed or started")
+	// errAgentMissing: this installation has no lf-agent build for the
+	// server's platform (the installers leave lf-agent out while the SSH
+	// servers are experimental; desktop/scripts/stage.js).
+	errAgentMissing = errors.New("this installation carries no lf-agent build")
 )
 
 // agentRunError maps a run's error event to the lecture's error.

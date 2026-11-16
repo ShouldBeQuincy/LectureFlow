@@ -51,8 +51,10 @@ type Download struct {
 	Error            *model.ErrorInfo `json:"error"`
 	OverrideDisabled bool             `json:"override_disabled"`
 	Tracks           []DownloadTrack  `json:"tracks"`
-	// AllowedActions: cancel (not ended, not importing), retry (failed),
-	// remove (done, failed, cancelled).
+	// AllowedActions: cancel (not ended, not importing), retry (failed,
+	// when a retry can fix it: fetch.Retryable), remove (done, failed,
+	// cancelled). A retry not offered answers 409 with the task's own
+	// error code and params.
 	AllowedActions []string `json:"allowed_actions"`
 	CreatedAt      string   `json:"created_at"`
 	UpdatedAt      string   `json:"updated_at"`

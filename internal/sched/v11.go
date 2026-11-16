@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"lectureflow/internal/db"
+	"lectureflow/internal/media"
 	"lectureflow/internal/model"
 	"lectureflow/internal/settings"
 	"lectureflow/internal/state"
@@ -82,6 +83,9 @@ func checkChoice(choice string) error {
 	switch choice {
 	case "", model.ModelChoiceSnapshot, model.ModelChoiceCurrent:
 		return nil
+	case model.ModelChoiceManual:
+		// v3.2.x P1-b: only a retry takes it, with its target (RetryManual).
+		return fmt.Errorf("%w: model_choice %q needs a model and is only for the retry of summary, repair or translate", state.ErrBadInput, choice)
 	}
 	return fmt.Errorf("%w: unknown model_choice %q", state.ErrBadInput, choice)
 }
@@ -223,7 +227,7 @@ func (s *Scheduler) currentSnapshots(stages []string, deferred bool) (map[string
 		}
 		switch st {
 		case model.StageSummary, model.StageRepair, model.StageTranslate:
-			t, rerr := s.set.RoleTarget(model.RoleOfStage(st))
+			t, rerr := s.set.SnapshotTarget(model.RoleOfStage(st)) // translate: the provider's default batch
 			if rerr != nil {
 				return nil, rerr
 			}
@@ -305,6 +309,29 @@ func snapshotUnusable(bad []state.ModelDiff) error {
 	return fmt.Errorf("%w（%s）", state.ErrSnapshotUnusable, strings.Join(parts, "；"))
 }
 
+// currentUnusable checks "使用当前设置" before any snapshot is replaced
+// (v3.2.x P1-b): the current setting of every LLM stage of stages must be
+// usable (settings.SnapshotUsableInfo: its provider exists and has a key —
+// the check a model named by hand gets too). The first one that is not is
+// returned as a coded error with that reason's code (snapshot.unusable.*)
+// wrapping state.ErrSnapshotUnusable (a conflict); nil when all are
+// usable. stages excludes the LLM stages of a "只转写" lecture (their
+// settings are taken when they start); asr and the other stages are not
+// checked here.
+func (s *Scheduler) currentUnusable(stages []string, cur map[string]string) error {
+	for _, st := range stages {
+		if !isLectureLLMStage(st) {
+			continue
+		}
+		if ok, reason := s.set.SnapshotUsableInfo(st, cur[st]); !ok && reason != nil {
+			info := *reason
+			return &model.CodedError{Info: info,
+				Err: fmt.Errorf("%w（%s：%s）", state.ErrSnapshotUnusable, model.StageLabel(st), info.Detail)}
+		}
+	}
+	return nil
+}
+
 func findJob(jobs []model.Job, stage string) *model.Job {
 	for i := range jobs {
 		if jobs[i].Stage == stage {
@@ -348,6 +375,9 @@ func (s *Scheduler) rerunSnapshots(lectureID string, jobs []model.Job, stage, ch
 	case model.ModelChoiceCurrent:
 		if curErr != nil {
 			return nil, curErr
+		}
+		if err := s.currentUnusable(stages, cur); err != nil {
+			return nil, err
 		}
 		return cur, nil
 	case model.ModelChoiceSnapshot:
@@ -435,17 +465,85 @@ func (s *Scheduler) Rerun(ctx context.Context, scope, scopeID, stage, choice str
 	return nil
 }
 
-// Retry is the user retry with the lead extension of A4.3 (NOTES.md):
-// choice "" → when the retried job's snapshot (or a downstream pending
-// job's) is unusable, *state.NeedsModelChoiceError listing those stages
-// (SnapshotUsable=false); otherwise state.RetryWith(nil).
+// Retry is the user retry with the lead extension of A4.3 (NOTES.md) and
+// the v3.2.x P1-b rule (Q9a):
+// choice "" → *state.NeedsModelChoiceError when the retried job's snapshot
+// (or a downstream pending job's) is unusable (those stages are listed with
+// SnapshotUsable=false), or — retry of summary, repair or translate only —
+// when the snapshot of the retried stage or of a pending downstream stage
+// differs from the current settings (retryDiffs); otherwise
+// state.RetryWith(nil). The retry of any other stage (asr, prep, export)
+// never asks because of a difference.
 // ModelChoiceCurrent → RetryWith(current settings for stage and downstream).
 // ModelChoiceSnapshot → RetryWith(nil), or ErrSnapshotUnusable when unusable.
+// ModelChoiceManual is RetryManual's (ErrBadInput here: it needs a target).
 // DoAction(retry) == Retry(..., "").
 func (s *Scheduler) Retry(ctx context.Context, scope, scopeID, stage, choice string) error {
 	if err := checkChoice(choice); err != nil {
 		return err
 	}
+	return s.retry(ctx, scope, scopeID, stage, choice, nil)
+}
+
+// RetryManual is the retry with model choice manual (v3.2.x P1-b): the
+// failed or cancelled job of stage (summary, repair or translate of a
+// lecture) is retried with the model the user names for this one retry.
+// Only that job's snapshot is replaced (Source manual; a translate job
+// keeps its context window and batch size); downstream jobs keep theirs
+// and the role's setting is not written. The target is validated like the
+// settings page does (settings.ManualSnapshot; errors.Is settings.ErrInvalid).
+// As with ModelChoiceCurrent, replacing the translate snapshot clears the
+// lecture's translations: the whole lecture is translated by the new model.
+// Any other stage or scope → state.ErrBadInput.
+func (s *Scheduler) RetryManual(ctx context.Context, scope, scopeID, stage string, target settings.ManualTarget) error {
+	if scope != model.ScopeLecture || !isLectureLLMStage(stage) {
+		return fmt.Errorf("%w: a model can only be named for the retry of summary, repair or translate", state.ErrBadInput)
+	}
+	return s.retry(ctx, scope, scopeID, stage, model.ModelChoiceManual, &target)
+}
+
+// retryDiffs lists what a retry without a choice has to ask about, in
+// pipeline order: every stage of check whose snapshot is unusable, and —
+// when the retried stage is an LLM stage and cur is known — every LLM stage
+// of check whose snapshot differs from the current settings. The prompt
+// version is not part of that comparison: a retry always runs the current
+// prompts (state.RetryWith, state.RecordPromptVersion), whatever is chosen.
+func (s *Scheduler) retryDiffs(lectureID string, jobs []model.Job, stage string, check []string, cur map[string]string) (diffs []state.ModelDiff, unusable bool) {
+	compare := isLectureLLMStage(stage) && cur != nil
+	for _, st := range check {
+		j := findJob(jobs, st)
+		if j == nil {
+			continue
+		}
+		ok, reason := s.usable(st, j.ConfigSnapshot)
+		differs := compare && isLectureLLMStage(st) && !sameModel(st, j.ConfigSnapshot, cur[st])
+		if ok && !differs {
+			continue
+		}
+		d := state.ModelDiff{LectureID: lectureID, Stage: st, Snapshot: j.ConfigSnapshot, Current: cur[st],
+			SnapshotUsable: ok, ReasonInfo: reason}
+		if reason != nil {
+			d.Reason = reason.Detail
+		}
+		unusable = unusable || !ok
+		diffs = append(diffs, d)
+	}
+	return diffs, unusable
+}
+
+// sameModel is model.SameSnapshot for two LLM snapshots of stage without
+// the prompt version: provider, model and params only.
+func sameModel(stage, a, b string) bool {
+	sa, okA := model.ParseLLMSnapshot(a)
+	sb, okB := model.ParseLLMSnapshot(b)
+	if !okA || !okB {
+		return model.SameSnapshot(stage, a, b)
+	}
+	sa.PromptVersion, sb.PromptVersion = 0, 0
+	return model.SameSnapshot(stage, model.MarshalSnapshot(sa), model.MarshalSnapshot(sb))
+}
+
+func (s *Scheduler) retry(ctx context.Context, scope, scopeID, stage, choice string, manual *settings.ManualTarget) error {
 	var newSnaps map[string]string
 	// An auxiliary task (v2) has no snapshot: its retry asks nothing.
 	if scope == model.ScopeLecture && model.ScopeOfStage(stage) == scope && !model.IsAuxStage(stage) {
@@ -478,11 +576,16 @@ func (s *Scheduler) Retry(ctx context.Context, scope, scopeID, stage, choice str
 		cur, curErr := s.currentSnapshots(withDownstream(stage), deferred)
 		switch choice {
 		case "":
-			if bad := s.unusable(scopeID, jobs, check, cur); len(bad) > 0 {
-				if curErr != nil {
+			var known map[string]string
+			if curErr == nil {
+				known = cur
+			}
+			if ds, bad := s.retryDiffs(scopeID, jobs, stage, check, known); len(ds) > 0 {
+				if bad && curErr != nil {
 					return curErr // neither choice could work: the settings must be fixed
 				}
-				return &state.NeedsModelChoiceError{Diffs: bad}
+				slog.Info("retry asks for the model choice", "lecture", scopeID, "stage", stage, "stages", len(ds), "unusable", bad)
+				return &state.NeedsModelChoiceError{Diffs: ds}
 			}
 		case model.ModelChoiceSnapshot:
 			if bad := s.unusable(scopeID, jobs, check, cur); len(bad) > 0 {
@@ -495,8 +598,24 @@ func (s *Scheduler) Retry(ctx context.Context, scope, scopeID, stage, choice str
 			if curErr != nil {
 				return curErr
 			}
+			// only the snapshots RetryWith replaces: the retried job's and
+			// the pending downstream jobs' (check)
+			if err := s.currentUnusable(check, cur); err != nil {
+				return err
+			}
 			newSnaps = cur
+		case model.ModelChoiceManual:
+			if manual == nil {
+				return fmt.Errorf("%w: model_choice manual needs a model", state.ErrBadInput)
+			}
+			snap, err := s.set.ManualSnapshot(stage, *manual, self.ConfigSnapshot)
+			if err != nil {
+				return err
+			}
+			newSnaps = map[string]string{stage: model.MarshalSnapshot(snap)}
 		}
+	} else if choice == model.ModelChoiceManual {
+		return fmt.Errorf("%w: %s has no model to choose", state.ErrBadInput, stage)
 	}
 	// Power management (backend Gate round 1, fix 4): a new asr snapshot
 	// may drop the lecture's checkpoint file; the scan lock keeps the job
@@ -512,12 +631,76 @@ func (s *Scheduler) Retry(ctx context.Context, scope, scopeID, stage, choice str
 	if err != nil {
 		return err
 	}
+	if choice != "" {
+		// No key and no lecture content: ids and the model name only.
+		attrs := []any{"scope_id", scopeID, "stage", stage, "choice", choice}
+		if snap, ok := model.ParseLLMSnapshot(newSnaps[stage]); ok && choice == model.ModelChoiceManual {
+			attrs = append(attrs, "provider", snap.ProviderID, "model", snap.Model)
+		}
+		slog.Info("retry with a model choice", attrs...)
+	}
 	if _, ok := newSnaps[model.StageTranslate]; ok {
 		s.ev.Changed("sentences", scopeID) // RetryWith cleared the translations
 	}
 	s.emitScope(ctx, scope, scopeID)
 	s.Kick()
 	return nil
+}
+
+// RetranslateSentence is the sentence operation "重新翻译这句" through the
+// scheduler (v3.2.x P1-b, Q10a). useCurrent false: state.RetranslateSentence.
+// useCurrent true: the sentence (one the model left without a usable
+// translation) is sent to the model of the translate role's CURRENT
+// setting; the lecture's translate job takes that snapshot without its
+// other translations being cleared (state.RetranslateSentenceWith), so the
+// incremental run — and the later ones — use it. mixed reports whether the
+// job's model changed that way. The debounced incremental translate is
+// requested in both cases. Errors: settings.ErrRoleNotConfigured (also when
+// the current setting cannot be used: no key, an unreadable key — coded
+// snapshot.unusable.*; nothing is changed), state.ErrBusy,
+// state.ErrConflict, db.ErrNotFound.
+func (s *Scheduler) RetranslateSentence(ctx context.Context, lectureID string, idx int, useCurrent bool) (sent model.Sentence, mixed bool, err error) {
+	var o state.RetranslateOpts
+	if useCurrent {
+		t, err := s.set.SnapshotTarget(model.RoleTranslate) // the lecture's snapshot, if it changes (mixTranslateSnapshot)
+		if err != nil {
+			return model.Sentence{}, false, err
+		}
+		t.PromptVersion = model.PromptVersionOf(model.StageTranslate)
+		o.Snapshot = model.MarshalSnapshot(t)
+		// The setting must be usable before the lecture's snapshot is
+		// switched to it (R2 issue 6): a provider without a key (not a local
+		// server) or with a key that cannot be read here would only leave
+		// the lecture on a model that fails.
+		if ok, reason := s.set.SnapshotUsableInfo(model.StageTranslate, o.Snapshot); !ok {
+			return model.Sentence{}, false, currentUnusable(reason)
+		}
+	}
+	sent, mixed, err = state.RetranslateSentenceWith(ctx, s.st, lectureID, idx, o)
+	if err != nil {
+		return model.Sentence{}, false, err
+	}
+	if mixed {
+		slog.Info("translate model switched for the sentences still to translate; the other translations are kept",
+			"lecture", lectureID, "sentence", idx)
+		s.emitCurrent(ctx, model.ScopeLecture, lectureID, model.StageTranslate)
+	}
+	s.RequestIncrementalTranslate(lectureID)
+	return sent, mixed, nil
+}
+
+// currentUnusable is the error for a role's current setting that cannot be
+// used (settings.SnapshotUsableInfo's reason): coded with that reason's code
+// and params (snapshot.unusable.*, as RetryManual reports them), and
+// errors.Is settings.ErrRoleNotConfigured (409: the settings must be fixed).
+func currentUnusable(reason *model.ErrorInfo) error {
+	info := model.ErrorInfo{Code: settings.CodeSnapshotInvalid}
+	detail := "当前设置不可用"
+	if reason != nil {
+		info = model.ErrorInfo{Code: reason.Code, Params: reason.Params}
+		detail = reason.Detail
+	}
+	return &model.CodedError{Info: info, Err: fmt.Errorf("%w: %s", settings.ErrRoleNotConfigured, detail)}
 }
 
 // UpdateResult is the per-lecture result of UpdateLectures.
@@ -690,8 +873,13 @@ func (s *Scheduler) DeleteLecture(ctx context.Context, lectureID string, force b
 	// directory as one whose lecture was deleted, which a later try (and
 	// the next start: state.SweepLectureDirs) may remove.
 	ldir := model.LectureDir(s.dataDir, l.CourseID, l.ID)
+	// AUD1 M-1, R77 mid-1: the ids come from the database (an imported
+	// library supplies them). Only the lecture's own directory is marked and
+	// removed: both ids single path elements, and the directory its parent's
+	// entry of exactly that name (not "own" for the lecture "OWN").
+	ownLecture := recordDirOwn(s.dataDir, ldir, l.CourseID, l.ID)
 	tombstoned := false
-	if s.dataDir != "" {
+	if s.dataDir != "" && ownLecture {
 		switch err := state.WriteTombstone(ldir, l.ID, s.now()); {
 		case err == nil:
 			tombstoned = true
@@ -721,9 +909,17 @@ func (s *Scheduler) DeleteLecture(ctx context.Context, lectureID string, force b
 	s.mu.Unlock()
 	// Only directories inside data_dir; the original media's own location
 	// (media_path may point anywhere) is never touched.
-	s.removeDir(ldir, l.ID, tombstoned)
+	if ownLecture {
+		s.removeDir(ldir, l.ID, tombstoned)
+	} else {
+		slog.Warn("lecture deleted; its directory is not removed (not the lecture's own place)", "lecture", l.ID, "path", ldir)
+	}
 	for _, m := range bound {
-		s.removeInDataDir(model.MaterialDir(s.dataDir, m.CourseID, m.ID))
+		if mdir := model.MaterialDir(s.dataDir, m.CourseID, m.ID); recordDirOwn(s.dataDir, mdir, m.CourseID, m.ID) {
+			s.removeInDataDir(mdir)
+		} else {
+			slog.Warn("lecture deleted; a bound material's directory is not removed (not its own place)", "material", m.ID, "path", mdir)
+		}
 	}
 	slog.Info("lecture deleted", "lecture", l.ID, "force", force, "cancelled_running", len(running))
 	s.ev.Changed("course", l.CourseID)
@@ -788,6 +984,23 @@ func (s *Scheduler) stopRuns(ctx context.Context, jobs []model.Job) error {
 		}
 	}
 	return nil
+}
+
+// recordDirOwn reports whether dir, a record directory built from ids
+// under the data directory root, may be marked and removed for that record
+// (media.IDElement, media.OwnDirIn): every id a single path element, and
+// dir — when anything is there — an ordinary directory, its parent's entry
+// of exactly that name, with no link on the way down from root (SEC49 L1).
+// Nothing there: true (there is nothing to remove, and nothing of another
+// record either).
+func recordDirOwn(root, dir string, ids ...string) bool {
+	for _, id := range ids {
+		if !media.IDElement(id) {
+			return false
+		}
+	}
+	own, exists := media.OwnDirIn(root, dir)
+	return own || !exists
 }
 
 // removeInDataDir removes p only when it lies strictly inside data_dir.

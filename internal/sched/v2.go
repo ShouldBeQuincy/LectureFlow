@@ -93,19 +93,15 @@ func (s *Scheduler) finishReview(r *run, runErr error, took time.Duration) strin
 // holds the scan lock, or calls it at Start before any scan. ran reports
 // whether a fallback ran, changed whether it changed terms.
 func (s *Scheduler) fallbackAfterReview(ctx context.Context, j model.Job) (ran, changed bool) {
-	if j.Stage != model.StageGlossaryReview || !j.IsCurrent ||
-		(j.Status != model.StatusFailed && j.Status != model.StatusCancelled) {
-		return false, false
-	}
-	key, stamp := kvReviewFallbackPrefix+j.ScopeID, reviewStamp(j)
-	v, ok, err := s.st.GetKV(ctx, key)
+	due, err := s.reviewFallbackDue(ctx, j)
 	if err != nil {
 		slog.Error("glossary fallback after the review", "course", j.ScopeID, "err", err)
 		return false, false
 	}
-	if ok && v == stamp {
+	if !due {
 		return false, false
 	}
+	key, stamp := kvReviewFallbackPrefix+j.ScopeID, reviewStamp(j)
 	if !s.fellBackSinceStart(ctx, j) {
 		rep, ch, err := glossary.RunFallbackNote(ctx, s.st, j.ScopeID, s.now(), reviewFallbackNote(j.Status), reviewFallbackInfo(j.Status))
 		if err != nil {
@@ -120,6 +116,24 @@ func (s *Scheduler) fallbackAfterReview(ctx context.Context, j model.Job) (ran, 
 		slog.Warn("glossary fallback marker", "course", j.ScopeID, "err", err)
 	}
 	return ran, changed
+}
+
+// reviewFallbackDue reports whether j is a course's current glossary_review
+// that ended failed or cancelled and has no fallback for that end yet (its
+// marker under kvReviewFallbackPrefix is not reviewStamp(j)): the end
+// fallbackAfterReview handles (it then still skips the fallback itself
+// when fellBackSinceStart). fallbackMayRun asks the same at Start, so the
+// two cannot drift apart.
+func (s *Scheduler) reviewFallbackDue(ctx context.Context, j model.Job) (bool, error) {
+	if j.Stage != model.StageGlossaryReview || !j.IsCurrent ||
+		(j.Status != model.StatusFailed && j.Status != model.StatusCancelled) {
+		return false, nil
+	}
+	v, ok, err := s.st.GetKV(ctx, kvReviewFallbackPrefix+j.ScopeID)
+	if err != nil {
+		return false, err
+	}
+	return !ok || v != reviewStamp(j), nil
 }
 
 // fellBackSinceStart: the course's last janitor run (glossary.LastRun, also

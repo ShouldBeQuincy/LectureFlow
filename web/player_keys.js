@@ -26,6 +26,9 @@ export function shortcutRows(opts = {}) {
     [['F'], 'player.help.fullscreen'],
     opts.angles ? [['V'], 'player.angle.help'] : null,
     [['Y'], 'player.help.cite'],
+    // T22 G15: the sentence menu (edit the English, translate again) has no
+    // button on the transcript's rows; this list names it
+    [['Shift+F10'], 'player.help.sentence_menu'],
     [['/'], 'player.help.search'],
     [['?'], 'player.help.help'],
   ].filter(Boolean);

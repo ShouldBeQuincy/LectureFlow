@@ -187,16 +187,40 @@ func TestAnthropicMaxTokensPerRole(t *testing.T) {
 		}
 	}
 
+	// The table above is what an older Claude model gets; a current one
+	// (anthropicFixtureModel: adaptive thinking) gets the bases of v3.2.x D1
+	// (maxtokens.go, BaseMaxTokens).
+	current := map[string]int{
+		model.RoleSyllabusFormat:  16000,
+		model.RoleGlossary:        8000,
+		model.RoleGlossaryJanitor: 16000,
+		model.RoleSummary:         4000,
+		model.RoleRepair:          6000,
+		model.RoleTranslate:       2000,
+		model.RoleChapters:        4000,
+		model.RoleOrganizer:       4000,
+	}
 	srv, got := captureServer(t, func(n int, w http.ResponseWriter) { io.WriteString(w, anthropicOK(`{"ok": true}`)) })
-	c, _, _, _, _, _ := anthropicClient(t, srv.URL)
+	c, set, p, _, _, _ := anthropicClient(t, srv.URL)
 	for _, role := range model.Roles {
 		if _, err := c.Complete(context.Background(), role, "SYS", "USR", true); err != nil {
 			t.Fatalf("%s: %v", role, err)
 		}
 	}
 	for i, role := range model.Roles {
-		if mt := got()[i].body["max_tokens"]; mt != float64(want[role]) {
-			t.Errorf("%s: max_tokens %v, want %d", role, mt, want[role])
+		if mt := got()[i].body["max_tokens"]; mt != float64(current[role]) || current[role] != BaseMaxTokens(role, 0) {
+			t.Errorf("%s: max_tokens %v, want %d", role, mt, current[role])
+		}
+	}
+	for _, role := range model.Roles {
+		setRole(t, set, role, p.ID, "claude-haiku-4-5", model.RoleParams{})
+		if _, err := c.Complete(context.Background(), role, "SYS", "USR", true); err != nil {
+			t.Fatalf("%s: %v", role, err)
+		}
+	}
+	for i, role := range model.Roles {
+		if mt := got()[len(model.Roles)+i].body["max_tokens"]; mt != float64(want[role]) {
+			t.Errorf("older model, %s: max_tokens %v, want %d", role, mt, want[role])
 		}
 	}
 
@@ -205,7 +229,7 @@ func TestAnthropicMaxTokensPerRole(t *testing.T) {
 	if _, err := c.Complete(context.Background(), model.RoleGlossaryJanitor, "SYS", "USR", true); err != nil {
 		t.Fatal(err)
 	}
-	if mt := got()[len(model.Roles)].body["max_tokens"]; mt != float64(123) {
+	if mt := got()[2*len(model.Roles)].body["max_tokens"]; mt != float64(123) {
 		t.Errorf("override: max_tokens %v", mt)
 	}
 }
@@ -225,7 +249,7 @@ func TestAnthropicTruncationRetriedWithDoubledLimit(t *testing.T) {
 		role        string
 		first, then float64
 	}{
-		{model.RoleRepair, 4000, 8000},
+		{model.RoleRepair, 6000, 12000}, // v3.2.x D1: anthropicFixtureModel is a current Claude model
 		{model.RoleGlossaryJanitor, 16000, 32000},
 	} {
 		srv, got := captureServer(t, func(n int, w http.ResponseWriter) {
@@ -286,18 +310,22 @@ func TestAnthropicTruncatedTwiceFails(t *testing.T) {
 	if !errors.Is(err, ErrTruncated) || !sched.IsPermanent(err) {
 		t.Errorf("error %v: want ErrTruncated wrapped permanent", err)
 	}
-	if !isCode(err, CodeTruncated, "role", model.RoleTranslate, "max_tokens", 8000, "model", "claude-test-model", "provider", "Claude") ||
-		!strings.Contains(infoOf(err).Detail, "4000") {
+	// v3.2.x D1: translate on a current Claude model starts at 2000; P1-c:
+	// two truncation retries, each doubling (the answer has text).
+	if !isCode(err, CodeTruncated, "role", model.RoleTranslate, "max_tokens", 8000, "model", anthropicFixtureModel, "provider", "Claude",
+		"tried", "off/2000, off/4000, off/8000") ||
+		!strings.Contains(infoOf(err).Detail, "从 2000 翻倍到 8000") {
 		t.Errorf("error %v: %+v", err, infoOf(err))
 	}
 	caps := got()
-	if len(caps) != 2 || caps[0].body["max_tokens"] != float64(4000) || caps[1].body["max_tokens"] != float64(8000) {
+	if len(caps) != 3 || caps[0].body["max_tokens"] != float64(2000) || caps[1].body["max_tokens"] != float64(4000) ||
+		caps[2].body["max_tokens"] != float64(8000) {
 		t.Fatalf("%d requests: %v", len(caps), caps)
 	}
 	if len(rec.waits) != 0 {
 		t.Errorf("waited %v", rec.waits)
 	}
-	if len(usage.all()) != 2 {
+	if len(usage.all()) != 3 {
 		t.Errorf("usage %+v", usage.all())
 	}
 }
@@ -392,7 +420,8 @@ func TestOpenAILengthWithoutMaxTokensFails(t *testing.T) {
 }
 
 // The janitor role on DeepSeek sends max_tokens 16000 (DeepSeek's default
-// is 8K): a truncated answer is retried once with 32000, like Anthropic.
+// is 8K): a truncated answer is retried with 32000, then 64000 (v3.2.x
+// P1-c), like Anthropic.
 func TestDeepSeekJanitorMaxTokens(t *testing.T) {
 	if openAIMaxTokens(model.RoleGlossaryJanitor, true) != 16000 || openAIMaxTokens(model.RoleGlossaryJanitor, false) != 0 ||
 		openAIMaxTokens(model.RoleRepair, true) != 0 || openAIMaxTokens(model.RoleTranslate, true) != 0 {
@@ -404,7 +433,8 @@ func TestDeepSeekJanitorMaxTokens(t *testing.T) {
 		ok      bool
 	}{
 		{"retry succeeds", []string{lengthBody(`{"act`), okBody(`{"actions": []}`)}, true},
-		{"truncated twice", []string{lengthBody(`{"act`), lengthBody(`{"actions": [`)}, false},
+		// v3.2.x P1-c: two truncation retries (16000, 32000, 64000)
+		{"truncated three times", []string{lengthBody(`{"act`), lengthBody(`{"actions": [`), lengthBody(`{"actions": [{`)}, false},
 	} {
 		srv, got := captureServer(t, func(n int, w http.ResponseWriter) { io.WriteString(w, tc.answers[n-1]) })
 		set := newSettings(t)
@@ -415,7 +445,8 @@ func TestDeepSeekJanitorMaxTokens(t *testing.T) {
 		c.Sleep = rec.sleep
 		res, err := c.Complete(context.Background(), model.RoleGlossaryJanitor, "SYS", "USR", true)
 		caps := got()
-		if len(caps) != 2 || caps[0].body["max_tokens"] != float64(16000) || caps[1].body["max_tokens"] != float64(32000) {
+		if len(caps) != len(tc.answers) || caps[0].body["max_tokens"] != float64(16000) || caps[1].body["max_tokens"] != float64(32000) ||
+			!tc.ok && caps[2].body["max_tokens"] != float64(64000) {
 			t.Fatalf("%s: %d requests: %v", tc.name, len(caps), caps)
 		}
 		if raw, _ := json.Marshal(caps[1].body["thinking"]); string(raw) != `{"type":"disabled"}` {
@@ -426,12 +457,12 @@ func TestDeepSeekJanitorMaxTokens(t *testing.T) {
 				t.Errorf("%s: %q %v", tc.name, res.Text, err)
 			}
 		} else {
-			if !errors.Is(err, ErrTruncated) || !sched.IsPermanent(err) || !isCode(err, CodeTruncated, "max_tokens", 32000) ||
+			if !errors.Is(err, ErrTruncated) || !sched.IsPermanent(err) || !isCode(err, CodeTruncated, "max_tokens", 64000) ||
 				!strings.Contains(infoOf(err).Detail, "16000") {
 				t.Errorf("%s: error %v", tc.name, err)
 			}
 		}
-		if len(rec.waits) != 0 || len(usage.all()) != 2 {
+		if len(rec.waits) != 0 || len(usage.all()) != len(tc.answers) {
 			t.Errorf("%s: waits %v usage %+v", tc.name, rec.waits, usage.all())
 		}
 	}

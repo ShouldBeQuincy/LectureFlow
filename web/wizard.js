@@ -27,21 +27,21 @@
 // layer, or inside the dialog where they have a place of their own).
 
 import { api, isLocalFile } from './api.js';
-import { h, clear, toast, confirmDialog, btn, iconBtn, makeDropTarget, dropzone, filePicker, errorBlock, skeleton, preserveFocus } from './dom.js';
+import { h, clear, toast, confirmDialog, btn, iconBtn, makeDropTarget, dropzone, filePicker, errorBlock, skeleton, preserveFocus, focusOpener } from './dom.js';
 import { icon } from './icons.js';
 import { renderMarkdown } from './markdown.js';
 import { addLectureFiles, addMaterialFiles, onUploadChange, uploadItems, retryUpload, removeUpload } from './uploads.js';
 import { uploadRow, updateUploadRow } from './widgets.js';
 import * as U from './util.js';
 import { t } from './i18n.js';
-import { calendarFields } from './calendar_ui.js';
+import { calendarFields, courseNameError as nameError, courseCodeError as codeError, COURSE_NAME_MAX as NAME_MAX, COURSE_CODE_MAX as CODE_MAX } from './calendar_ui.js';
 import { kindTag } from './kinds.js';
 import { bindSelect, weekChoices } from './material_bind.js';
 
 const SYLLABUS_ACCEPT = '.txt,.md,.pdf,text/plain,text/markdown,application/pdf';
 const MEDIA_ACCEPT = U.MEDIA_ACCEPT; // extensions only (util.js, security review 2 M3)
-const NAME_MAX = 200; // same limits as the server (POST/PATCH /api/courses)
-const CODE_MAX = 32;
+// NAME_MAX, CODE_MAX, nameError, codeError: calendar_ui.js (the server's
+// limits, shared with the course settings, T22 B1)
 const REFRESH_MS = 300; // SSE events → re-read the course (debounced)
 
 let uid = 0;
@@ -53,18 +53,6 @@ let uid = 0;
 function courseAbbr(name) {
   const words = (name || '').match(/[\p{L}\p{N}][\p{L}\p{N}']*/gu) || [];
   return words.map((w) => w[0].toUpperCase()).join('') || 'COURSE';
-}
-
-function codeError(code) {
-  if (!code) return '';
-  if ([...code].length > CODE_MAX) return t('wizard.basics.code_too_long', { max: CODE_MAX });
-  if (/\s/.test(code)) return t('wizard.basics.code_has_space');
-  return '';
-}
-
-function nameError(name) {
-  if ([...name].length > NAME_MAX) return t('wizard.basics.name_too_long', { max: NAME_MAX });
-  return '';
 }
 
 function chars(s) {
@@ -94,7 +82,9 @@ const isAbort = (e) => !!e && e.name === 'AbortError';
 // the dialog by itself (Chrome does so on a repeated Esc), it is reopened
 // and the request goes through the same path.
 function modal(className, label, onRequestClose) {
-  const prev = document.activeElement;
+  // The modal stays across a route change; closed on another page, the
+  // focus goes back as after a dialog (T21 M4, dom.js focusOpener).
+  const back = focusOpener();
   const dlg = h('dialog', { class: `dlg ${className}`, 'aria-label': label });
   const toasts = document.getElementById('toasts');
   let closing = false;
@@ -142,7 +132,7 @@ function modal(className, label, onRequestClose) {
       if (toasts && toasts.parentNode === dlg) document.body.append(toasts);
       if (dlg.open) dlg.close();
       dlg.remove();
-      if (prev && prev.isConnected && prev.focus) prev.focus({ preventScroll: true });
+      back(document.getElementById('main'));
     },
   };
 }
@@ -295,7 +285,7 @@ function syllabusFlow(courseId, opts) {
       return dropzone({ text: t('wizard.syllabus.drop'), accept: SYLLABUS_ACCEPT, multiple: false, onFiles: pickFile, target: false });
     }
     R.upStatus = h('span', { class: 'syl-file-status' });
-    R.upProgress = up.status === 'uploading' ? h('progress', { class: 'up-progress', max: '1' }) : null;
+    R.upProgress = up.status === 'uploading' ? h('progress', { class: 'up-progress', max: '1', 'aria-label': up.file.name }) : null; // named by its file (L16)
     const actions = [];
     if (up.status === 'uploading') actions.push(btn(t('wizard.upload.cancel'), { size: 'sm', onclick: () => up.abort && up.abort() }));
     // Retrying only helps when the connection or the server failed; a file
@@ -494,6 +484,7 @@ function syllabusFlow(courseId, opts) {
     R.dirtyChip = h('span', { class: 'chip chip-warn syl-dirty', hidden: true }, t('wizard.format.unsaved'));
     R.notice = h('div', { class: 'syl-notice', role: 'status', hidden: true });
     R.preview = h('div', { class: 'md syl-preview', tabindex: '0', 'aria-label': t('wizard.format.preview_aria') });
+    R.previewMd = null; // the SYLLABUS.md the preview shows (renderFormat)
     R.editor = h('textarea', { class: 'syl-editor', spellcheck: 'false', 'aria-label': t('wizard.format.editor_aria'), value: S.md });
     R.editorFresh = true; // assigning .value puts the caret at the end
     R.editor.addEventListener('input', () => {
@@ -642,9 +633,16 @@ function syllabusFlow(courseId, opts) {
     R.preview.hidden = !showDoc || edit;
     R.editor.hidden = !showDoc || !edit;
     R.split.classList.toggle('is-busy', running);
-    if (showDoc && !edit) {
+    // R80 low-3: drawn again only when what it shows changed. A source over
+    // 256 KiB is rendered in slices (markdown.js): drawn anew, the place
+    // scrolled to in .syl-md-body was held to the first slice's height and
+    // did not come back ("preview" pressed again, a save). What changes
+    // S.md hides the preview first (a format running, the editor), which
+    // loses the place in any case, as it did before the slices.
+    if (showDoc && !edit && R.previewMd !== S.md) {
       clear(R.preview);
       R.preview.append(renderMarkdown(S.md));
+      R.previewMd = S.md;
     }
     for (const [k, b] of Object.entries(R.viewBtns)) {
       b.setAttribute('aria-pressed', String(S.view === k));
@@ -991,11 +989,21 @@ export function openWizard(ctx) {
     render(true);
   }
 
+  // A slide file of step 4 that failed to upload (as the summary counts it).
+  const matFailed = (x) => x.status !== 'done' && x.item.status === 'failed';
+  // Whether terms are being (or will be) extracted: from the syllabus, or
+  // from the slides added in step 4 that did not fail to upload (one still
+  // on its way is extracted once it is in; R74: not the failed ones).
+  // Without either, the last step does not say that extraction runs in
+  // the background (T25 G10).
+  const termsComing = () => !!(W.course && W.course.syllabus) || W.materials.some((x) => !matFailed(x));
+  const stepDesc = () => t(W.step === 5 && !termsComing() ? 'wizard.done.desc_no_terms' : STEP_TEXT[W.step - 1][1]);
+
   function render(focus) {
-    const [ttl, d] = STEP_TEXT[W.step - 1];
+    const [ttl] = STEP_TEXT[W.step - 1];
     eyebrow.textContent = t('wizard.step_of', { n: W.step, total: STEPS.length });
     title.textContent = t(ttl);
-    desc.textContent = t(d);
+    desc.textContent = stepDesc();
     clear(body);
     body.dataset.step = String(W.step);
     body.append(stepView());
@@ -1401,7 +1409,7 @@ export function openWizard(ctx) {
       'li',
       { class: 'wiz-file', dataset: { up: it.key } },
       h('span', { class: 'wiz-file-icon' }, icon('file-text', { size: 16 })),
-      h('div', { class: 'wiz-file-main' }, h('span', { class: 'fname', text: it.file.name, title: it.file.name }), h('span', { class: 'wiz-file-status' }), h('progress', { class: 'up-progress', max: '1' })),
+      h('div', { class: 'wiz-file-main' }, h('span', { class: 'fname', text: it.file.name, title: it.file.name }), h('span', { class: 'wiz-file-status' }), h('progress', { class: 'up-progress', max: '1', 'aria-label': it.file.name })),
       seg,
       h('span', { class: 'wiz-file-actions' }, actions),
     );
@@ -1478,7 +1486,7 @@ export function openWizard(ctx) {
         gText = t('wizard.done.seed_waiting');
       }
       const mats = W.materials.filter((x) => x.status === 'done').length;
-      const failed = W.materials.filter((x) => x.status !== 'done' && x.item.status === 'failed').length;
+      const failed = W.materials.filter(matFailed).length;
       const pending = W.materials.length - mats - failed;
       const matText = [mats ? t('wizard.done.mats_uploaded', { n: mats }) : '', pending ? t('wizard.done.mats_uploading', { n: pending }) : '', failed ? t('wizard.done.mats_failed', { n: failed }) : '']
         .filter(Boolean)
@@ -1595,6 +1603,11 @@ export function openWizard(ctx) {
         for (const mm of result.materials || []) W.knownMaterials.add(mm.id);
         renderSummary();
         renderBind();
+      } else if (item.kind === 'material' && !progressOnly && W.materials.some((y) => y.item === item)) {
+        // one of step 4's slide files failed (or was taken up again) while
+        // this step is open: its count, and whether terms are still coming
+        renderSummary();
+        desc.textContent = stepDesc();
       }
     });
     // Term and slide extraction run in the background: follow them through

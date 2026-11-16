@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -783,6 +784,187 @@ func TestImportFailureAndLaunchRefused(t *testing.T) {
 	}
 	if !strings.Contains(e.logs.String(), "stays a draft") {
 		t.Fatal("the refused launch is not logged")
+	}
+}
+
+// review R10 M1: the import refusing the downloaded file (a sign-in page,
+// an empty file) fails the task with that code and its params, not
+// downloads.import_failed, in the list and in the extension's status. The
+// file goes back to the task's directory, but sending the recording again
+// downloads it anew: the same file would be refused again. Another import
+// failure keeps the file for the next try.
+func TestImportRefusedKeepsReason(t *testing.T) {
+	e := newQEnv(t, nil)
+	ctx := context.Background()
+	ch := e.q.Subscribe(ctx)
+	e.media.put("/files/a.m4a", pattern(1, 1000))
+	track := e.fileTrack(bridge.KindAudio, "/files/a.m4a")
+	e.mu.Lock()
+	e.importErr = fmt.Errorf("download import: %w", &ImportRefused{Code: "upload.media_html", Params: map[string]any{"name": "Lecture 3.m4a"}})
+	e.mu.Unlock()
+	id := e.enqueue(e.request("s1", track))
+	info := e.wait(id, bridge.StateFailed)
+	if info.Error == nil || info.Error.Code != "upload.media_html" || info.Error.Params["name"] != "Lecture 3.m4a" || len(info.Error.Params) != 1 || info.Error.Detail != "" {
+		t.Fatalf("refused import %+v", info.Error)
+	}
+	// a retry would import the same file (T18 N2): remove only
+	if !slices.Equal(info.AllowedActions, []string{ActionRemove}) {
+		t.Fatalf("actions %v", info.AllowedActions)
+	}
+	rec, err := e.opts.Store.GetDownloadTask(ctx, id)
+	if err != nil || rec.ErrorCode != "upload.media_html" || rec.ErrorParams != `{"name":"Lecture 3.m4a"}` {
+		t.Fatalf("stored %q %q %v", rec.ErrorCode, rec.ErrorParams, err)
+	}
+	var st bridge.Status
+	for st.State != bridge.StateFailed {
+		select {
+		case st = <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatal("no failed status")
+		}
+	}
+	if st.Error == nil || st.Error.Code != "upload.media_html" || st.Error.Params["name"] != "Lecture 3.m4a" {
+		t.Fatalf("status %+v", st.Error)
+	}
+	if _, err := os.Stat(filepath.Join(e.q.taskDir(id), "media.m4a")); err != nil {
+		t.Fatalf("the file was not given back: %v", err)
+	}
+
+	// a retry would import the same file and be refused again: it is
+	// refused with the task's reason (T18 N2), nothing runs
+	adds, _, _, _, _ := e.aria.snapshot()
+	before := len(adds)
+	if _, err := e.q.Retry(ctx, id); codedOf(err) != "upload.media_html" || !errors.Is(err, ErrConflict) {
+		t.Fatalf("retry of a refused file: %v", err)
+	}
+	if info, _ = e.q.Get(ctx, id); info.State != bridge.StateFailed || info.Error == nil || info.Error.Code != "upload.media_html" {
+		t.Fatalf("after the refused retry %+v", info)
+	}
+	if adds, _, _, _, _ = e.aria.snapshot(); len(adds) != before {
+		t.Fatalf("a retry downloaded again: %d → %d", before, len(adds))
+	}
+
+	// sent again after the refusal: downloaded anew; another import failure
+	e.mu.Lock()
+	e.importErr = errors.New("disk on fire")
+	e.mu.Unlock()
+	if again := e.enqueue(e.request("s1", track)); again != id {
+		t.Fatalf("a new task %d", again)
+	}
+	info = e.wait(id, bridge.StateFailed)
+	if info.Error == nil || info.Error.Code != CodeImportFailed || info.Error.Detail != "disk on fire" {
+		t.Fatalf("import failure %+v", info.Error)
+	}
+	if adds, _, _, _, _ = e.aria.snapshot(); len(adds) != before+1 {
+		t.Fatalf("not downloaded anew after a refusal: %d → %d", before, len(adds))
+	}
+
+	// sent again after that failure: the file there is imported
+	e.mu.Lock()
+	e.importErr = nil
+	e.mu.Unlock()
+	if again := e.enqueue(e.request("s1", track)); again != id {
+		t.Fatalf("a new task %d", again)
+	}
+	info = e.wait(id, bridge.StateDone)
+	if adds, _, _, _, _ = e.aria.snapshot(); info.LectureID == "" || len(adds) != before+1 {
+		t.Fatalf("done %+v, downloads %d → %d", info, before, len(adds))
+	}
+}
+
+// R12 D-3 (P6 D4): the extension's refresh of a task whose file the
+// import refused downloads it anew, as sending it again does, instead of
+// importing the same file to be refused again. Only that task's directory
+// goes: another failed task's file stays, and a refresh of a task that
+// failed otherwise still resumes from its file.
+func TestRefreshAfterRefusedImportDownloadsAnew(t *testing.T) {
+	e := newQEnv(t, nil)
+	ctx := context.Background()
+	e.media.put("/files/a.m4a", pattern(1, 1000))
+	e.media.put("/files/b.m4a", pattern(2, 1000))
+	trackA := e.fileTrack(bridge.KindAudio, "/files/a.m4a")
+	trackB := e.fileTrack(bridge.KindAudio, "/files/b.m4a")
+	setImportErr := func(err error) {
+		e.mu.Lock()
+		e.importErr = err
+		e.mu.Unlock()
+	}
+	refresh := func(session string, tr bridge.Track) {
+		t.Helper()
+		if _, err := e.q.Refresh(ctx, &bridge.RefreshRequest{Platform: "panopto", SessionID: session,
+			Tracks: []bridge.Track{tr}, Referer: testReferer, Cookies: e.cookies()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// another task: its import failed otherwise, its file is kept
+	setImportErr(errors.New("disk on fire"))
+	other := e.enqueue(e.request("other", trackB))
+	if info := e.wait(other, bridge.StateFailed); info.Error == nil || info.Error.Code != CodeImportFailed {
+		t.Fatalf("other %+v", info.Error)
+	}
+	otherFile := filepath.Join(e.q.taskDir(other), "media.m4a")
+	if _, err := os.Stat(otherFile); err != nil {
+		t.Fatal(err)
+	}
+	// this task: the file refused
+	setImportErr(&ImportRefused{Code: "upload.media_html", Params: map[string]any{"name": "Lecture 3.m4a"}})
+	id := e.enqueue(e.request("s1", trackA))
+	if info := e.wait(id, bridge.StateFailed); info.Error == nil || info.Error.Code != "upload.media_html" {
+		t.Fatalf("refused %+v", info.Error)
+	}
+	if _, err := os.Stat(filepath.Join(e.q.taskDir(id), "media.m4a")); err != nil {
+		t.Fatalf("the refused file was not given back: %v", err)
+	}
+	adds, _, _, _, _ := e.aria.snapshot()
+	before := len(adds)
+	imports := len(e.importsSnapshot())
+
+	if rec, err := e.opts.Store.GetDownloadTask(ctx, id); err != nil || rec.BytesDone != 1000 {
+		t.Fatalf("stored bytes before the refresh %d/%d %v", rec.BytesDone, rec.BytesTotal, err)
+	}
+
+	// refreshed: the progress starts over (the download held at half, so
+	// nothing has reported yet), then downloaded anew (one more download),
+	// imported once, done
+	setImportErr(nil)
+	e.media.hold("/files/a.m4a")
+	refresh("s1", trackA)
+	if rec, err := e.opts.Store.GetDownloadTask(ctx, id); err != nil || rec.BytesDone != 0 || rec.BytesTotal != -1 {
+		t.Fatalf("stored bytes right after the refresh %d/%d %v, want 0/-1", rec.BytesDone, rec.BytesTotal, err)
+	}
+	e.media.release()
+	info := e.wait(id, bridge.StateDone)
+	if adds, _, _, _, _ = e.aria.snapshot(); len(adds) != before+1 {
+		t.Fatalf("not downloaded anew on refresh: %d → %d", before, len(adds))
+	}
+	if got := len(e.importsSnapshot()); got != imports+1 || info.LectureID == "" {
+		t.Fatalf("imports %d → %d, %+v", imports, got, info)
+	}
+	if rec, err := e.opts.Store.GetDownloadTask(ctx, id); err != nil || rec.BytesDone != 1000 || rec.BytesTotal != 1000 {
+		t.Fatalf("stored bytes %d/%d %v", rec.BytesDone, rec.BytesTotal, err)
+	}
+	// the other task's file is untouched; its refresh imports that file
+	// without downloading it again
+	if _, err := os.Stat(otherFile); err != nil {
+		t.Fatalf("another task's file went: %v", err)
+	}
+	refresh("other", trackB)
+	e.wait(other, bridge.StateDone)
+	if adds, _, _, _, _ = e.aria.snapshot(); len(adds) != before+1 {
+		t.Fatalf("a refresh after another import failure downloaded again: %d → %d", before, len(adds))
+	}
+}
+
+// An import error that is not a refusal of the file keeps
+// downloads.import_failed, also a coded one of another kind.
+func TestRefusedFileCodes(t *testing.T) {
+	for code, want := range map[string]bool{
+		"upload.media_empty": true, "upload.media_html": true, "upload.media_playlist": true, "upload.media_format": true,
+		CodeImportFailed: false, "upload.not_media": false, "server.internal": false, "": false,
+	} {
+		if RefusedFile(code) != want {
+			t.Errorf("RefusedFile(%q) = %v", code, !want)
+		}
 	}
 }
 

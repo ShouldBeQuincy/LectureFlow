@@ -88,12 +88,16 @@ func (b *Backend) startRemoval(s *liveSession, kid, base, jobDir string) {
 	b.mu.Lock()
 	s.removals = append(s.removals, r)
 	b.mu.Unlock()
+	b.markBusyDir(s, jobDir)
 	b.removalWG.Add(1)
 	go func() {
 		defer b.removalWG.Done()
 		defer stop()
 		start := b.now()
-		how, left, kernelOK := b.removeJob(stopCtx, s, kid, base, jobDir)
+		how, left, stopped, kernelOK := b.removeJob(stopCtx, s, kid, base, jobDir)
+		// left is "" also when a release stopped the retries: gone only
+		// when the cell confirmed it or the deletions ran to their end.
+		b.settleBusyDir(s, jobDir, how == "cell" || (left == "" && stopCtx.Err() == nil))
 		b.giveKernel(s, kid, kernelOK)
 		b.mu.Lock()
 		for i, x := range s.removals {
@@ -106,31 +110,45 @@ func (b *Backend) startRemoval(s *liveSession, kid, base, jobDir string) {
 		if live && left != "" {
 			s.leftFile = left
 		}
+		if live && stopped != "" && s.rec.State == StateRunning {
+			// The release that stopped the retries waits for this removal
+			// and may still be skipped because a lecture was dispatched
+			// meanwhile (ifIdle): the file would stay on a runtime that goes
+			// on, with nothing recording it (review R52 M1). Recorded, the
+			// left-file rule takes over (the end of the last lecture, or
+			// Tick once none is on the runtime); when
+			// that release does happen, the record goes with the
+			// session. No release of its own here: one is under way.
+			s.leftFile = stopped
+		}
 		idle := len(b.jobs) == 0
 		b.mu.Unlock()
 		close(r.done)
 		b.log.Info("colab: a finished lecture's files on the runtime were removed", "how", how,
-			"ms", b.now().Sub(start).Milliseconds(), "left", left != "")
+			"ms", b.now().Sub(start).Milliseconds(), "left", left != "" || stopped != "")
 		if live && left != "" && idle {
 			// Gate round 1 item 8: release now, its storage goes with it
 			// (with lectures running, the last of them releases it).
-			_ = b.releaseWith(context.Background(), ReleaseCleanupFailed, left)
+			_ = b.releaseWith(context.Background(), ReleaseCleanupFailed, releaseOpts{file: left, expect: s, ifIdle: true})
 		}
 	}()
 }
 
 // removeJob removes jobDir: the cell first, the Contents API when it does
 // not confirm. how is "cell" or "contents"; left names a file that could
-// not be deleted ("" = all gone, or the removal was stopped); kernelOK is
-// false when the kernel may still run the cell (not used again).
-func (b *Backend) removeJob(stopCtx context.Context, s *liveSession, kid, base, jobDir string) (how, left string, kernelOK bool) {
+// not be deleted ("" = all gone, or the removal was stopped); stopped names
+// a file whose single deletion failed after a release stopped the retries;
+// kernelOK is false when the kernel may still run the cell (not used
+// again).
+func (b *Backend) removeJob(stopCtx context.Context, s *liveSession, kid, base, jobDir string) (how, left, stopped string, kernelOK bool) {
 	removed, kernelOK, err := b.removeByCell(stopCtx, s, kid, base, jobDir)
 	if removed {
-		return "cell", "", kernelOK
+		return "cell", "", "", kernelOK
 	}
 	b.log.Info("colab: removing a lecture's files with a cell did not work; deleting them one by one",
 		"code", Code(codedHTTP("api/kernels", err)))
-	return "contents", b.cleanupRemote(stopCtx, s, jobDir, true), kernelOK
+	left, stopped = b.cleanupRemoteStopped(stopCtx, s, jobDir, true)
+	return "contents", left, stopped, kernelOK
 }
 
 // removeByCell runs removeCellCode in kernel kid. It is not stopped by
@@ -150,7 +168,7 @@ func (b *Backend) removeByCell(stopCtx context.Context, s *liveSession, kid, bas
 		}
 		out.WriteString(text)
 		return nil
-	}, b.o.Sleep, nil)
+	}, b.newReconnector(nil), nil)
 	if err != nil {
 		return false, false, err
 	}
@@ -191,3 +209,58 @@ func (b *Backend) awaitRemovals(s *liveSession) {
 // removalsSettled waits until every background removal (and the release it
 // may start) has ended (tests).
 func (b *Backend) removalsSettled() { b.removalWG.Wait() }
+
+// ---- one directory per attempt while an earlier one is being removed ----
+//
+// T051 (test review R3): a lecture's job directory is named after the
+// lecture (remoteJobID), and its files are deleted in the background after
+// a success (startRemoval) or a failure that keeps the runtime
+// (cleanupKept), with retries that may take a minute. The same lecture can
+// be dispatched to the same runtime again meanwhile (a retry, "改用 Colab
+// 处理"): in the same directory, the deletion under way would delete its
+// new upload or job.json, and its new job.json would meet the previous
+// attempt's (the resident worker queues a directory name once while its
+// job.json stays). So a directory being deleted, or left with a file, is
+// marked busy until it is known gone, and an attempt whose directory is
+// busy takes the lecture's id with a random suffix — the naming of the
+// uploads ahead (aheadID). Nothing waits; a deletion only ever deletes its
+// own directory. The worker finds jobs by BASE/jobs/*/job.json and the
+// memory mode by BASE/jobs/ID's grandparent, whatever the name.
+
+// markBusyDir marks jobDir busy on s; call it before the lecture's
+// Transcribe returns (before a goroutine that deletes it starts).
+func (b *Backend) markBusyDir(s *liveSession, jobDir string) {
+	if jobDir == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if s.busyDirs == nil {
+		s.busyDirs = map[string]bool{}
+	}
+	s.busyDirs[jobDir] = true
+}
+
+// settleBusyDir ends the mark of jobDir when its deletion has ended with
+// every file gone; a directory that keeps a file stays busy.
+func (b *Backend) settleBusyDir(s *liveSession, jobDir string, gone bool) {
+	if !gone || jobDir == "" {
+		return
+	}
+	b.mu.Lock()
+	delete(s.busyDirs, jobDir)
+	b.mu.Unlock()
+}
+
+// jobDirFor names lecture j's job directory under base on s: BASE/jobs/ID,
+// or BASE/jobs/ID-xxxxxx when that one is busy (j.id follows).
+func (b *Backend) jobDirFor(s *liveSession, base string, j *jobState) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	dir := base + "/jobs/" + j.id
+	for s.busyDirs[dir] {
+		j.id = aheadID(j.key)
+		dir = base + "/jobs/" + j.id
+	}
+	return dir
+}

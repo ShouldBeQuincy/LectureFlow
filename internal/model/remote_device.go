@@ -19,8 +19,15 @@ import (
 const SSHDevicePrefix = "ssh:"
 
 // SSHSlugPattern is the slug of an SSH server (its device id is
-// "ssh:"+slug and its remote_server.id the slug).
+// "ssh:"+slug and its remote_server.id the slug). It recognises every
+// server that exists; a new one's slug is an SSHNewSlugPattern.
 var SSHSlugPattern = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
+
+// SSHNewSlugPattern is the slug a new SSH server may get (SEC7 L7): an
+// SSHSlugPattern that starts with a letter or a digit, so that nothing made
+// of it ("lectureflow-<slug>", "ssh:<slug>") can ever read as an option.
+// Servers added before keep their slug (SSHSlugPattern).
+var SSHNewSlugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 
 // IsSSHDevice reports whether id is an SSH inference server's device id.
 func IsSSHDevice(id string) bool {

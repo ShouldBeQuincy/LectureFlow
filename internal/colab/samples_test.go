@@ -114,6 +114,7 @@ func TestReplaySampleViolation(t *testing.T) {
 	if r, _ := codedParam(err, "reason"); r != "bad value of gpu_name" {
 		t.Errorf("reason %q", r)
 	}
+	e.b.handbacksSettled() // v3.2.x: the files and the runtime go in the background
 	e.rs.finish()
 	e.checkClean(t, err)
 }

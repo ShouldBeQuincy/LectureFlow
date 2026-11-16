@@ -970,6 +970,18 @@ func testSplitsTruncated(t *testing.T, anthropic bool) {
 	if len(answered) != 4 {
 		t.Fatalf("answered batches %v, want 4 of 15 (60 → 30 → 15)", answered)
 	}
+	// T-PERF-07: the first truncation splits at once, without the client's
+	// truncation ladder: 60 once, 30 twice, 15 four times, every request
+	// with the same max_tokens (none doubled).
+	reqs := e.fake.Requests(llmtest.RoleGlossaryJanitor)
+	if len(reqs) != 7 {
+		t.Errorf("%d requests, want 7 (60 → 30 ×2 → 15 ×4, each asked once)", len(reqs))
+	}
+	for i, q := range reqs {
+		if q.MaxTokens != reqs[0].MaxTokens {
+			t.Errorf("request %d: max_tokens %d, the first had %d", i, q.MaxTokens, reqs[0].MaxTokens)
+		}
+	}
 	for k, b := range answered {
 		if len(b) != 15 || b[0] != fmt.Sprintf("term%03d", 15*k) || b[14] != fmt.Sprintf("term%03d", 15*k+14) {
 			t.Errorf("batch %d: %v", k, b)
@@ -1016,9 +1028,11 @@ func TestGlossaryReviewTruncatedSmall(t *testing.T) {
 	}
 	public := e.term2("public", "公钥", model.SourceMaterial, nil)
 	// The two halves run in parallel and the half that fails first cancels
-	// the other. To make the count deterministic, a half's second (last)
-	// request is answered only after all four requests of the halves have
-	// reached the server: then both halves are asked twice whatever the
+	// the other. To make the count deterministic, a half's third (last)
+	// request is answered only after all six requests of the halves have
+	// reached the server: then both halves are asked three times (v3.2.x
+	// P1-c: two truncation retries; a batch below janitorMinSplit cannot be
+	// split and keeps the client's ladder, T-PERF-07) whatever the
 	// scheduling (the timeout only keeps a broken stage from hanging the test).
 	var (
 		mu      sync.Mutex
@@ -1031,8 +1045,8 @@ func TestGlossaryReviewTruncatedSmall(t *testing.T) {
 		if n := entriesOf(user); n < 31 {
 			mu.Lock()
 			perHalf[n]++
-			last := perHalf[n] == 2
-			if halves++; halves == 4 {
+			last := perHalf[n] == 3
+			if halves++; halves == 6 {
 				close(allSent)
 			}
 			mu.Unlock()
@@ -1050,23 +1064,25 @@ func TestGlossaryReviewTruncatedSmall(t *testing.T) {
 	if r.err == nil || !sched.IsPermanent(r.err) || !errors.Is(r.err, llm.ErrTruncated) {
 		t.Fatalf("err %v", r.err)
 	}
-	// 31 → 15 + 16, both still cut off (each asked twice by the client): no
-	// further split — exactly 6 requests: 31, 31, then 15, 15, 16, 16.
+	// 31 → 15 + 16 at its first truncation (T-PERF-07: no ladder for a
+	// batch that can be split), both still cut off (each asked three times
+	// by the client): no further split — exactly 7 requests: 31 ×1, 15 ×3,
+	// 16 ×3.
 	reqs := e.fake.Requests(llmtest.RoleGlossaryJanitor)
-	if n := len(reqs); n != 6 {
-		t.Fatalf("%d requests, want 6", n)
+	if n := len(reqs); n != 7 {
+		t.Fatalf("%d requests, want 7", n)
 	}
 	var sizes []int
 	for i, q := range reqs {
-		if n := entriesOf(q.User); i < 2 && n != 31 {
+		if n := entriesOf(q.User); i < 1 && n != 31 {
 			t.Errorf("request %d has %d entries, want 31", i, n)
-		} else if i >= 2 {
+		} else if i >= 1 {
 			sizes = append(sizes, n)
 		}
 	}
 	sort.Ints(sizes)
-	if fmt.Sprint(sizes) != "[15 15 16 16]" {
-		t.Errorf("requests of the halves have %v entries, want [15 15 16 16]", sizes)
+	if fmt.Sprint(sizes) != "[15 15 15 16 16 16]" {
+		t.Errorf("requests of the halves have %v entries, want [15 15 15 16 16 16]", sizes)
 	}
 	if rep, err := glossary.LastRun(e.ctx, e.st, e.course.ID); err != nil || !rep.Fallback {
 		t.Errorf("fallback run %+v %v", rep, err)

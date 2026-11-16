@@ -14,6 +14,7 @@ import (
 
 	"lectureflow/internal/calendar"
 	"lectureflow/internal/db"
+	lfmedia "lectureflow/internal/media"
 	"lectureflow/internal/model"
 	"lectureflow/internal/state"
 )
@@ -205,8 +206,10 @@ func UndoFilenameRule(ctx context.Context, d Deps, courseID string) error {
 				}
 				changed, dated = true, true
 			}
-			if titleSource(l.TitleSource) == model.TitleSourceFilename && l.Title != p.Title {
-				if err := tx.SetLectureTitles(ctx, l.ID, p.Title, l.TitleZh, model.TitleSourceFilename); err != nil {
+			// cleaned like every stored title (lfmedia.CleanTitle: one line,
+			// at most 200 characters), so it compares with what was stored
+			if t := lfmedia.CleanTitle(p.Title); titleSource(l.TitleSource) == model.TitleSourceFilename && l.Title != t {
+				if err := tx.SetLectureTitles(ctx, l.ID, t, l.TitleZh, model.TitleSourceFilename); err != nil {
 					return err
 				}
 				changed = true
@@ -474,7 +477,9 @@ func resolveOne(ctx context.Context, tx db.Store, rule *calendar.FilenameRule, l
 	if rule != nil && l.OriginalFilename != "" {
 		p := calendar.Parse(*rule, calendar.Sample{Filename: l.OriginalFilename, UploadedAt: up, CreationTime: ct})
 		if p.Matched {
-			fromName, title, fileKind = p.RecordedAt, p.Title, kinds.resolve(p.Kind)
+			// the title the rule captures is stored like every title
+			// (lfmedia.CleanTitle: one line, at most 200 characters)
+			fromName, title, fileKind = p.RecordedAt, lfmedia.CleanTitle(p.Title), kinds.resolve(p.Kind)
 		}
 	}
 	if ct == nil && recordedSource(l.RecordedAtSource) == model.RecordedAtMetadata {

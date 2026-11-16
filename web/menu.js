@@ -5,9 +5,10 @@
 // submenus (▸), Enter / Space activate. Items that are not available are not
 // passed in at all (SPEC §9.8: unavailable actions are not rendered).
 //
-// Item: {label, icon?, hint?, danger?, onSelect?, items?: Item[], checked?, lang?} | 'sep'
+// Item: {label, icon?, hint?, desc?, danger?, onSelect?, items?: Item[], checked?, lang?} | 'sep'
 // checked (true/false) makes the item a menuitemradio with a check mark;
-// lang marks a label written in another language (fonts, SPEC-v2 P14.5).
+// lang marks a label written in another language (fonts, SPEC-v2 P14.5);
+// desc is a line of small text under the label (what the item is, T22 S4).
 // Falsy entries are dropped, separators are collapsed, empty submenus removed.
 
 import { h } from './dom.js';
@@ -16,6 +17,7 @@ import { icon } from './icons.js';
 let root = null; // the open top-level menu element
 let openedAt = 0;
 let restoreFocus = null;
+let descSeq = 0; // ids of the items' descriptions
 
 function normalize(items) {
   const out = [];
@@ -42,7 +44,7 @@ export function closeMenu({ focus = true } = {}) {
   root = null;
   for (const m of document.querySelectorAll('.ctx-menu')) m.remove(); // with open submenus
   document.removeEventListener('pointerdown', onOutside, true);
-  window.removeEventListener('resize', onDismiss);
+  window.removeEventListener('resize', onResize);
   window.removeEventListener('blur', onDismiss);
   document.removeEventListener('scroll', onScroll, true);
   window.removeEventListener('hashchange', onDismiss);
@@ -59,8 +61,23 @@ function onOutside(e) {
 function onDismiss() {
   closeMenu({ focus: false });
 }
+// A scroll of the page or a resized window closes the menu. When the focus
+// is in it then (a menu opened from the keyboard, or one whose items the
+// arrows or the pointer moved through), it goes back to the menu's opener
+// (found again by its data-fkey when redrawn), without scrolling to it: left
+// on the removed item it fell to the page's body, and the next Enter did
+// nothing (T28 G2, as T21 M1). A focus elsewhere on the page stays where it
+// is; so does it when the window loses the focus (blur), and on a press
+// outside the menu (onOutside).
+function focusInMenu() {
+  const a = document.activeElement;
+  return !!(a && a.closest && a.closest('.ctx-menu'));
+}
+function onResize() {
+  closeMenu({ focus: focusInMenu() });
+}
 function onScroll(e) {
-  if (root && !(e.target instanceof Node && e.target.closest && e.target.closest('.ctx-menu'))) closeMenu({ focus: false });
+  if (root && !(e.target instanceof Node && e.target.closest && e.target.closest('.ctx-menu'))) closeMenu({ focus: focusInMenu() });
 }
 
 function itemsOf(menu) {
@@ -74,18 +91,63 @@ function focusItem(menu, i) {
   list[n].focus();
 }
 
+// A menu is measured as it is laid out (offsetWidth / offsetHeight). Its
+// rect is the menu as drawn, and while it opens the animation draws it 1.5%
+// smaller (lf-pop): placed by that, it ended a few pixels past the 8px it
+// keeps from the window's edges, and a menu too tall for the room beside
+// its button passed for one that fits (T21 M3).
 function place(menu, x, y, alignRightTo = null) {
   menu.style.left = '0px';
   menu.style.top = '0px';
-  const r = menu.getBoundingClientRect();
+  const w = menu.offsetWidth;
+  const hgt = menu.offsetHeight;
   const vw = window.innerWidth;
   const vh = window.innerHeight;
   let left = x;
   let top = y;
-  if (left + r.width > vw - 8) left = alignRightTo != null ? alignRightTo - r.width : vw - 8 - r.width;
-  if (top + r.height > vh - 8) top = Math.max(8, vh - 8 - r.height);
+  if (left + w > vw - 8) left = alignRightTo != null ? alignRightTo - w : vw - 8 - w;
+  if (top + hgt > vh - 8) top = Math.max(8, vh - 8 - hgt);
   menu.style.left = `${Math.max(8, left)}px`;
   menu.style.top = `${Math.max(8, top)}px`;
+}
+
+// T18e: where a menu opened from a button goes (rect: the button's
+// getBoundingClientRect; height: the menu's, as laid out), 4px from the
+// button and 8px from the window's edges: below it when it fits, else above
+// it when it fits there, else on the larger side, as tall as that side
+// allows (it then scrolls; maxHeight). It never covers its own button.
+// openMenu tries menuBeside before it limits a menu. → {top, maxHeight}
+export function anchoredMenuPlace(rect, height, viewHeight) {
+  const below = viewHeight - 8 - (rect.bottom + 4);
+  const above = rect.top - 4 - 8;
+  if (height <= below) return { top: rect.bottom + 4, maxHeight: null };
+  if (height <= above) return { top: rect.top - 4 - height, maxHeight: null };
+  if (above > below) return { top: 8, maxHeight: Math.max(0, above) };
+  return { top: rect.bottom + 4, maxHeight: Math.max(0, below) };
+}
+
+// T21 M2, R68: a menu with room neither below nor above its button, limited
+// to the larger side, was often cut by a few pixels (9 of a 369px menu),
+// with a scroll bar and its last item, "delete", out of sight. Shown whole
+// over the button instead, it took the second click on the button, the one
+// that closes the menu (and a double click), on one of its items. So a menu
+// that fits the window (8px from its top and bottom edges) goes beside the
+// button, whole and off it: 4px from the button, level with it, or as far up
+// as it must go to end 8px from the bottom edge. A right-aligned menu (the
+// "⋯" at the end of a row) goes to the button's left, else to its right; a
+// left-aligned one to the right first. size: the menu's {width, height} as
+// laid out; view: the window's. → {left, top}, or null when the menu is
+// taller than the window or neither side is wide enough (a narrow window,
+// an anchor as wide as the page): it is then limited (anchoredMenuPlace).
+export function menuBeside(rect, size, view, alignRight) {
+  if (size.height > view.height - 16) return null;
+  const onLeft = rect.left - 4 - size.width;
+  const onRight = rect.right + 4;
+  const fitsLeft = onLeft >= 8;
+  const fitsRight = onRight + size.width <= view.width - 8;
+  if (!fitsLeft && !fitsRight) return null;
+  const left = (alignRight ? fitsLeft : !fitsRight) ? onLeft : onRight;
+  return { left, top: Math.max(8, Math.min(rect.top, view.height - 8 - size.height)) };
 }
 
 function buildMenu(items, level) {
@@ -109,13 +171,33 @@ function buildMenu(items, level) {
     const m = buildMenu(sub, level + 1);
     document.body.append(m);
     const r = item.getBoundingClientRect();
-    place(m, r.right - 2, r.top - 5, r.left + 2);
+    // A menu limited in height scrolls, and its scroll bar is between its
+    // items and its edge: the submenu starts at the menu's outer edge there
+    // (as laid out: where place() put it, and its width), not over the
+    // scroll bar (T21 M3). Limited is the max-height openMenu gave it: the
+    // scroll and client heights, rounded each, can differ by a pixel on a
+    // menu that does not scroll (R68).
+    const scrolls = !!menu.style.maxHeight;
+    place(m, scrolls ? parseFloat(menu.style.left) + menu.offsetWidth : r.right - 2, r.top - 5, r.left + 2);
     item.setAttribute('aria-expanded', 'true');
-    openSub = { item, menu: m };
+    openSub = { item, menu: m, scrollTop: menu.scrollTop };
     m._parentItem = item;
     if (focusFirst) focusItem(m, 0);
   };
   menu._closeSub = closeSub;
+  // The menu scrolled under its open submenu (the wheel), which would stay
+  // where it was, beside nothing: the submenu closes, and a focus that was
+  // in it goes to its item, without scrolling the menu back (T21 M3). A
+  // scroll event without a move since the submenu opened is not one: the
+  // scroll that brought the focused item into view is reported after the
+  // key that opened its submenu.
+  menu.addEventListener('scroll', () => {
+    if (!openSub || menu.scrollTop === openSub.scrollTop) return;
+    const item = openSub.item;
+    const inSub = openSub.menu.contains(document.activeElement);
+    closeSub();
+    if (inSub) item.focus({ preventScroll: true });
+  });
   for (const it of items) {
     if (it === 'sep') {
       menu.append(h('div', { class: 'ctx-sep', role: 'separator' }));
@@ -123,19 +205,26 @@ function buildMenu(items, level) {
     }
     const hasSub = !!it.items;
     const radio = typeof it.checked === 'boolean';
+    // desc: the item's description, heard after its name (aria-describedby)
+    // rather than part of it: a screen reader names each item briefly and
+    // says what it is when it is focused; hidden from the name computed from
+    // the content (a description may still point at hidden text)
+    const descId = it.desc ? `ctx-desc-${++descSeq}` : null;
     const el = h(
       'button',
       {
         type: 'button',
-        class: 'ctx-item' + (it.danger ? ' is-danger' : ''),
+        class: 'ctx-item' + (it.danger ? ' is-danger' : '') + (descId ? ' has-desc' : ''),
         role: radio ? 'menuitemradio' : 'menuitem',
         'aria-checked': radio ? String(it.checked) : undefined,
         tabindex: '-1',
         'aria-haspopup': hasSub ? 'menu' : undefined,
         'aria-expanded': hasSub ? 'false' : undefined,
+        'aria-describedby': descId || undefined,
       },
       h('span', { class: 'ctx-icon' }, it.icon ? icon(it.icon, { size: 15 }) : radio && it.checked ? icon('check', { size: 15 }) : null),
       h('span', { class: 'ctx-label', lang: it.lang || undefined }, it.label),
+      descId ? h('span', { class: 'ctx-desc', id: descId, 'aria-hidden': 'true' }, it.desc) : null,
       it.hint ? h('span', { class: 'ctx-hint' }, it.hint) : null,
       hasSub ? h('span', { class: 'ctx-arrow' }, icon('chevron-right', { size: 14 })) : null,
     );
@@ -197,15 +286,33 @@ export function openMenu(items, pos, opts = {}) {
     const r = pos.anchor.getBoundingClientRect();
     const alignRight = opts.align === 'right';
     root.style.left = '0px';
-    const w = root.getBoundingClientRect().width;
-    place(root, alignRight ? r.right - w : r.left, r.bottom + 4, r.right);
+    const size = { width: root.offsetWidth, height: root.offsetHeight };
+    const at = anchoredMenuPlace(r, size.height, window.innerHeight);
+    // room neither below nor above: beside the button when the window has
+    // room for the whole menu there, else limited in height (R68)
+    const side = at.maxHeight != null ? menuBeside(r, size, { width: window.innerWidth, height: window.innerHeight }, alignRight) : null;
+    if (side) {
+      place(root, side.left, side.top);
+    } else {
+      if (at.maxHeight != null) {
+        root.style.maxHeight = `${at.maxHeight}px`;
+        root.style.overflowY = 'auto';
+      }
+      // its width once limited: a scroll bar makes it wider, and a menu
+      // right-aligned by its width without one stood past its button
+      const w = root.offsetWidth;
+      place(root, alignRight ? r.right - w : r.left, at.top, r.right);
+    }
   } else {
     place(root, pos.x, pos.y);
   }
   openedAt = performance.now();
-  focusItem(root, 0);
+  // opts.focus: the item to open on (a list of choices opens on the one in
+  // use, T21 M7); the first item otherwise, or when there is no such item
+  const first = Number.isInteger(opts.focus) && opts.focus >= 0 && opts.focus < itemsOf(root).length ? opts.focus : 0;
+  focusItem(root, first);
   document.addEventListener('pointerdown', onOutside, true);
-  window.addEventListener('resize', onDismiss);
+  window.addEventListener('resize', onResize);
   window.addEventListener('blur', onDismiss);
   document.addEventListener('scroll', onScroll, true);
   window.addEventListener('hashchange', onDismiss);

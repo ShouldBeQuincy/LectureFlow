@@ -14,6 +14,7 @@ import (
 
 	"lectureflow/internal/colab"
 	"lectureflow/internal/model"
+	"lectureflow/internal/remote"
 	"lectureflow/internal/sched"
 	"lectureflow/internal/wav"
 )
@@ -45,7 +46,7 @@ func (s *asrStage) remoteRun(ctx context.Context, job model.Job, run model.ASRSn
 	ms, ok := wav.DurationMS(audio)
 	if !ok || ms <= 0 {
 		return nil, sched.Permanent(model.Errorf(CodeASRAudioMissing, map[string]any{"file": model.AudioFile},
-			fmt.Errorf("%s 无法读取（prep 的产物），请重跑 prep 阶段", audio)))
+			fmt.Errorf("%s 无法读取（预处理的产物），请重新运行预处理阶段", audio)))
 	}
 	acc := rb.Status(ctx).Accelerator
 	if acc == "" {
@@ -121,9 +122,16 @@ func (r *remoteReporter) report(ev colab.Event, force bool) {
 	}
 	st := model.RemoteStats{Step: step, Steps: model.RemoteSteps, EtaSec: eta, Accelerator: r.acc,
 		Stage: ev.Stage, WaitingFor: ev.WaitingFor}
+	if ev.Reconnect != nil { // a copy: the backend keeps its own
+		rc := *ev.Reconnect
+		st.Reconnect = &rc
+	}
 	now := time.Now()
 	r.mu.Lock()
-	changed := force || r.last.Step != st.Step || r.last.Stage != st.Stage || r.last.WaitingFor != st.WaitingFor
+	// a reconnect that starts, moves on or ends is a change too (an event
+	// without one clears it from stats.remote)
+	changed := force || r.last.Step != st.Step || r.last.Stage != st.Stage || r.last.WaitingFor != st.WaitingFor ||
+		!sameReconnect(r.last.Reconnect, st.Reconnect)
 	if !changed && now.Sub(r.at) < remoteStatsEvery {
 		r.mu.Unlock()
 		return
@@ -133,6 +141,18 @@ func (r *remoteReporter) report(ev colab.Event, force bool) {
 	sched.UpdateStats(r.ctx, func(js *model.JobStats) {
 		v := st
 		v.Steps = append([]string(nil), st.Steps...)
+		if st.Reconnect != nil {
+			rc := *st.Reconnect
+			v.Reconnect = &rc
+		}
 		js.Remote = &v
 	})
+}
+
+// sameReconnect reports whether a and b tell the same reconnect state.
+func sameReconnect(a, b *remote.Reconnect) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Attempt == b.Attempt && a.Of == b.Of && a.NextAt.Equal(b.NextAt)
 }

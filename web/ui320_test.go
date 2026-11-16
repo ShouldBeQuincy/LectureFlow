@@ -173,7 +173,8 @@ func TestInspectorDrawnAfterCatalog(t *testing.T) {
 func TestUI320Fixes(t *testing.T) {
 	want := map[string][]string{
 		// P2: the row's and the notices' buttons go through actions.js
-		"lecture_list.js": {"done(A.launchLectures([lec]))", "done(A.stageAction(lec, failed.stage, 'retry', true))", "done(A.updateLectures([lec]))",
+		// (T25 X1: the update asks first, then goes through actions.js as before)
+		"lecture_list.js": {"done(A.launchLectures([lec]))", "done(A.stageAction(lec, failed.stage, 'retry', true))", "done(updateConfirmed([lec]))", "((await confirmUpdate(ls, { named: list.length > 1 })) ? A.updateLectures(ls) : [])",
 			// L12: the row's status counts down
 			"if (U.backoffCounting(lec.stages))\n      everySecond(statusEl, () => {"},
 		"view_lecture.js": {"run(A.taskRetry(lec, 'stream'))", "run(A.taskRetry(lec, 'title'))", "run(A.stageAction(lec, st.stage, 'retry', true))",
@@ -214,7 +215,7 @@ func TestUI320Fixes(t *testing.T) {
 		t.Fatal(err)
 	}
 	url := "file:///" + strings.TrimPrefix(filepath.ToSlash(dir), "/") + "/"
-	out, err := exec.Command(node, filepath.Join("testdata", "ui320_test.mjs"), url).CombinedOutput()
+	out, err := runNode(t, node, "ui320_test.mjs", url)
 	if err != nil || !strings.Contains(string(out), "ui 3.2.0 checks: ok") {
 		t.Fatalf("ui320_test.mjs: %v\n%s", err, out)
 	}

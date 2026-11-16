@@ -25,8 +25,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -93,7 +95,128 @@ type fakeColab struct {
 	// until closed; booting is closed when that probe arrived.
 	bootGate chan struct{}
 	booting  chan struct{}
+	// faults (v3.2.x): requests that fail the first times, hang until the
+	// client gives up, or lose their connection (fault).
+	faults []*fakeFault
+	// unassignGate, when set, holds the release (POST unassign) until
+	// closed; unassigning is closed when it arrived.
+	unassignGate chan struct{}
+	unassigning  chan struct{}
+	// assignGate, when set, holds the next POST assign until closed (the
+	// runtime is assigned when it goes on); assigning is closed when it
+	// arrived.
+	assignGate chan struct{}
+	assigning  chan struct{}
+	// probes counts GET /api/kernels (the boot probe and the reconnect probes)
+	probes int
+	// multi: every POST assign gets a runtime of its own (gpu-fake-1,
+	// gpu-fake-2, ...), listed until its own unassign; live holds those
+	// still assigned. They share the one Jupyter server; its files go only
+	// when the last runtime is released.
+	multi     bool
+	nAssigned int
+	live      []string
+	// proxyTok replaces the runtime proxy token the fake hands out (nil:
+	// "fake-proxy-token"); the fake's runtime itself accepts any.
+	proxyTok atomic.Pointer[string]
+	// result replaces the result.json the worker writes ("": one sentence);
+	// declaredBytes replaces the size its done event reports (0: the real
+	// one); resultGets counts the GETs of a result.json.
+	result        string
+	declaredBytes int64
+	resultGets    int
 }
+
+// liveEndpoints returns the runtimes still assigned (multi).
+func (f *fakeColab) liveEndpoints() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.live...)
+}
+
+// fakeFault makes matching requests fail: after skip of them went through,
+// the next times (-1: every one) answer status, hang until the client gives
+// up (hang) or lose their connection without an answer (drop). With apply a
+// Contents API PUT is written first: the answer is lost, not the request.
+type fakeFault struct {
+	method string // "" = any
+	suffix string // of the request path
+	chunk  int    // 0 = any; else the PUT's "chunk"
+	skip   int
+	times  int
+	status int
+	hang   bool
+	drop   bool
+	apply  bool
+	hits   int // how many requests it failed
+}
+
+// fault adds ft and returns it (faultHits tells how often it struck).
+func (f *fakeColab) fault(ft fakeFault) *fakeFault {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := &ft
+	f.faults = append(f.faults, p)
+	return p
+}
+
+func (f *fakeColab) faultHits(ft *fakeFault) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return ft.hits
+}
+
+// clearFaults removes every fault: the runtime answers again.
+func (f *fakeColab) clearFaults() {
+	f.mu.Lock()
+	f.faults = nil
+	f.mu.Unlock()
+}
+
+func (f *fakeColab) wasReleased() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.released
+}
+
+// faultFor returns the fault that strikes this request, if any.
+func (f *fakeColab) faultFor(r *http.Request, body []byte) *fakeFault {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, ft := range f.faults {
+		if ft.method != "" && ft.method != r.Method || !strings.HasSuffix(r.URL.Path, ft.suffix) {
+			continue
+		}
+		if ft.chunk != 0 {
+			var m struct {
+				Chunk int `json:"chunk"`
+			}
+			if json.Unmarshal(body, &m) != nil || m.Chunk != ft.chunk {
+				continue
+			}
+		}
+		if ft.skip > 0 {
+			ft.skip--
+			continue
+		}
+		if ft.times == 0 {
+			continue
+		}
+		if ft.times > 0 {
+			ft.times--
+		}
+		ft.hits++
+		return ft
+	}
+	return nil
+}
+
+// lostAnswer is a ResponseWriter whose answer never reaches the client.
+type lostAnswer struct{ h http.Header }
+
+func (d lostAnswer) Header() http.Header       { return d.h }
+func (lostAnswer) Write(b []byte) (int, error) { return len(b), nil }
+func (lostAnswer) WriteHeader(int)             {}
 
 func newFakeColab(t *testing.T) *fakeColab {
 	f := &fakeColab{t: t, files: map[string][]byte{}, dirs: map[string]bool{}, kernels: map[string]bool{},
@@ -123,7 +246,8 @@ func (f *fakeColab) options(o *Options) {
 }
 
 // hold makes the lecture of job directory name wait in its transcription
-// until release(name).
+// until release(name); name "*" holds every lecture without a gate of its
+// own.
 func (f *fakeColab) hold(name string) {
 	f.mu.Lock()
 	f.gates[name] = make(chan struct{})
@@ -163,12 +287,34 @@ func (f *fakeColab) writeJSON(w http.ResponseWriter, status int, xssi bool, v an
 }
 
 func (f *fakeColab) proxy() map[string]any {
-	return map[string]any{"token": "fake-proxy-token", "tokenExpiresInSeconds": 3600, "url": f.srv.URL + "/rt"}
+	tok := "fake-proxy-token"
+	if p := f.proxyTok.Load(); p != nil {
+		tok = *p
+	}
+	return map[string]any{"token": tok, "tokenExpiresInSeconds": 3600, "url": f.srv.URL + "/rt"}
 }
 
 func (f *fakeColab) serve(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
 	body, _ := io.ReadAll(r.Body)
+	if ft := f.faultFor(r, body); ft != nil {
+		if ft.apply && strings.HasPrefix(p, "/rt/api/contents/") {
+			f.serveContents(lostAnswer{h: http.Header{}}, r, strings.TrimPrefix(p, "/rt/api/contents/"), body)
+		}
+		switch {
+		case ft.hang:
+			<-r.Context().Done() // until the client gives up (or the test ends)
+		case ft.drop:
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					conn.Close()
+				}
+			}
+		default:
+			http.Error(w, "fake fault", ft.status)
+		}
+		return
+	}
 	switch {
 	case p == "/oauth/token":
 		f.writeJSON(w, 200, false, map[string]any{"access_token": "ya29.fake", "expires_in": 3599,
@@ -206,15 +352,33 @@ func (f *fakeColab) serve(w http.ResponseWriter, r *http.Request) {
 		f.writeJSON(w, 200, true, map[string]any{"acc": r.URL.Query().Get("accelerator"), "nbh": "nbh", "token": "xsrf-fake", "variant": "GPU", "p": p})
 	case p == "/colab/tun/m/assign" && r.Method == http.MethodPost:
 		f.mu.Lock()
+		gate, arrived := f.assignGate, f.assigning
+		f.assignGate, f.assigning = nil, nil
+		f.mu.Unlock()
+		if gate != nil {
+			close(arrived)
+			<-gate
+		}
+		f.mu.Lock()
 		f.assigned, f.released = true, false
 		f.accelerator = r.URL.Query().Get("accelerator")
-		acc := f.accelerator
+		acc, ep := f.accelerator, "gpu-fake-1"
+		if f.multi {
+			f.nAssigned++
+			ep = fmt.Sprintf("gpu-fake-%d", f.nAssigned)
+			f.live = append(f.live, ep)
+		}
 		f.mu.Unlock()
-		f.writeJSON(w, 200, true, map[string]any{"accelerator": acc, "endpoint": "gpu-fake-1", "runtimeProxyInfo": f.proxy(), "variant": 1})
+		f.writeJSON(w, 200, true, map[string]any{"accelerator": acc, "endpoint": ep, "runtimeProxyInfo": f.proxy(), "variant": 1})
 	case p == "/colab/tun/m/assignments":
 		f.mu.Lock()
 		var list []any
-		if f.assigned {
+		if f.multi {
+			for _, ep := range f.live {
+				list = append(list, map[string]any{"accelerator": f.accelerator, "endpoint": ep, "variant": 1, "machineShape": 0,
+					"runtimeProxyInfo": f.proxy()})
+			}
+		} else if f.assigned {
 			list = append(list, map[string]any{"accelerator": f.accelerator, "endpoint": "gpu-fake-1", "variant": 1, "machineShape": 0,
 				"runtimeProxyInfo": f.proxy()})
 		}
@@ -223,6 +387,30 @@ func (f *fakeColab) serve(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(p, "/colab/tun/m/unassign/"):
 		if r.Method == http.MethodPost {
 			f.mu.Lock()
+			gate, arrived := f.unassignGate, f.unassigning
+			f.unassigning = nil
+			f.mu.Unlock()
+			if gate != nil {
+				if arrived != nil {
+					close(arrived)
+				}
+				select {
+				case <-gate:
+				case <-r.Context().Done():
+					return
+				}
+			}
+			f.mu.Lock()
+			if f.multi {
+				ep := strings.TrimPrefix(p, "/colab/tun/m/unassign/")
+				f.live = slices.DeleteFunc(f.live, func(x string) bool { return x == ep })
+				f.released = true
+				if len(f.live) > 0 {
+					f.mu.Unlock()
+					f.writeJSON(w, 200, true, map[string]any{})
+					return
+				}
+			}
 			f.assigned, f.released, f.workerReady = false, true, false
 			f.files, f.dirs = map[string][]byte{}, map[string]bool{}
 			f.mu.Unlock()
@@ -234,6 +422,7 @@ func (f *fakeColab) serve(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		gate, booting := f.bootGate, f.booting
 		f.bootGate = nil
+		f.probes++
 		f.mu.Unlock()
 		if gate != nil {
 			close(booting)
@@ -302,6 +491,9 @@ func (f *fakeColab) serveContents(w http.ResponseWriter, r *http.Request, path s
 		f.uploadSpans[path] = span
 		w.WriteHeader(201)
 	case http.MethodGet:
+		if strings.HasSuffix(path, "/result.json") {
+			f.resultGets++
+		}
 		data, ok := f.files[path]
 		if !ok {
 			http.Error(w, "no", 404)
@@ -496,6 +688,9 @@ func (f *fakeColab) serveWS(w http.ResponseWriter, r *http.Request) {
 	f.running++
 	f.maxRunning = max(f.maxRunning, f.running)
 	gate := f.gates[name]
+	if gate == nil {
+		gate = f.gates["*"] // hold("*"): every lecture, whatever its directory name
+	}
 	f.mu.Unlock()
 	defer func() {
 		f.mu.Lock()
@@ -531,12 +726,19 @@ func (f *fakeColab) serveWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	result := `{"prompt_terms_used":0,"sentences":[{"start_ms":0,"end_ms":500,"text":"x","low_conf_words":[],"words":[]}]}`
-	sum := sha256.Sum256([]byte(result))
 	f.mu.Lock()
+	if f.result != "" {
+		result = f.result
+	}
+	size := int64(len(result))
+	if f.declaredBytes > 0 {
+		size = f.declaredBytes
+	}
 	f.files[jobDir+"/result.json"] = []byte(result)
 	f.mu.Unlock()
+	sum := sha256.Sum256([]byte(result))
 	lines(map[string]any{"type": "progress", "fraction": 1.0}, map[string]any{"type": "stage", "stage": "write"},
-		map[string]any{"type": "done", "result": "result.json", "sha256": hex.EncodeToString(sum[:]), "bytes": len(result),
+		map[string]any{"type": "done", "result": "result.json", "sha256": hex.EncodeToString(sum[:]), "bytes": size,
 			"audio_s": 600.0, "load_s": 0.0, "transcribe_s": 60.0, "sentences": 1})
 	end("ok")
 }
@@ -560,7 +762,8 @@ func newFakeEnv(t *testing.T, set Settings, mods ...func(*Options)) *fakeEnv {
 	clk := newFakeClock()
 	lg, lb := newTestLogger()
 	o := Options{KV: kv, WorkerDir: workerDir(t), FFmpeg: "ffmpeg", RunFFmpeg: fakeFFmpeg(300), Logger: lg, Now: clk.Now,
-		Sleep: clk.Sleep, RunID: "run-1", AllowHTTP: true, ChunkSize: 100, ADCPath: filepath.Join(t.TempDir(), "absent.json")}
+		Sleep: clk.Sleep, RunID: "run-1", AllowHTTP: true, ChunkSize: 100, ADCPath: filepath.Join(t.TempDir(), "absent.json"),
+		Retry: RetryOptions{Jitter: -1}} // exact waits; the jitter has its own test
 	f.options(&o)
 	for _, m := range mods {
 		m(&o)

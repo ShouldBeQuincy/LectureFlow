@@ -274,28 +274,53 @@ export function createColabLogin({ rerender, onAuthorized = () => {}, taskId = (
     return null;
   }
 
+  // R91 low-5: the sign-in's live regions (a failure's alert; waiting and
+  // importing, status) stay the same nodes while they are shown and say
+  // the same, so that a caller putting them in place (keepChildren) leaves
+  // them where they are through its redraws and a screen reader does not
+  // read them again (as R81 L8 for the install's view). One that says
+  // something else, or is shown again after it was gone, is a new node.
+  // Two places: the refused request's failure, the sign-in's state.
+  const live = { error: null, state: null }; // place → {key, el}
+  function kept(place, used, key, make) {
+    used.add(place);
+    const k = live[place];
+    if (k && k.key === key) return k.el;
+    const el = make();
+    live[place] = { key, el };
+    return el;
+  }
+
   /** The sign-in's state: waiting (with the link), importing, failed, cancelled, or a hint. */
   function loginBlock({ idleHint = true } = {}) {
     const l = S.login || { state: 'idle' };
     const out = [];
-    if (S.loginError) out.push(failure(S.loginError, S.loginDetail));
+    const used = new Set();
+    const failureKey = (text, detail) => JSON.stringify(['failed', text, detail, t('onboarding.remote.details')]);
+    if (S.loginError) out.push(kept('error', used, failureKey(S.loginError, S.loginDetail), () => failure(S.loginError, S.loginDetail)));
     if (l.state === 'waiting') {
       out.push(
-        h(
-          'div',
-          { class: 'ob-callout is-info', role: 'status' },
-          icon('loader-circle', { size: 16, class: 'spin' }),
-          h('div', null, h('p', null, t('onboarding.remote.waiting')), l.url ? h('p', null, linkFallback(l.url)) : null),
+        kept('state', used, JSON.stringify(['waiting', t('onboarding.remote.waiting'), l.url || '', t('onboarding.remote.open_link')]), () =>
+          h(
+            'div',
+            { class: 'ob-callout is-info', role: 'status' },
+            icon('loader-circle', { size: 16, class: 'spin' }),
+            h('div', null, h('p', null, t('onboarding.remote.waiting')), l.url ? h('p', null, linkFallback(l.url)) : null),
+          ),
         ),
       );
     } else if (l.state === 'importing') {
-      out.push(h('p', { class: 'ob-callout is-info', role: 'status' }, icon('loader-circle', { size: 16, class: 'spin' }), h('span', null, t('onboarding.remote.importing'))));
+      out.push(kept('state', used, JSON.stringify(['importing', t('onboarding.remote.importing')]), () => h('p', { class: 'ob-callout is-info', role: 'status' }, icon('loader-circle', { size: 16, class: 'spin' }), h('span', null, t('onboarding.remote.importing')))));
     } else if (l.state === 'failed') {
-      out.push(failure(U.errorInfoText(l.error, t('common.unknown_error')), (l.error && l.error.detail) || ''));
+      const text = U.errorInfoText(l.error, t('common.unknown_error'));
+      const detail = (l.error && l.error.detail) || '';
+      out.push(kept('state', used, failureKey(text, detail), () => failure(text, detail)));
     } else if (!S.loginError) {
       if (l.state === 'cancelled') out.push(h('p', { class: 'ob-hint' }, t('onboarding.remote.cancelled')));
       if (idleHint) out.push(h('p', { class: 'ob-hint' }, gcloudReady() ? t('onboarding.remote.login_hint') : t('onboarding.remote.wait_download')));
     }
+    // not shown now: shown again later, it is new
+    for (const place of Object.keys(live)) if (!used.has(place)) live[place] = null;
     return out;
   }
 

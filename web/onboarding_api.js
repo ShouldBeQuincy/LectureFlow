@@ -8,6 +8,7 @@
 
 import { api, ApiError, errorText, MOCK, MOCK_SCENARIO } from './api.js';
 import { t } from './i18n.js';
+import { toast } from './dom.js';
 
 function withMock(path) {
   if (!MOCK) return path;
@@ -19,6 +20,11 @@ let onError = null;
 /** The handler for failed requests that are not quiet (the onboarding page shows a toast). */
 export function setErrorHandler(fn) {
   onError = fn;
+}
+
+/** The handler set now (the settings' preset dialog puts back only its own). */
+export function errorHandler() {
+  return onError;
 }
 
 async function request(method, path, body, opts = {}) {
@@ -115,11 +121,34 @@ export function desktop() {
   return typeof window !== 'undefined' && window.lectureflow && typeof window.lectureflow === 'object' ? window.lectureflow : null;
 }
 
+// The desktop shell opens at most 3 links in 10 seconds and refuses the
+// next one (desktop/src/main/ipc.js, lib/ratelimit.js). Its error reaches
+// the page through IPC as "Error invoking remote method
+// 'lf:open-external': Error: openExternal: too many links in a short
+// time", so the main process's own words are looked for anywhere in it.
+const LINK_THROTTLED = 'too many links in a short time';
+
+/** Whether openExternal's rejection is the shell's link limit. */
+export function linkThrottled(err) {
+  const msg = err && typeof err === 'object' ? err.message : err;
+  return typeof msg === 'string' && msg.includes(LINK_THROTTLED);
+}
+
+/**
+ * The catch of every window.lectureflow.openExternal call: a link refused
+ * by the shell's limit says so in a notice (r4: a click that did nothing,
+ * with no reason given); any other failure (no user activation, a URL the
+ * shell refuses) stays silent as before.
+ */
+export function externalLinkFailed(err) {
+  if (linkThrottled(err)) toast(t('common.link_throttled'), 'info');
+}
+
 /** Opens an external page: through the desktop shell, else a new tab. */
 export function openExternal(url) {
   const d = desktop();
   if (d && typeof d.openExternal === 'function') {
-    d.openExternal(url).catch(() => {});
+    Promise.resolve(d.openExternal(url)).catch(externalLinkFailed);
     return;
   }
   window.open(url, '_blank', 'noopener');

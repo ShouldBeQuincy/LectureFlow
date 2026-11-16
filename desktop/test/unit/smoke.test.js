@@ -8,9 +8,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
-const { updateMechanism, expectedUpdates, smokeEnv } = require('../../scripts/smoke');
+const { updateMechanism, expectedUpdates, smokeEnv, smokeDirs, removeRoot } = require('../../scripts/smoke');
 const { updateFeedNote } = require('../../src/main/lib/updatefeed');
 
 const READY = '2026-10-27T16:00:09.408Z INFO service ready on port 51247 (attempt 1)\n';
@@ -88,16 +89,95 @@ test('smoke: the app gets its own data dir and no browser extension endpoint', (
     });
     delete process.env.LECTUREFLOW_NM_ENDPOINT;
     const dir = path.join(path.parse(process.cwd()).root, 'lf-smoke-x');
-    const env = smokeEnv(dir);
+    const user = path.join(path.parse(process.cwd()).root, 'lf-smoke-x-user');
+    const env = smokeEnv(dir, user);
     assert.equal(env.LECTUREFLOW_DATA_DIR, dir);
     // Off: the service would otherwise register the browsers' native
     // messaging host of this temporary build over an installed LectureFlow's.
     assert.equal(env.LECTUREFLOW_NM_ENDPOINT, 'off');
     for (const k of ['LECTUREFLOW_SERVER', 'LECTUREFLOW_RESOURCES', 'ELECTRON_RUN_AS_NODE', 'LECTUREFLOW_E2E_ALLOW_DEBUG']) assert.equal(env[k], undefined, k);
     process.env.LECTUREFLOW_NM_ENDPOINT = '\\\\.\\pipe\\lf-smoke-test';
-    assert.equal(smokeEnv(dir).LECTUREFLOW_NM_ENDPOINT, '\\\\.\\pipe\\lf-smoke-test', 'an endpoint the caller chose is kept');
+    assert.equal(smokeEnv(dir, user).LECTUREFLOW_NM_ENDPOINT, '\\\\.\\pipe\\lf-smoke-test', 'an endpoint the caller chose is kept');
   } finally {
     for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
     Object.assign(process.env, saved);
   }
+});
+
+test('smoke: the app gets no model service key from the caller\'s environment (T27 P4)', () => {
+  const saved = { ...process.env };
+  try {
+    // made-up values; they replace whatever the caller's shell holds for the test
+    const keys = ['DEEPSEEK_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'ZHIPUAI_API_KEY', 'Some_Service_Api_Key'];
+    for (const k of keys) process.env[k] = 'sk-smoke-test-not-a-key';
+    process.env.LF_SMOKE_API_KEYRING = 'kept';
+    process.env.LF_SMOKE_KEEP = 'kept';
+    const dir = path.join(path.parse(process.cwd()).root, 'lf-smoke-x');
+    const user = path.join(path.parse(process.cwd()).root, 'lf-smoke-x-user');
+    const env = smokeEnv(dir, user);
+    // presence only: a failing check never prints a value
+    for (const k of keys) assert.ok(!Object.prototype.hasOwnProperty.call(env, k), `${k} reaches the app`);
+    assert.ok(!Object.keys(env).some((k) => /_api_key$/i.test(k)), 'a variable ending in _API_KEY reaches the app');
+    // the rest of the environment is passed on as before
+    assert.equal(env.LF_SMOKE_KEEP, 'kept');
+    assert.equal(env.LF_SMOKE_API_KEYRING, 'kept', 'only names ending in _API_KEY are dropped');
+    assert.equal(env.LECTUREFLOW_DATA_DIR, dir);
+  } finally {
+    for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+    Object.assign(process.env, saved);
+  }
+});
+
+test('smoke: the app\'s per-user folders lie in the run\'s temporary root, never the real account\'s (T14)', () => {
+  const saved = { ...process.env };
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lf-smoke-test-'));
+  try {
+    // the real account's folders (made up): none of them may reach the app
+    const real = path.join(path.parse(process.cwd()).root, 'Users', 'someone', 'AppData');
+    Object.assign(process.env, {
+      LOCALAPPDATA: path.join(real, 'Local'), APPDATA: path.join(real, 'Roaming'), TEMP: path.join(real, 'Local', 'Temp'), TMP: path.join(real, 'Local', 'Temp'),
+    });
+    const d = smokeDirs('lf-smoke-', tmp);
+    assert.equal(path.dirname(d.root), tmp);
+    assert.ok(path.basename(d.root).startsWith('lf-smoke-'));
+    const env = smokeEnv(d.dataDir, d.userRoot);
+    assert.equal(env.LECTUREFLOW_DATA_DIR, d.dataDir);
+    for (const k of ['LECTUREFLOW_DATA_DIR', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP']) {
+      const rel = path.relative(d.root, env[k]);
+      assert.ok(rel && !rel.startsWith('..') && !path.isAbsolute(rel), `${k} lies below the run's root: ${env[k]}`);
+      assert.ok(fs.statSync(env[k]).isDirectory(), `${k} exists`);
+      assert.ok(!env[k].startsWith(real), `${k} is not the real account's`);
+    }
+    assert.notEqual(env.LOCALAPPDATA, env.APPDATA);
+    assert.equal(env.TEMP, env.TMP);
+    const rel = path.relative(env.LECTUREFLOW_DATA_DIR, env.LOCALAPPDATA);
+    assert.ok(rel.startsWith('..'), 'the per-user folders are not in the data folder (the service refuses a trust folder there)');
+    assert.throws(() => smokeEnv(d.dataDir), /userRoot/, 'no run without its own per-user folders');
+    assert.throws(() => smokeEnv(d.dataDir, 'relative'), /userRoot/);
+    // removing the root removes everything
+    fs.rmSync(d.root, { recursive: true, force: true });
+    assert.deepEqual(fs.readdirSync(tmp), []);
+  } finally {
+    for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+    Object.assign(process.env, saved);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('smoke: a temporary root that cannot be removed is a warning, not the run\'s result (SEC29 低-2)', () => {
+  const warnings = [];
+  const busy = () => {
+    const err = new Error('EBUSY: resource busy or locked, rmdir');
+    err.code = 'EBUSY';
+    throw err;
+  };
+  assert.doesNotThrow(() => removeRoot(path.join(os.tmpdir(), 'lf-smoke-x'), busy, (m) => warnings.push(m)));
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /could not remove the temporary folder .*lf-smoke-x.*EBUSY/);
+  // removed: no warning
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lf-smoke-test-'));
+  fs.writeFileSync(path.join(tmp, 'f'), 'x');
+  removeRoot(tmp, undefined, (m) => warnings.push(m));
+  assert.equal(fs.existsSync(tmp), false);
+  assert.equal(warnings.length, 1);
 });

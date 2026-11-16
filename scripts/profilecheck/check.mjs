@@ -12,7 +12,8 @@
 //    extension/fixtures holds <id>/<scenario>.json, <id> being a profile id
 //    or "generic"; nothing else (no HAR files, screenshots, notes).
 // 2. Profiles: the extension's own checkProfile (the JSON Schema plus what
-//    a schema cannot say: regexes compile, one capture group, unique roles,
+//    a schema cannot say: regexes compile and cannot backtrack out of
+//    control (regexComplexity), one capture group, unique roles,
 //    nothing on the do-not-handle list — YouTube, MOOCs and online / paid
 //    course platforms, extension/src/lib/blocklist.js, hosts and blocked
 //    paths alike), so a profile valid here imports in the extension; the

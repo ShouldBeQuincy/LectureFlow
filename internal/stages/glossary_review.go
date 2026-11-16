@@ -84,11 +84,21 @@ func (s *glossaryReviewStage) Run(ctx context.Context, courseID string, progress
 	// solve asks for one batch; an answer cut off at the output limit
 	// (llm.ErrTruncated) is asked again as two halves in en_key order, in
 	// parallel, down to janitorMinSplit entries (lead ruling after the real
-	// acceptance: the model may act on nearly every entry).
+	// acceptance: the model may act on nearly every entry). A batch that can
+	// still be split skips the client's truncation ladder (T-PERF-07, user
+	// 2026-11-11): its first truncation splits it at once instead of sending
+	// it twice more with a doubled limit, from scratch, while the course's
+	// transcription waits. A batch below janitorMinSplit, which cannot be
+	// split, keeps the ladder (a lower thinking level, then a doubled limit)
+	// before the run fails as before.
 	var solve func(ctx context.Context, entries []model.Term) ([]janitorAction, error)
 	solve = func(ctx context.Context, entries []model.Term) ([]janitorAction, error) {
 		req := b.Request(entries)
-		a, err := askJSON(ctx, d.LLM, s.role, req.System, req.User, checkJanitorAnswer)
+		actx := ctx
+		if len(entries) >= janitorMinSplit {
+			actx = llm.WithNoTruncationRetry(ctx)
+		}
+		a, err := askJSON(actx, d.LLM, s.role, req.System, req.User, checkJanitorAnswer)
 		if err == nil {
 			mu.Lock()
 			answered += len(entries)
@@ -356,6 +366,7 @@ var whyText = map[string]string{
 	WhyTargetGone:    "合并目标在本次整理中被停用或合并",
 	WhyNoZh:          "缺少译法（zh）",
 	WhyUserZh:        "译法由用户设定，清道夫不能修改",
+	WhyZhTooLong:     "译法太长，超过术语译名的长度上限",
 }
 
 // applyJanitor validates the actions against the glossary as it is now (it
@@ -364,8 +375,10 @@ var whyText = map[string]string{
 // report is stored either way (glossary.SaveRunReport). Validation: the id
 // must exist and be unlocked; one action per id (the first counts); merge
 // needs an existing, enabled target other than itself that this run does
-// not disable or merge away; fix_zh needs a zh and never replaces a user's
-// zh (G6 rule 3). Actions that would change nothing (same tier, already
+// not disable or merge away; fix_zh needs a zh, never replaces a user's
+// zh (G6 rule 3) and gives none over ctxbuild.TermZhMaxChars (AUD5 low-1,
+// the limit of every other path that writes a zh). Actions that would
+// change nothing (same tier, already
 // disabled, the same zh after fixZh) are dropped and only counted.
 // Merges are applied after the other actions; a merge fills the target's
 // empty zh when the target is unlocked and its zh came from the extractor:
@@ -438,6 +451,8 @@ func applyJanitor(ctx context.Context, st db.Store, courseID string, acts []jani
 					why = WhyNoZh
 				case t.ZhSource == model.ZhSourceUser:
 					why = WhyUserZh
+				case ctxbuild.TermTooLong("", *a.Zh):
+					why = WhyZhTooLong
 				}
 			default:
 				why = WhyUnknownAction

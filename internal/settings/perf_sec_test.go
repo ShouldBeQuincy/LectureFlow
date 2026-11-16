@@ -11,9 +11,19 @@ import (
 
 // TestProviderKeyStaysWithItsHost (sec2-app L2): moving base_url to another
 // origin clears the key unless the same patch brings a new one; a change
-// within the origin (path, case, default port) keeps it.
+// within the origin (path, case, default port) keeps it. Also with a data
+// key (sec3 L3): the key is sealed bound to the origin, and every key the
+// settings keep still opens (SameOrigin and the binding agree).
 func TestProviderKeyStaysWithItsHost(t *testing.T) {
-	s, _ := newService(t)
+	t.Run("plain", testProviderKeyStaysWithItsHost)
+	t.Run("sealed", func(t *testing.T) {
+		useDataKey(t, 7)
+		testProviderKeyStaysWithItsHost(t)
+	})
+}
+
+func testProviderKeyStaysWithItsHost(t *testing.T) {
+	s, st := newService(t)
 	p := create(t, s, "DS", model.ProviderOpenAI, "https://api.deepseek.com", fakeKey)
 	steps := []struct {
 		base, key string
@@ -27,6 +37,7 @@ func TestProviderKeyStaysWithItsHost(t *testing.T) {
 		{"http://evil.example:8080", "sk-other-5678", "sk-other-5678"},
 		{"http://evil.example:8081", "", ""}, // another port
 	}
+	store := st
 	for i, st := range steps {
 		in := ProviderInput{BaseURL: sp(st.base)}
 		if st.key != "" {
@@ -41,6 +52,9 @@ func TestProviderKeyStaysWithItsHost(t *testing.T) {
 		}
 		if got, _ := s.Provider(p.ID); got.APIKey != st.wantKey {
 			t.Fatalf("step %d: stored key %q", i, got.APIKey)
+		}
+		if got, _ := store.GetProvider(bg(), p.ID); got.APIKey != st.wantKey {
+			t.Fatalf("step %d: the database reads key %q", i, got.APIKey)
 		}
 	}
 	// A patch without base_url never touches the key.

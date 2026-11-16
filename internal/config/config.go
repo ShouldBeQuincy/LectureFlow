@@ -130,6 +130,12 @@ type ASR struct {
 // DefaultWorkerMemBudgetMB is ASR.WorkerMemBudgetMB's default (8 GB).
 const DefaultWorkerMemBudgetMB = 8192
 
+// DefaultVRAMPerJobMB is vram_per_job_mb's default (SPEC §2 / §17.2; the
+// only default it ever had, config.example.toml too). Since r2 T-PERF-02
+// a stored value equal to it counts as "not chosen": the per-model
+// estimates apply (devices.VRAMBaseMB).
+const DefaultVRAMPerJobMB = 5000
+
 type Provider struct {
 	BaseURL           string `toml:"base_url"`
 	APIKey            string `toml:"api_key"`
@@ -453,7 +459,7 @@ func (c *Config) applyDefaults() {
 		a.Language = "en"
 	}
 	if a.VRAMPerJobMB == 0 {
-		a.VRAMPerJobMB = 5000
+		a.VRAMPerJobMB = DefaultVRAMPerJobMB
 	}
 	if a.MaxParallel == 0 {
 		a.MaxParallel = 1

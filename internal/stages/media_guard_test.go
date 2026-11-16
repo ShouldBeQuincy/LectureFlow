@@ -72,7 +72,7 @@ func hasOptions(opts, want []string) bool {
 // option (after -i) from a right one.
 func TestMediaInputArgsPosition(t *testing.T) {
 	media, out := filepath.Join(t.TempDir(), "in.mp4"), filepath.Join(t.TempDir(), "out.tmp")
-	if a := audioArgs(media, out); !inputGuarded(a, media) || a[len(a)-1] != out {
+	if a := audioArgs(media, out, nil); !inputGuarded(a, media) || a[len(a)-1] != out {
 		t.Errorf("audio.wav args %v", a)
 	}
 	info := mediaInfo{Video: &mediaStream{Index: 0, Codec: "h264"}, Audio: &mediaStream{Index: 1, Codec: "aac"}}
@@ -406,7 +406,7 @@ func TestRealPrepRefusesPlaylists(t *testing.T) {
 	pl := filepath.Join(dir, "media.m3u8")
 	e.must(os.WriteFile(pl, []byte(hls), 0o644))
 	ps := &prepStage{d: e.deps(nil), media: tools}
-	err := ps.convertAudio(e.ctx, tools, model.Lecture{MediaPath: pl}, dir, pl, func(float64) {})
+	err := ps.convertAudio(e.ctx, tools, model.Lecture{MediaPath: pl}, dir, pl, nil, func(float64) {})
 	if codeOf(err) != MediaFormatRejected || !sched.IsPermanent(err) {
 		t.Errorf("audio.wav from a playlist: %v", err)
 	}

@@ -23,7 +23,7 @@
     "message": "已连接 LectureFlow"
   },
   "connConnectedVersion": {
-    "message": "LectureFlow $P1$",
+    "message": "已连接 · $P1$",
     "description": "Connected, with app version",
     "placeholders": {
       "p1": {
@@ -71,12 +71,25 @@
   "noAccess": {
     "message": "扩展读不到这个页面。"
   },
+  "pageLoading": {
+    "message": "页面还在加载，请稍后再试。",
+    "description": "Popup: the page did not finish loading before detection gave up waiting"
+  },
   "noTracks": {
     "message": "没探测到轨道"
   },
   "tracksDetected": {
     "message": "探测到 $P1$ 条轨道",
     "description": "Header with the track count",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "tracksDetectedOne": {
+    "message": "探测到 $P1$ 条轨道",
+    "description": "Header with the track count when exactly one track was found (singular where the language needs it)",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -96,7 +109,7 @@
     }
   },
   "sourceGeneric": {
-    "message": "通用探测"
+    "message": "在页面上找到"
   },
   "unreviewed": {
     "message": "未审核",
@@ -126,7 +139,7 @@
     "message": "推荐"
   },
   "unreadable": {
-    "message": "清单读不到"
+    "message": "读不到这条轨道的信息，可能无法刮削"
   },
   "kind_video": {
     "message": "视频"
@@ -180,7 +193,7 @@
     "message": "无法为这个页面生成报告。"
   },
   "reportSaved": {
-    "message": "报告已保存。分享前请先看一遍。"
+    "message": "报告已保存到浏览器保存文件的位置。它是给开发者用来支持这个网站的，不会自动发送。文件已脱敏，但保留了这个网站的地址；分享前请先看一遍。"
   },
   "finding_email": {
     "message": "有内容像邮箱地址。"
@@ -219,7 +232,7 @@
     "message": "对策文件"
   },
   "profilesHint": {
-    "message": "对策文件为平台的轨道命名。本地导入的标“未审核”，并优先使用。"
+    "message": "对策文件是告诉扩展某个录播平台的轨道叫什么、默认选哪条的小文件，常见平台已经内置。本地导入的标“未审核”，并优先使用。"
   },
   "importProfile": {
     "message": "导入本地对策文件"
@@ -327,7 +340,7 @@
   },
   "titleGenerated": {
     "message": "标题由 LectureFlow 生成",
-    "description": "Generic detection reads no title"
+    "description": "No title to show: the page has none, or only a placeholder or the site name; LectureFlow names the lecture"
   },
   "durationMinutes": {
     "message": "$P1$ 分钟",
@@ -367,7 +380,7 @@
     "description": "Course select label"
   },
   "courseNone": {
-    "message": "LectureFlow 里还没有课程。请先在 LectureFlow 里新建一门课程。",
+    "message": "LectureFlow 里还没有课程。",
     "description": "No courses"
   },
   "sendButton": {
@@ -393,6 +406,15 @@
   "selectTrack": {
     "message": "选择 $P1$",
     "description": "Checkbox label",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "trackOnHost": {
+    "message": "在 $P1$ 上",
+    "description": "Track list: in a track’s small line, after its kind and quality, when the track is on another site than the page (EU-03; AUD3 中-1). $P1$ is a host name such as media.example.net (never a path)",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -448,7 +470,7 @@
     "description": "Fetch task state"
   },
   "state_failed": {
-    "message": "刮削失败",
+    "message": "失败",
     "description": "Fetch task state"
   },
   "state_needs_refresh": {
@@ -587,7 +609,7 @@
     "description": "Options section"
   },
   "reportsHint": {
-    "message": "导出已脱敏的探测报告，用来编写或改进对策文件。在录播页上点一次扩展图标后，那个页面会列在这里。",
+    "message": "探测报告是给开发者的文件，用来让 LectureFlow 支持新的录播网站或改进已有的支持（编写对策文件）。报告已脱敏：不含 Cookie；网址保留网站名和路径（路径里较长的编号换成同形的假值），参数值换成占位符；讲座标题等页面文字只留格式；发现疑似个人信息时不会导出。不会自动发送，分享前请先看一遍。在录播页上点一次扩展图标后，那个页面会列在这里。",
     "description": "Options: reports"
   },
   "reportsEmpty": {
@@ -597,6 +619,18 @@
   "reportRow": {
     "message": "$P1$ · $P2$ 条轨道",
     "description": "Options: one page",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "reportRowOne": {
+    "message": "$P1$ · $P2$ 条轨道",
+    "description": "Options: one page with exactly one track (singular where the language needs it)",
     "placeholders": {
       "p1": {
         "content": "$1"
@@ -777,6 +811,15 @@
       }
     }
   },
+  "tracksHidden": {
+    "message": "还有 $P1$ 条轨道未显示（轨道太多）",
+    "description": "Track list: how many tracks are left out because the page gave too many to list (they cannot be chosen); $1 is a number",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
   "offerEmbedded": {
     "message": "这页嵌着 $P1$。允许访问 $P1$ 网站并刷新页面后，就能在这里发送。",
     "description": "Popup: a platform frame not readable yet",
@@ -881,7 +924,7 @@
     "description": "Bulk row"
   },
   "bulkQueued": {
-    "message": "已加入队列",
+    "message": "排队中",
     "description": "Bulk row"
   },
   "bulkFailed": {
@@ -1016,6 +1059,47 @@
     "message": "未启用：与内置的对策文件同名，需要重新导入并确认",
     "description": "Settings: chip on a local profile with a built-in profile’s id that was never confirmed"
   },
+  "profileInvalid": {
+    "message": "未启用：这个本地对策文件已不再通过检查（$P1$），请修改后重新导入",
+    "description": "Settings: chip on a local profile that no longer passes the profile checks (for example a sessionInfo POST stored before local profiles were limited to GET); $1 is the first problem, as \"path message\" in English",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "profileTooSlow": {
+    "message": "未启用：规则 $P1$ 匹配太慢（$P2$ 毫秒）。修改文件后重新导入即可再次启用",
+    "description": "Settings: chip on a local profile stopped by the runtime regex guard (one match too slow, or too much time in all); $1 is the place of the rule in the file (\"/tracks/1/detect/urlPattern\"), $2 the milliseconds",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "profileTooSlowBuiltin": {
+    "message": "未启用：内置对策文件的规则 $P1$ 在这台电脑上匹配太慢（$P2$ 毫秒）。这是 LectureFlow 的问题，请向我们报告；更新扩展后会再次尝试",
+    "description": "Settings: chip on a built-in profile stopped by the runtime regex guard (several slow matches, or one very slow); $1 is the place of the rule, $2 the milliseconds",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "profileReenable": {
+    "message": "重新启用",
+    "description": "Settings: button on a built-in profile stopped as too slow: use it again"
+  },
+  "policyStopped": {
+    "message": "无法判断是否受政策限制：对策文件匹配太慢，已停用",
+    "description": "Popup and in-page card: chip when the runtime regex guard stopped the platform profile during this detection, so the restriction switch could not be read"
+  },
   "embedWhy": {
     "message": "这个录播页面嵌在 $P1$ 的网页里。为了防止其他网站诱导你点击，请在这个窗口里确认。",
     "description": "Confirmation window: why it opened; $1 is the site the recording page is embedded in (an origin)",
@@ -1054,5 +1138,119 @@
   "errConfirmWindow": {
     "message": "请在 LectureFlow 的确认窗口里发送。",
     "description": "Error: this frame must confirm in the extension’s window"
+  },
+  "openApp": {
+    "message": "打开 LectureFlow",
+    "description": "Popup, not connected: LectureFlow is installed but not running; the button starts it (T26 G1)"
+  },
+  "discNotOpen": {
+    "message": "LectureFlow 已经安装，但还没有打开。点“打开 LectureFlow”启动它；如果你已经自己打开了，点“重新检测”。",
+    "description": "Popup, not connected: LectureFlow is installed but not running; opening the popup does not start it (T26 G1). Quotes openApp (starts it) and connRecheck (only looks again; SEC42 低-2)"
+  },
+  "failNetwork": {
+    "message": "网络连接出了问题，刮削没有完成。网络恢复后，在 LectureFlow 里点“重试”即可接着刮削。",
+    "description": "Queued view: the fetch failed for the network (retryable; T26 G3). “Retry” is LectureFlow’s button (downloads.action.retry)"
+  },
+  "failDisk": {
+    "message": "磁盘空间不足，或者刮削到的文件无法写入。请释放空间、检查数据目录所在的磁盘，然后在 LectureFlow 里点“重试”。",
+    "description": "Queued view: the fetch failed for the disk (no space, or not writable; retryable; T26 G3)"
+  },
+  "failEngineMissing": {
+    "message": "找不到 LectureFlow 内置的刮削工具。请重新安装 LectureFlow，然后在 LectureFlow 里点“重试”。",
+    "description": "Queued view: the fetch failed because LectureFlow’s aria2c is missing (retryable after a reinstall; T26 G3)"
+  },
+  "failUnsupported": {
+    "message": "这条轨道是直播，或者是 LectureFlow 还不支持的格式，无法刮削，重试也不会成功。如果这一页还有别的轨道，可以换一条发送。",
+    "description": "Queued view: a live stream or an unsupported format (not retryable; T26 G3)"
+  },
+  "failUnsafeAddress": {
+    "message": "这节课的轨道地址指向这台电脑或它所在的局域网，或者无法安全检查，LectureFlow 为安全起见拒绝了刮削，重试也不会成功。",
+    "description": "Queued view: the tracks’ addresses lead to this computer, the local network, or cannot be checked (not retryable; T26 G3)"
+  },
+  "failAngle": {
+    "message": "第二路画面里没有视频，无法保存为第二视角。可以选“主要音视频”重新发送。",
+    "description": "Queued view: the second picture has no video (not retryable; T26 G3). Quotes presetMain"
+  },
+  "failTooLarge": {
+    "message": "这节录像超过了单个刮削任务的大小上限，无法刮削。可能是直播，或者服务器一直在不停地发送数据。如果这一页还有别的轨道，可以换一条发送。",
+    "description": "Queued view: the recording is over the size one fetch may hold (downloads.too_large; a live stream, or a server that keeps sending; not retryable, so no “Retry”; C165b)"
+  },
+  "failNotMedia": {
+    "message": "刮削到的不是录音或录像（可能是登录页或错误页），重试也不会成功。请确认这节课在页面上能正常播放，再重新发送。",
+    "description": "Queued view: what was fetched is not a recording (an empty file, a web page, a playlist, a refused format; not retryable; T26 G3)"
+  },
+  "failedCode": {
+    "message": "刮削没有完成（代码 $P1$）。可以在 LectureFlow 里查看原因并重试。",
+    "description": "Queued view: the fetch failed with a code this version does not know (LectureFlow treats it as retryable; T26 G3)",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "failEmbeddedHint": {
+    "message": "如果录播嵌在别的网站里，可以打开播放器自己的页面再发送一次。",
+    "description": "Added after the failed note or the needs_refresh text when the platform refused the fetch (401 / 403) and the lecture may have been sent from a page that embeds the player (EU-02; SEC46 低-3): the cookies it needs may only reach the player’s own page"
+  },
+  "errOpenGone": {
+    "message": "LectureFlow 里已经没有这节课或这个刮削任务了，可能已被删除或移除。",
+    "description": "“Open in LectureFlow”: the lecture was deleted or the task removed (open.not_found; T26 G3)"
+  },
+  "presetUnavailable": {
+    "message": "“$P1$”不可选：$P2$。",
+    "description": "Send card, under the three choices: why one cannot be chosen (T26 G4). $P1$ is the choice (presetDual…), $P2$ its reason (presetDualNone…, no final full stop)",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      },
+      "p2": {
+        "content": "$2"
+      }
+    }
+  },
+  "bulkRefreshNote": {
+    "message": "$P1$ 节需要刷新，不能在这里勾选：请点列表中那一行的“发送至 LectureFlow”续传。",
+    "description": "Bulk card: lectures whose fetch needs a refresh cannot be ticked; each is resumed from its own row’s button (T26 G5). Quotes sendButton; $P1$ is how many",
+    "placeholders": {
+      "p1": {
+        "content": "$1"
+      }
+    }
+  },
+  "bulkWaiting": {
+    "message": "等待确认…",
+    "description": "Bulk card button while the reminder before sending restricted recordings is open: nothing is sent yet (T26 G6)"
+  },
+  "connectingApp": {
+    "message": "正在连接 LectureFlow…",
+    "description": "Popup and cards: the tracks are found, waiting for LectureFlow to answer (T26 G7)"
+  },
+  "launchingApp": {
+    "message": "正在启动 LectureFlow…",
+    "description": "Popup: the user clicked “Open LectureFlow”; it is being started (T26 G7)"
+  },
+  "discRegister": {
+    "message": "已经安装并打开了？在 LectureFlow 的“诊断”页找到“浏览器扩展连接”，点“重新登记”，再回到这里点“重新检测”。",
+    "description": "Not connected, “not found”: the browser’s registration may be broken; LectureFlow’s Diagnostics page (nav.system) › Browser extension connection (common.check.browser_ext) › Register again (system.ext.register) fixes it (T26 G8). Quotes connRecheck"
+  },
+  "courseCreate": {
+    "message": "在 LectureFlow 里点“添加课程”新建一门，然后点“重新检测”。",
+    "description": "No course in LectureFlow yet: where to make one (nav.add_course), then the button beside it (T26 G9). Quotes connRecheck"
+  },
+  "doneTitle": {
+    "message": "刮削完成",
+    "description": "Queued view title once the fetch is done and the lecture made (T26 J2)"
+  },
+  "failedTitle": {
+    "message": "刮削没有完成",
+    "description": "Queued view title when the fetch failed (T26 J2)"
+  },
+  "closeHintCard": {
+    "message": "可以关掉这张卡片，刮削会在 LectureFlow 里继续。",
+    "description": "In-page card, queued: the card may be closed (closeHint says “window”, for the popup and the confirmation window; T26 J2)"
+  },
+  "exportReportHint": {
+    "message": "生成一份给开发者的文件，帮助 LectureFlow 支持这个录播网站，不会自动发送。文件已脱敏：不含 Cookie；网址保留网站名和路径（路径里较长的编号换成同形的假值），编号、签名等参数值换成占位符；讲座标题等页面文字只留格式。发现疑似个人信息时不会导出。分享前请先看一遍。",
+    "description": "Tooltip of the popup’s “Export detection report”: what it is, for whom, what the redaction does (src/lib/redact.js, report.js; T26 G14, SEC42 低-5: no promise beyond what it does)"
   }
 }

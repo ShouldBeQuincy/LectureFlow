@@ -8,6 +8,7 @@
 //
 //   lectureflow -selfupdate-verify <updates dir> -app-version <running version>
 //               [-selfupdate-previous] [-selfupdate-copy <temporary dir>]
+//               [-selfupdate-private]
 //
 // -selfupdate-previous: previous.json's package (the version a rollback
 // returns to) instead of pending.json's. -selfupdate-copy: the package is
@@ -25,6 +26,28 @@
 //
 // Only exit 0 with a line naming exactly the expected package (and, when
 // a copy was asked for, a copy in the right place) lets the shell run it.
+//
+// -selfupdate-private (with -selfupdate-copy; security audit M-3) verifies
+// no package: after the same check of the data folder's permissions the
+// program makes an empty directory only this account can use and names it,
+//   exit 0  ok private=<temporary dir>/lectureflow-update-<n>
+// The shell copies a backup of the installation there and checks the
+// copy's hash before a rollback uses it (interpretPrivateDir).
+//
+// -selfupdate-trust-dir <dir> (Windows; security review SEC17 中-B): the
+// folder outside the data folder where the shell keeps its update record.
+// Every run checks it after the data folder (exit 3 when it lies in the
+// data folder, is a link or others can change it). -selfupdate-trust-check
+// verifies no package, only these checks: exit 0 "ok trusted"
+// (interpretTrustCheck).
+//
+// -selfupdate-install-dir <dir> (Windows installation; security audit
+// M-4): the installation directory (updatefiles.installDirOf). Every run
+// checks it last, in every mode: when other accounts can change it (or
+// remove or rename it or a folder above it) the program prints
+//   exit 3  untrusted_install_dir: …
+// and nothing is installed or rolled back either; the user installs the
+// new version by hand (the diagnostics page says so).
 // No Electron imports.
 'use strict';
 
@@ -35,6 +58,10 @@ const VERIFY_FLAG = '-selfupdate-verify';
 const VERSION_FLAG = '-app-version';
 const PREVIOUS_FLAG = '-selfupdate-previous';
 const COPY_FLAG = '-selfupdate-copy';
+const PRIVATE_FLAG = '-selfupdate-private';
+const TRUST_DIR_FLAG = '-selfupdate-trust-dir';
+const TRUST_CHECK_FLAG = '-selfupdate-trust-check';
+const INSTALL_DIR_FLAG = '-selfupdate-install-dir';
 // The check hashes the package (about 200 MB) once more and copies it:
 // seconds on most disks, longer on a slow one with a virus scanner looking
 // at the new file.
@@ -47,17 +74,63 @@ const OK_RE = /^ok version=(\S+) kind=(\S+) file=(.+?) sha256=([0-9a-f]{64})(?: 
 const INVALID_RE = /^invalid ([^\s:]*):\s*(.*)$/;
 const NOT_CONFIGURED_RE = /^not_configured\b:?\s*(.*)$/;
 const UNTRUSTED_RE = /^untrusted_dir:\s*(.*)$/;
+const UNTRUSTED_INSTALL_RE = /^untrusted_install_dir:\s*(.*)$/;
+// What an untrusted installation directory means, whatever was asked
+// (short: the program's reason with the folder follows, in 300 characters).
+const INSTALL_DIR_TEXT = 'other accounts can change the installation folder: nothing is installed or rolled back in the app (install the new version by hand)';
+// The program's reason when the folder the shell keeps its update record
+// in (-selfupdate-trust-dir: %LOCALAPPDATA%\LectureFlow\selfupdate) and the
+// data folder overlap (internal/selfupdate/trustdir.go CheckTrustDir).
+// Tightening permissions does not help then; moving the data folder does
+// (security review SEC17 round 4, low-I). Anchored at the end: the program
+// always ends its reason with it ("… cannot vouch for the record (%s)"),
+// while a path earlier in another reason may contain the same words
+// (review R47 S1).
+const OVERLAP_RE = /\(it lies in the data directory, or the data directory lies in it\)$/;
+// (the folder it names: the rest of the reason says what OVERLAP_TEXT says)
+const OVERLAP_DIR_RE = /trust directory (.+) cannot vouch for the record \(it lies in the data directory, or the data directory lies in it\)$/;
+const OVERLAP_TEXT = 'the data folder overlaps %LOCALAPPDATA%\\LectureFlow, where the update record is kept';
+const OVERLAP_FIX = '(move the data folder somewhere else)';
+const PRIVATE_RE = /^ok private=(.+)$/;
+const TRUSTED_LINE = 'ok trusted';
 
 /**
- * verifyArgs(updatesDir, appVersion, { previous, copyTo }) → the arguments
- * after the program (and its prefix arguments).
+ * verifyArgs(updatesDir, appVersion, { previous, copyTo, privateDir }) →
+ * the arguments after the program (and its prefix arguments). privateDir:
+ * make an empty private directory in copyTo instead of verifying a package.
  */
-function verifyArgs(updatesDir, appVersion, { previous = false, copyTo = '' } = {}) {
+function verifyArgs(updatesDir, appVersion, { previous = false, copyTo = '', privateDir = false, trustDir = '', trustCheck = false, installDir = '' } = {}) {
   const args = [VERIFY_FLAG, updatesDir];
   if (appVersion) args.push(VERSION_FLAG, appVersion);
-  if (previous) args.push(PREVIOUS_FLAG);
-  if (copyTo) args.push(COPY_FLAG, copyTo);
+  if (trustCheck) args.push(TRUST_CHECK_FLAG);
+  else if (privateDir) args.push(PRIVATE_FLAG);
+  else if (previous) args.push(PREVIOUS_FLAG);
+  if (copyTo && !trustCheck) args.push(COPY_FLAG, copyTo);
+  if (trustDir) args.push(TRUST_DIR_FLAG, trustDir);
+  if (installDir) args.push(INSTALL_DIR_FLAG, installDir);
   return args;
+}
+
+/** untrustedInstall(line) → the reason when line says the installation directory is not vouched for, else null. */
+function untrustedInstall(line) {
+  const m = line ? UNTRUSTED_INSTALL_RE.exec(line) : null;
+  // (the program's reason repeats the code; the folder matters more)
+  return m ? oneLine(`${INSTALL_DIR_TEXT}: ${m[1].replace(/^selfupdate\.untrusted_install_dir:\s*/, '')}`) : null;
+}
+
+/**
+ * untrustedDir(reason, { others, overlap }) → the text for an
+ * "untrusted_dir: <reason>" line: overlap (then OVERLAP_FIX) when the
+ * reason is that the trust folder and the data folder overlap (followed by
+ * the trust folder the program names, or failing that its whole reason),
+ * else others followed by the program's reason, as before.
+ */
+function untrustedDir(reason, { others, overlap }) {
+  if (OVERLAP_RE.test(reason)) {
+    const dir = OVERLAP_DIR_RE.exec(reason);
+    return oneLine(`${OVERLAP_TEXT}${overlap} ${OVERLAP_FIX}: ${dir ? dir[1] : reason}`);
+  }
+  return oneLine(`${others}: ${reason}`);
 }
 
 /**
@@ -77,7 +150,7 @@ function oneLine(text) {
 
 /**
  * runVerify(cmd, updatesDir, appVersion, { timeoutMs, spawn, previous,
- * copyTo }) runs the service program with -selfupdate-verify. cmd is what
+ * copyTo, privateDir }) runs the service program with -selfupdate-verify. cmd is what
  * lib/serverutil.resolveServerCommand returns ({ command, prefixArgs,
  * extraEnv }) plus env (the environment to run it with).
  * → Promise<{ code, stdout, stderr, timedOut, error }>, never rejects:
@@ -85,7 +158,9 @@ function oneLine(text) {
  *   timedOut  it was stopped after timeoutMs
  *   error     why it could not be run (or how it ended without an exit code)
  */
-function runVerify(cmd, updatesDir, appVersion, { timeoutMs = VERIFY_TIMEOUT_MS, spawn = childProcess.spawn, previous = false, copyTo = '' } = {}) {
+function runVerify(cmd, updatesDir, appVersion, {
+  timeoutMs = VERIFY_TIMEOUT_MS, spawn = childProcess.spawn, previous = false, copyTo = '', privateDir = false, trustDir = '', trustCheck = false, installDir = '',
+} = {}) {
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
@@ -97,7 +172,7 @@ function runVerify(cmd, updatesDir, appVersion, { timeoutMs = VERIFY_TIMEOUT_MS,
       if (timer) clearTimeout(timer);
       resolve({ code: null, stdout, stderr, timedOut: false, error: null, ...r });
     };
-    const args = [...(cmd.prefixArgs || []), ...verifyArgs(updatesDir, appVersion, { previous, copyTo })];
+    const args = [...(cmd.prefixArgs || []), ...verifyArgs(updatesDir, appVersion, { previous, copyTo, privateDir, trustDir, trustCheck, installDir })];
     const env = { ...(cmd.env || process.env), ...(cmd.extraEnv || {}) };
     let child;
     try {
@@ -172,7 +247,8 @@ function copyPath(copy, copyTo, file) {
  *                            "delete pending.json")
  *   { keep: reason }         no verdict: a build without a public key
  *                            (exit 2, notConfigured), other accounts can
- *                            change the data folder (exit 3, untrusted), a
+ *                            change the data folder or it overlaps the
+ *                            trust folder (exit 3, untrusted), a
  *                            timeout, a program that could not run or gave
  *                            an answer outside the contract (also exit 0
  *                            without the copy asked for)
@@ -217,16 +293,109 @@ function interpretVerify(run, expected, { timeoutMs = VERIFY_TIMEOUT_MS, copyTo 
     const m = UNTRUSTED_RE.exec(line);
     if (m) {
       return {
-        keep: oneLine(`other accounts of this computer can change the data folder, so no update is installed from it (tighten its permissions in Diagnostics): ${m[1]}`),
+        keep: untrustedDir(m[1], {
+          others: 'other accounts of this computer can change the data folder, so no update is installed from it (tighten its permissions in Diagnostics)',
+          overlap: ', so no update is installed from it',
+        }),
         verdict: 'untrusted',
       };
     }
+    const install = untrustedInstall(line);
+    if (install) return { keep: install, verdict: 'untrusted' };
   }
   return unusable();
 }
 
+/**
+ * interpretPrivateDir(run, { timeoutMs, copyTo }) → what runVerify's result
+ * of a -selfupdate-private run means:
+ *   { dir, verdict: 'ok' }   exit 0 naming a directory where it was asked
+ *                            for: <copyTo>/lectureflow-update-<n>
+ *   { error, verdict }       anything else, in short English: 'untrusted'
+ *                            (exit 3: other accounts can change the data
+ *                            folder), 'invalid' (exit 1: the directory
+ *                            could not be made) or 'none' (a timeout, a
+ *                            program that could not run, an answer outside
+ *                            the contract — also a directory elsewhere)
+ */
+function interpretPrivateDir(run, { timeoutMs = VERIFY_TIMEOUT_MS, copyTo = '' } = {}) {
+  const r = run || {};
+  const none = (error) => ({ error, verdict: 'none' });
+  if (r.timedOut) return none(`the update check did not finish within ${Math.round(timeoutMs / 1000)} seconds`);
+  if (r.error) return none(`the update check could not run: ${oneLine(r.error)}`);
+  const lines = String(r.stdout || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const line = lines.length === 1 ? lines[0] : null;
+  const unusable = () => {
+    const detail = lastLine(r.stderr);
+    return none(`the update check gave no usable answer (exit code ${r.code})${detail ? `: ${detail}` : ''}`);
+  };
+  if (r.code === 0) {
+    const m = line ? PRIVATE_RE.exec(line) : null;
+    if (!m) return unusable();
+    const dir = m[1];
+    if (!copyTo || !path.isAbsolute(dir) || dir.includes('\0') || !samePath(path.dirname(dir), copyTo) || !COPY_DIR_RE.test(path.basename(dir))) {
+      return none(`the update check did not make the private folder where it was asked to (${oneLine(dir)})`);
+    }
+    return { dir: path.resolve(dir), verdict: 'ok' };
+  }
+  if (r.code === 1 && line) {
+    const m = INVALID_RE.exec(line);
+    if (m) return { error: oneLine(`no private folder could be made (${m[1] || 'invalid'}): ${m[2]}`), verdict: 'invalid' };
+  }
+  if (r.code === 3 && line) {
+    const m = UNTRUSTED_RE.exec(line);
+    if (m) {
+      return {
+        error: untrustedDir(m[1], {
+          others: 'other accounts of this computer can change the data folder, so nothing in it is used (tighten its permissions in Diagnostics)',
+          overlap: ', so nothing in the data folder is used',
+        }),
+        verdict: 'untrusted',
+      };
+    }
+    const install = untrustedInstall(line);
+    if (install) return { error: install, verdict: 'untrusted' };
+  }
+  return unusable();
+}
+
+/**
+ * interpretTrustCheck(run, { timeoutMs }) → what runVerify's result of a
+ * -selfupdate-trust-check run means: { ok: true } only for exit 0 with
+ * exactly "ok trusted"; anything else is { error } in short English (exit
+ * 3: other accounts can change the data folder or the trust folder, or
+ * the two overlap; a timeout, a program that could not run, an answer outside the contract).
+ */
+function interpretTrustCheck(run, { timeoutMs = VERIFY_TIMEOUT_MS } = {}) {
+  const r = run || {};
+  if (r.timedOut) return { error: `the update check did not finish within ${Math.round(timeoutMs / 1000)} seconds` };
+  if (r.error) return { error: `the update check could not run: ${oneLine(r.error)}` };
+  const lines = String(r.stdout || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const line = lines.length === 1 ? lines[0] : null;
+  if (r.code === 0 && line === TRUSTED_LINE) return { ok: true };
+  if (r.code === 3 && line) {
+    const m = UNTRUSTED_RE.exec(line);
+    if (m) {
+      return {
+        error: untrustedDir(m[1], {
+          others: "other accounts of this computer can change the data folder or the update's trust folder",
+          overlap: '',
+        }),
+      };
+    }
+    const install = untrustedInstall(line);
+    if (install) return { error: install };
+  }
+  const detail = lastLine(r.stderr);
+  return { error: `the update check gave no usable answer (exit code ${r.code})${detail ? `: ${detail}` : ''}` };
+}
+
 module.exports = {
   VERIFY_FLAG,
+  TRUST_DIR_FLAG,
+  TRUST_CHECK_FLAG,
+  INSTALL_DIR_FLAG,
+  interpretTrustCheck,
   VERIFY_TIMEOUT_MS,
   COPY_DIR_RE,
   verifyArgs,
@@ -234,4 +403,5 @@ module.exports = {
   runVerify,
   copyPath,
   interpretVerify,
+  interpretPrivateDir,
 };

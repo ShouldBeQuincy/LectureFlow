@@ -419,7 +419,7 @@ func TestJobCASAndQueries(t *testing.T) {
 	st.SetJobInputHash(ctx, prep1.ID, "abc")
 	st.SetJobError(ctx, prep1.ID, sp("err"))
 	j, _ = st.GetJob(ctx, prep1.ID)
-	if j.Stats != stats || j.Progress != 0.5 || j.InputHash == nil || *j.InputHash != "abc" || *j.Error != "err" {
+	if !reflect.DeepEqual(j.Stats, stats) || j.Progress != 0.5 || j.InputHash == nil || *j.InputHash != "abc" || *j.Error != "err" {
 		t.Fatalf("job = %+v", j)
 	}
 

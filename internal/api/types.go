@@ -44,6 +44,11 @@ type StageView struct {
 	DisplayStatus string      `json:"display_status"` // status, or "outdated" (A2.1)
 	StaleReason   *string     `json:"stale_reason"`   // A2.2, stale jobs only
 	Model         *StageModel `json:"model"`          // A4 snapshot summary
+	// LLM and LastActivityAt (v3.2.x P1-c, lead freeze): job.stats.llm and
+	// job.stats.last_activity_at — the attempts of the run's LLM requests
+	// and when the run last showed life; absent for jobs without them.
+	LLM            *model.LLMStats `json:"llm,omitempty"`
+	LastActivityAt *string         `json:"last_activity_at,omitempty"`
 	// ASRTiming is the asr worker's timing of the last successful run
 	// (job.stats.asr_timing, SPEC-v2 I7 / I12: the hover card's transcription
 	// time, audio length and RTF); asr stages only, absent without one.
@@ -72,6 +77,15 @@ type UsageStats struct {
 	// Remote (stage views only): the sub-step of an asr job running on
 	// colab:remote (SPEC-v3 V14.5 hover card); omitted otherwise.
 	Remote *model.RemoteStats `json:"remote,omitempty"`
+	// PendingSentences (stage views and job events only; v3.2.x P1, lead
+	// freeze 2026-11-11): job.stats.pending_sentences of a translate job —
+	// sentences the run left without a usable translation; omitted when 0.
+	PendingSentences int `json:"pending_sentences,omitempty"`
+	// MixedModels (stage views and job events only; v3.2.x P1-b):
+	// job.stats.mixed_models of a translate job — the models the lecture's
+	// current translations come from ("provider name / model", first use
+	// first) when they are more than one; omitted otherwise.
+	MixedModels []string `json:"mixed_models,omitempty"`
 }
 
 type LectureCounts struct {
@@ -101,6 +115,12 @@ type Lecture struct {
 	Reviewable bool         `json:"reviewable"`
 	Exports    []ExportFile `json:"exports"`
 	Usage      UsageStats   `json:"usage"` // sum over the lecture's current jobs (SPEC §17.7)
+	// UsageTotal (v3.2.x r7, T25 S1): every job the lecture ever had —
+	// retired ones (reruns, updates, retranslations), auxiliary tasks, every
+	// attempt — priced like Usage. Only in GET /api/lectures/{id}?usage_total=1
+	// (lecture_usage.go); left out of every other response and when the
+	// store cannot read it.
+	UsageTotal *UsageStats `json:"usage_total,omitempty"`
 	// v1.1
 	Seq            int      `json:"seq"`
 	Label          string   `json:"label"`       // "L03" (A11.3); v2 P13 and lecture kinds: see CiteLabel
@@ -189,6 +209,7 @@ type Course struct {
 	StaleLectureCount int      `json:"stale_lecture_count"`
 	PatchesPending    int      `json:"patches_pending"`
 	RunningCount      int      `json:"running_count"`
+	FailedCount       int      `json:"failed_count"` // v3.2.x r7 (T24 S2): launched lectures with a failed stage, no time window
 	LastActivityAt    string   `json:"last_activity_at"`
 	CourseActions     []string `json:"course_actions"` // CourseAction* (A12.2)
 	// GlossaryPending is true while glossary_seed or a material_terms is not
@@ -346,6 +367,10 @@ type GPUInfo struct {
 	SlotsUsed      int  `json:"slots_used"`
 	SlotsMax       int  `json:"slots_max"`
 	EstimatedJobMB int  `json:"estimated_job_mb"`
+	// EstimateRaised: estimated_job_mb was raised in memory after a
+	// transcription ran out of GPU memory (sched.GPUStatus); a restart or
+	// another model or precision on cuda:0 drops it. Omitted when false.
+	EstimateRaised bool `json:"estimate_raised,omitempty"`
 }
 
 type APIInfo struct {
@@ -389,6 +414,13 @@ type JobEvent struct {
 	Stage    string  `json:"stage"`
 	Status   string  `json:"status"`
 	Progress float64 `json:"progress"`
+	// v3.2.x P1-c (lead freeze; SPEC §8.2 as the user revised it on
+	// 2026-11-10): optional, present for a running job whose statistics the
+	// scheduler sent with the event — the same values as StageView.stats,
+	// llm and last_activity_at, so the card follows them without a refetch.
+	Stats          *UsageStats     `json:"stats,omitempty"`
+	LLM            *model.LLMStats `json:"llm,omitempty"`
+	LastActivityAt *string         `json:"last_activity_at,omitempty"`
 }
 
 type ChangedEvent struct {

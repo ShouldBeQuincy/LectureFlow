@@ -3,6 +3,8 @@
 
 package model
 
+import "lectureflow/internal/remote"
+
 // SPEC-v3 V14: the Colab backend inside the scheduler, the asr stage and the
 // HTTP API (v14-colab-integrate; .claude/v3-brief.md §8). The Colab
 // package's own kv keys (credential, session, settings, rates) are in
@@ -51,6 +53,11 @@ type RemoteStats struct {
 	Stage string `json:"stage,omitempty"`
 	// WaitingFor is WaitRemoteQueue while Colab has no accelerator for us.
 	WaitingFor string `json:"waiting_for,omitempty"`
+	// Reconnect (v3.2.x, lead freeze 2026-11-11): the runtime does not
+	// answer and the lecture is trying again in place (colab.Event's
+	// reconnect: attempt, of, next_at); absent otherwise, cleared once the
+	// runtime answers again.
+	Reconnect *remote.Reconnect `json:"reconnect,omitempty"`
 }
 
 // ParseKVFlag reads a "1" | "0" kv flag: "1" and "true" are on, anything

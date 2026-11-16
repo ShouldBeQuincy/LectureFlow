@@ -179,8 +179,12 @@ test('list, main layout: row buttons and states; the header button is above the 
   await bulk.locator('#override').waitFor({ timeout: 15000 });
   assert.match(await bulk.locator('#override').textContent(), /该媒体流可能受政策限制/);
   assert.match(await bulk.locator('#override').textContent(), /其中 1 节可能受讲师或大学政策限制/);
+  // nothing is being sent while the user decides (T26 G6)
+  assert.equal((await bulk.locator('#primary').textContent()).trim(), '等待确认…');
   await bulk.locator('#override-confirm').click();
   await bulk.locator('.lf-card[data-phase="done"]').waitFor({ timeout: 15000 });
+  // the reminder is behind: no "发送前会再提醒一次" left on the card (T26 G6)
+  assert.ok(!(await bulk.locator('#bulk-warning').textContent()).includes('发送前会再提醒一次'));
   assert.deepEqual(listInfoRequests(), [S(1), S(1), S(5), S(6)], 'only the sessions sent, in order, after the click');
   assert.match(await bulk.locator('#bulk-done').textContent(), /已发送 2 节；1 节没有发送/);
   const rows = await bulk.locator('#bulk-rows .bulk-row').evaluateAll((xs) => xs.map((x) => x.dataset.state));
@@ -194,6 +198,54 @@ test('list, main layout: row buttons and states; the header button is above the 
   assert.ok(!kept.includes(PANOPTO.userEmail) && !kept.includes(PANOPTO.userName));
   // the rows follow
   await page.waitForSelector(`tr[id="${S(1)}"] [data-row-state="queued"]`, { timeout: 5000 });
+  await page.close();
+});
+
+test('the player’s card in a low window: the send block scrolls with the card instead of covering it; in a tall one it stays in sight (SEC42 中-1)', async () => {
+  server.panopto.downloadUrl = null; // possibly restricted: the notice is part of the card
+  await H.fakeLectureFlow(worker, { nextTaskId: 300 });
+  const page = await context.newPage();
+  try {
+    for (const [height, sticky] of [[420, 'false'], [800, 'true']]) {
+      await page.setViewportSize({ width: 1280, height });
+      await page.goto(`http://${PANOPTO.host}:${port()}/Panopto/Pages/Viewer.aspx?id=${PANOPTO.deliveryId}`);
+      await page.waitForSelector('body[data-ready="1"]', { timeout: 10000 });
+      await page.locator('lectureflow-ui[data-kind="player"] .ip-btn').click();
+      const card = page.locator('lectureflow-ui[data-kind="card"]');
+      await card.locator('.lf-card[data-view="blocked"]').waitFor({ timeout: 15000 });
+      await page.waitForTimeout(300);
+      const m = await card.locator('.ip-card').evaluate((f) => {
+        const r = f.getBoundingClientRect();
+        const send = f.querySelector('.send').getBoundingClientRect();
+        const lec = f.querySelector('#lecture').getBoundingClientRect();
+        return { sticky: f.dataset.sendSticky, card: [r.top, r.bottom], send: [send.top, send.bottom], lecture: [lec.top, lec.bottom], pos: getComputedStyle(f.querySelector('.send')).position };
+      });
+      assert.equal(m.sticky, sticky, `${height}: ${JSON.stringify(m)}`);
+      if (sticky === 'false') {
+        assert.equal(m.pos, 'static', JSON.stringify(m));
+        // the lecture is what one sees first, not covered by the send block
+        assert.ok(m.lecture[1] <= m.card[1] && m.lecture[1] <= m.send[0], JSON.stringify(m));
+      } else assert.equal(m.pos, 'sticky');
+      await card.locator('#ip-close').click();
+      await card.waitFor({ state: 'detached' });
+    }
+  } finally {
+    await page.close();
+  }
+});
+
+test('list, a lecture that needs a refresh: not counted as being fetched; the bulk card says why it cannot be ticked and where to resume it (T26 G5)', async () => {
+  await listLectureFlow({ checkMap: { [S(2)]: { state: 'imported', taskId: 2, lectureId: '01JE2ELECTURE0000000000002' }, [S(3)]: { state: 'needs_refresh', taskId: 33 } } });
+  const page = await open(listUrl(), 'body[data-ready="1"]');
+  const hdr = page.locator('lectureflow-ui[data-kind="header"]');
+  await hdr.locator('.ip-btn').waitFor({ timeout: 10000 });
+  await hdr.locator('.ip-btn').click();
+  const bulk = page.locator('lectureflow-ui[data-kind="card"]');
+  await bulk.locator('.lf-card[data-phase="idle"]').waitFor({ timeout: 10000 });
+  assert.equal((await bulk.locator('#bulk-summary').textContent()).trim(), '共 6 节：2 节已导入（按会话与标题去重），0 节正在刮削，3 节将发送');
+  assert.equal((await bulk.locator('#bulk-refresh-note').textContent()).trim(), '1 节需要刷新，不能在这里勾选：请点列表中那一行的“发送至 LectureFlow”续传。');
+  assert.equal(await bulk.locator(`.bulk-row[data-session-id="${S(3)}"] input`).isDisabled(), true);
+  await H.shoot(page, 'inpage-bulk-refresh', null, { fullPage: false, clip: { x: 0, y: 0, width: 1280, height: 800 } });
   await page.close();
 });
 

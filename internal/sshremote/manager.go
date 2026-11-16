@@ -88,10 +88,56 @@ type Manager struct {
 
 	mu      sync.Mutex
 	servers map[string]*Server
+	adding  map[string]bool // ids of the Adds under way
 	builds  map[string]agentBuild
 	sess    map[string]*sync.Mutex
 	hooks   []func()
 	done    chan struct{}
+
+	sizeMu sync.Mutex
+	sizes  map[string]*KitSize // platform|engine|model|precision → size (nil: unknown)
+}
+
+// kitSize is the size of a kit from the component manifest (cached; nil
+// without a manifest or when it lacks one of the parts).
+func (m *Manager) kitSize(platform, engine, modelName, precision string) *KitSize {
+	if m.o.Manifest == "" || modelName == "" {
+		return nil
+	}
+	key := strings.Join([]string{platform, engine, modelName, precision}, "|")
+	m.sizeMu.Lock()
+	defer m.sizeMu.Unlock()
+	if v, ok := m.sizes[key]; ok {
+		return v
+	}
+	var out *KitSize
+	if ks, err := kitSizeFromManifest(m.o.Manifest, platform, engine, modelName, precision); err == nil {
+		out = &ks
+	}
+	if m.sizes == nil {
+		m.sizes = map[string]*KitSize{}
+	}
+	m.sizes[key] = out
+	return out
+}
+
+// Cards are the servers' resource cards (resources.Snapshot.Remotes),
+// sorted by name.
+func (m *Manager) Cards(ctx context.Context) []remote.Card {
+	m.mu.Lock()
+	list := make([]*Server, 0, len(m.servers))
+	for _, s := range m.servers {
+		list = append(list, s)
+	}
+	m.mu.Unlock()
+	out := make([]remote.Card, 0, len(list))
+	for _, s := range list {
+		out = append(out, s.Card(ctx))
+	}
+	sort.Slice(out, func(a, b int) bool {
+		return out[a].Label < out[b].Label || (out[a].Label == out[b].Label && out[a].ID < out[b].ID)
+	})
+	return out
 }
 
 // New loads the servers and starts the idle watcher.
@@ -114,7 +160,7 @@ func New(ctx context.Context, o Options) (*Manager, error) {
 	if o.AgentVersion == "" || !remote.VersionStringPattern.MatchString(o.AgentVersion) {
 		o.AgentVersion = "0.0.0-dev"
 	}
-	m := &Manager{o: o, servers: map[string]*Server{}, builds: map[string]agentBuild{}, sess: map[string]*sync.Mutex{},
+	m := &Manager{o: o, servers: map[string]*Server{}, adding: map[string]bool{}, builds: map[string]agentBuild{}, sess: map[string]*sync.Mutex{},
 		done: make(chan struct{})}
 	m.ctx, m.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	recs, err := o.Store.ListRemoteServers(ctx)
@@ -291,6 +337,27 @@ type ServerView struct {
 	LastError    *remote.CardError `json:"last_error,omitempty"`
 	AgentVersion string            `json:"agent_version,omitempty"`
 	KitReady     bool              `json:"kit_ready"`
+
+	// ssh-1b (the settings' wizard and server cards, the diagnostics):
+	// AgentCurrent: the agent the server reported last is this build's
+	// version. Model and Precision are the device row's (empty before the
+	// first probe created it); Recommended is what the server's memory
+	// suits (recommendModel, nil before a probe). KitSize is what
+	// installing the environment downloads and takes on the server (the
+	// component manifest's sizes; nil when unknown). LatencyMS is the last
+	// keepalive round trip while connected.
+	AgentCurrent bool         `json:"agent_current"`
+	Model        string       `json:"model,omitempty"`
+	Precision    string       `json:"precision,omitempty"`
+	Recommended  *ModelChoice `json:"recommended,omitempty"`
+	KitSize      *KitSize     `json:"kit_size,omitempty"`
+	LatencyMS    *int         `json:"latency_ms,omitempty"`
+}
+
+// ModelChoice is a model and its precision.
+type ModelChoice struct {
+	Model     string `json:"model"`
+	Precision string `json:"precision"`
 }
 
 // ProbeView is the probe for display.
@@ -312,12 +379,34 @@ type InstallView struct {
 }
 
 func (s *Server) view() ServerView {
+	// The device row and the kit's size first: neither is read under s.mu.
+	row, hasRow := s.row()
+	s.mu.Lock()
+	platform, probe := s.rec.Platform, s.probe
+	s.mu.Unlock()
+	var size *KitSize
+	if hasRow && platform != "" {
+		size = s.m.kitSize(platform, engineOf(platform), row.Model, modelPrecision(engineOf(platform), row.Precision, int(probe.VRAMTotalMB)))
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	v := ServerView{ID: s.id, DeviceID: s.devID, Name: s.rec.Name, Host: s.rec.Host, Port: s.rec.Port, Username: s.rec.Username,
 		State: s.state, Platform: s.rec.Platform, Engine: s.rec.Engine, Trusted: s.rec.HostKey != "",
 		PublicKey: s.rec.PublicKey, KeyFP: PublicFingerprint(s.rec.PublicKey), Settings: s.set, LastError: s.lastErr,
-		AgentVersion: s.rec.AgentVersion, KitReady: s.rec.KitHash != "" && slices.Contains(s.probe.Kits, s.rec.KitHash)}
+		AgentVersion: s.rec.AgentVersion, KitReady: s.rec.KitHash != "" && slices.Contains(s.probe.Kits, s.rec.KitHash),
+		AgentCurrent: s.rec.AgentVersion != "" && s.rec.AgentVersion == s.m.o.AgentVersion, KitSize: size}
+	if hasRow {
+		v.Model, v.Precision = row.Model, row.Precision
+	}
+	if s.rec.Platform != "" {
+		m, p := recommendModel(engineOf(s.rec.Platform), s.probe)
+		v.Recommended = &ModelChoice{Model: m, Precision: p}
+	}
+	if s.c != nil && s.c.alive() {
+		if ms := int(s.c.latency.Load()); ms > 0 {
+			v.LatencyMS = &ms
+		}
+	}
 	if s.set.Paused {
 		v.State = StatePaused
 	} else if s.state == StateReady && len(s.runs) >= s.slotsLocked() {
@@ -457,27 +546,43 @@ func (m *Manager) Add(ctx context.Context, req AddRequest) (ServerView, error) {
 	if req.Group != GroupPrefer && req.Group != GroupSupplement {
 		return ServerView{}, &FieldError{Field: "group"}
 	}
+	// A new id starts with a letter or a digit (SEC7 L7); the servers that
+	// exist keep theirs.
 	id := req.ID
-	if id == "" {
-		id = slugOf(req.Name)
-		m.mu.Lock()
-		base := id
-		for n := 2; m.servers[id] != nil; n++ {
-			id = fmt.Sprintf("%s-%d", strings.TrimRight(base[:min(len(base), 29)], "-"), n)
-		}
-		m.mu.Unlock()
-	}
-	if !model.SSHSlugPattern.MatchString(id) {
+	if id != "" && !model.SSHNewSlugPattern.MatchString(id) {
 		return ServerView{}, &FieldError{Field: "id"}
 	}
-	if m.server(id) != nil {
+	// The id is taken under the lock until this Add ends (SEC7 L6): two
+	// Adds at once never write the same key row and server row, where the
+	// later key replaced the earlier one and the Add whose row lost then
+	// emptied the winner's key.
+	m.mu.Lock()
+	taken := func(id string) bool { return m.servers[id] != nil || m.adding[id] }
+	if id == "" {
+		id = slugOf(req.Name)
+		base := id
+		for n := 2; taken(id); n++ {
+			id = fmt.Sprintf("%s-%d", strings.TrimRight(base[:min(len(base), 29)], "-"), n)
+		}
+	} else if taken(id) {
+		m.mu.Unlock()
 		return ServerView{}, ErrExists
 	}
-	sealed, pub, err := newKey("lectureflow-" + id)
+	m.adding[id] = true
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.adding, id)
+		m.mu.Unlock()
+	}()
+	if !model.SSHNewSlugPattern.MatchString(id) {
+		return ServerView{}, &FieldError{Field: "id"}
+	}
+	ref := KeyRef(id)
+	sealed, pub, err := newKey("lectureflow-"+id, ref)
 	if err != nil {
 		return ServerView{}, err
 	}
-	ref := KVKeyPrefix + id
 	if err := m.o.Store.SetKV(ctx, ref, sealed); err != nil {
 		return ServerView{}, err
 	}
@@ -611,11 +716,60 @@ type ConnectResult struct {
 	// the server).
 	HostKey    *HostKeyInfo `json:"host_key,omitempty"`
 	HostKeyHop int          `json:"host_key_hop"`
+	// Changed (SEC7 M1): the hop has a confirmed key and presented another
+	// one, HostKey; PreviousFingerprint is the confirmed key's. Nothing is
+	// pinned and no session is opened: only Trust with Replace and Previous
+	// replaces the confirmed key.
+	PreviousFingerprint string `json:"previous_fingerprint,omitempty"`
+	Changed             bool   `json:"changed,omitempty"`
+}
+
+// snapshot is the server's row and its jump hosts, read under the lock.
+func (s *Server) snapshot() (db.RemoteServer, []Jump) {
+	s.mu.Lock()
+	rec := s.rec
+	s.mu.Unlock()
+	return rec, recJumps(rec)
+}
+
+func recJumps(rec db.RemoteServer) []Jump {
+	var jumps []Jump
+	_ = jsonUnmarshal(rec.JumpJSON, &jumps)
+	return jumps
+}
+
+// hopKey is the pinned key of hop ("" = none yet); hopAddr its host and port.
+func hopKey(rec db.RemoteServer, jumps []Jump, hop int) string {
+	if hop < len(jumps) {
+		return jumps[hop].HostKey
+	}
+	return rec.HostKey
+}
+
+func hopAddr(rec db.RemoteServer, jumps []Jump, hop int) (string, int) {
+	if hop < len(jumps) {
+		return jumps[hop].Host, jumps[hop].Port
+	}
+	return rec.Host, rec.Port
+}
+
+// endpointOf is every hop's user, host and port (not their keys): Trust
+// pins nothing when the address changed meanwhile.
+func endpointOf(rec db.RemoteServer, jumps []Jump) string {
+	var b strings.Builder
+	for _, j := range jumps {
+		fmt.Fprintf(&b, "%s@%s:%d>", j.Username, j.Host, j.Port)
+	}
+	fmt.Fprintf(&b, "%s@%s:%d", rec.Username, rec.Host, rec.Port)
+	return b.String()
 }
 
 // Connect contacts the server: without a confirmed host key it returns
 // the presented one; otherwise it connects, installs or updates the agent
-// and probes the machine (no environment is installed: Install).
+// and probes the machine (no environment is installed: Install). A hop
+// that presents another key than the confirmed one: the presented key,
+// Changed and the confirmed key's fingerprint, and the server's state
+// host_key_changed (SEC7 M1); nothing is pinned, nothing is sent.
 func (m *Manager) Connect(ctx context.Context, id string) (ConnectResult, error) {
 	s := m.server(id)
 	if s == nil {
@@ -625,34 +779,74 @@ func (m *Manager) Connect(ctx context.Context, id string) (ConnectResult, error)
 	if err != nil {
 		return ConnectResult{}, err
 	}
-	// Hops whose key is not confirmed: stop at the first and show it.
-	var jumps []Jump
-	_ = jsonUnmarshal(s.rec.JumpJSON, &jumps)
+	// Hops whose key is not confirmed: stop at the first and show it. A
+	// confirmed hop before it that presents another key comes first (N30-L1):
+	// the way to the unconfirmed hop leads through it.
+	rec, jumps := s.snapshot()
 	for i, j := range jumps {
 		if j.HostKey == "" {
 			key, err := presentedKey(ctx, t, i)
 			if err != nil {
-				s.setState(StateOffline, err)
-				return ConnectResult{Server: s.view()}, err
+				return s.unconfirmedFailed(rec, jumps, err)
 			}
+			// as below for the server itself: not "offline" or
+			// host_key_changed left by an earlier attempt
+			s.setState(StateUntrusted, nil)
 			info := describeKey(key, j.Host, j.Port)
 			return ConnectResult{Server: s.view(), HostKey: &info, HostKeyHop: i}, nil
 		}
 	}
-	if s.rec.HostKey == "" {
+	if rec.HostKey == "" {
 		key, err := presentedKey(ctx, t, len(jumps))
 		if err != nil {
-			s.setState(StateOffline, err)
-			return ConnectResult{Server: s.view()}, err
+			return s.unconfirmedFailed(rec, jumps, err)
 		}
 		s.setState(StateUntrusted, nil)
-		info := describeKey(key, s.rec.Host, s.rec.Port)
+		info := describeKey(key, rec.Host, rec.Port)
 		return ConnectResult{Server: s.view(), HostKey: &info, HostKeyHop: len(jumps)}, nil
 	}
 	_, _, err = s.session(ctx, false)
+	if res, ok := s.changedResult(rec, jumps, err); ok {
+		// session recorded host_key_changed and the error (with the
+		// presented fingerprint) on the card.
+		return res, nil
+	}
 	if errors.Is(err, errSetup) {
 		err = nil // reachable, environment not installed yet: the wizard installs it
 	}
+	return ConnectResult{Server: s.view()}, err
+}
+
+// changedResult is Connect's answer to err when it is a confirmed hop
+// presenting another key than its confirmed one (ok false otherwise): that
+// hop, the presented key and the confirmed key's fingerprint. The state
+// host_key_changed is the caller's to record before.
+func (s *Server) changedResult(rec db.RemoteServer, jumps []Jump, err error) (ConnectResult, bool) {
+	var mm *keyMismatchError
+	if !errors.As(err, &mm) || mm.presented == nil || mm.hop < 0 || mm.hop > len(jumps) {
+		return ConnectResult{}, false
+	}
+	host, port := hopAddr(rec, jumps, mm.hop)
+	info := describeKey(mm.presented, host, port)
+	return ConnectResult{Server: s.view(), HostKey: &info, HostKeyHop: mm.hop,
+		PreviousFingerprint: keyFingerprint(mm.pinned), Changed: true}, true
+}
+
+// unconfirmedFailed is Connect's answer when the key of the first
+// unconfirmed hop could not be read. A confirmed hop on the way that
+// presented another key (N30-L1): host_key_changed and that hop, as for a
+// server whose every hop is confirmed, so that its key can be replaced
+// knowingly (Trust). Anything else: offline and the error.
+func (s *Server) unconfirmedFailed(rec db.RemoteServer, jumps []Jump, err error) (ConnectResult, error) {
+	if errors.Is(err, errHostKeyMismatch) {
+		s.setState(StateKeyChanged, err)
+		if res, ok := s.changedResult(rec, jumps, err); ok {
+			slog.Info("ssh server: not ready", "device", s.devID, "state", StateKeyChanged, "code", ConnErrorCode(err), "class", ErrorClass(err))
+			return res, nil
+		}
+		return ConnectResult{Server: s.view()}, err
+	}
+	s.setState(StateOffline, err)
 	return ConnectResult{Server: s.view()}, err
 }
 
@@ -683,42 +877,85 @@ func presentedKey(ctx context.Context, t target, hop int) (ssh.PublicKey, error)
 	return nil, err
 }
 
-// Trust pins the host key with this fingerprint (the one Connect showed)
-// for hop, then connects.
-func (m *Manager) Trust(ctx context.Context, id string, hop int, fingerprint string) (ConnectResult, error) {
+// TrustRequest confirms the host key Connect showed for a hop.
+type TrustRequest struct {
+	Hop         int    `json:"hop"`
+	Fingerprint string `json:"fingerprint"`
+	// Replace and Previous (SEC7 M1): a hop whose key is confirmed already
+	// gets the presented key only with Replace and Previous, the confirmed
+	// key's fingerprint (what Connect answered as previous_fingerprint).
+	Replace  bool   `json:"replace,omitempty"`
+	Previous string `json:"previous,omitempty"`
+}
+
+// ErrHostKeyPinned: Trust for a hop whose key is confirmed already, without
+// Replace or with a Previous that is not that key's fingerprint (or the
+// key or the address changed meanwhile). The API answers 409.
+var ErrHostKeyPinned = errors.New("sshremote: the host key is confirmed already; replacing it needs the previous fingerprint")
+
+// Trust pins the host key with req.Fingerprint (the one Connect showed)
+// for req.Hop, then connects. A hop with a confirmed key keeps it unless
+// the request replaces it knowingly (TrustRequest.Replace, Previous).
+func (m *Manager) Trust(ctx context.Context, id string, req TrustRequest) (ConnectResult, error) {
 	s := m.server(id)
 	if s == nil {
 		return ConnectResult{}, ErrNotFound
+	}
+	rec, jumps := s.snapshot()
+	hop := req.Hop
+	if hop < 0 || hop > len(jumps) {
+		return ConnectResult{}, &FieldError{Field: "hop"}
+	}
+	pinned := hopKey(rec, jumps, hop)
+	if pinned != "" {
+		prev := NormalizeFingerprint(req.Previous)
+		if !req.Replace || prev == "" || prev != keyFingerprint(pinned) {
+			return ConnectResult{}, ErrHostKeyPinned
+		}
 	}
 	t, err := s.target(ctx)
 	if err != nil {
 		return ConnectResult{}, err
 	}
-	var jumps []Jump
-	_ = jsonUnmarshal(s.rec.JumpJSON, &jumps)
-	if hop < 0 || hop > len(jumps) {
-		return ConnectResult{}, &FieldError{Field: "hop"}
-	}
 	key, err := presentedKey(ctx, t, hop)
 	if err != nil {
 		return ConnectResult{}, err
 	}
-	if ssh.FingerprintSHA256(key) != fingerprint {
+	if ssh.FingerprintSHA256(key) != NormalizeFingerprint(req.Fingerprint) {
 		// The server presents another key than the one the user confirmed.
 		return ConnectResult{}, &FieldError{Field: "fingerprint"}
 	}
 	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
 	s.mu.Lock()
-	if hop < len(jumps) {
-		jumps[hop].HostKey = line
-		s.rec.JumpJSON = jsonString(jumps, "[]")
+	cur := recJumps(s.rec)
+	if endpointOf(s.rec, cur) != endpointOf(rec, jumps) || hopKey(s.rec, cur, hop) != pinned {
+		// edited or confirmed meanwhile: nothing is pinned
+		s.mu.Unlock()
+		return ConnectResult{}, ErrHostKeyPinned
+	}
+	if hop < len(cur) {
+		cur[hop].HostKey = line
+		s.rec.JumpJSON = jsonString(cur, "[]")
 	} else {
 		s.rec.HostKey = line
+	}
+	if hop == len(cur) || s.state == StateKeyChanged {
 		s.state = StateOffline
+	}
+	// SEC39 L-B: an error about a host key is answered by this
+	// confirmation; left on the card it would name the very key that was
+	// just pinned. The Connect below records what still holds; an error
+	// about anything else stays until the server is reached.
+	if s.lastErr != nil && (s.lastErr.Code == remote.CodeHostKeyMismatch || s.lastErr.Code == remote.CodeHostKeyUnknown) {
+		s.lastErr = nil
 	}
 	s.persistLocked(ctx)
 	s.mu.Unlock()
-	slog.Info("ssh server: host key confirmed", "device", s.devID, "hop", hop, "fingerprint", fingerprint)
+	if pinned != "" {
+		slog.Warn("ssh server: confirmed host key replaced by the user", "device", s.devID, "hop", hop)
+	} else {
+		slog.Info("ssh server: host key confirmed", "device", s.devID, "hop", hop)
+	}
 	return m.Connect(ctx, id)
 }
 
@@ -750,7 +987,7 @@ func (m *Manager) Install(id string) error {
 		s.installing = nil
 		s.mu.Unlock()
 		if err != nil {
-			slog.Warn("ssh server: installing the environment", "device", s.devID, "err", err)
+			slog.Warn("ssh server: installing the environment", "device", s.devID, "code", ConnErrorCode(err), "class", ErrorClass(err))
 			state, _, _ := connError(err)
 			if errors.Is(err, errInstall) {
 				state = StateSetup
@@ -778,14 +1015,21 @@ func (m *Manager) Test(ctx context.Context, id string) (ServerView, error) {
 type PublicKey struct {
 	Line        string `json:"line"`
 	Fingerprint string `json:"fingerprint"`
-	// Command appends the line on the server (to run there, by the user).
+	// Command appends the line on the server (to run there, by the user):
+	// Linux and macOS.
 	Command string `json:"command"`
+	// CommandWindows is the variant for a standard account on a Windows
+	// server (PowerShell, %USERPROFILE%\.ssh\authorized_keys; ssh-1b).
+	CommandWindows string `json:"command_windows"`
 	// CommandWindowsAdmin is the variant for an administrator account on a
 	// Windows server (administrators_authorized_keys).
 	CommandWindowsAdmin string `json:"command_windows_admin"`
 }
 
-// PublicKeyOf returns the server's public key.
+// PublicKeyOf returns the server's public key and the commands that
+// authorize it. A stored line that is not exactly LectureFlow's own
+// (checkPublicKeyLine, SEC7 L2) is an invalid public_key: no command is
+// built around it.
 func (m *Manager) PublicKeyOf(id string) (PublicKey, error) {
 	s := m.server(id)
 	if s == nil {
@@ -794,10 +1038,20 @@ func (m *Manager) PublicKeyOf(id string) (PublicKey, error) {
 	s.mu.Lock()
 	line := s.rec.PublicKey
 	s.mu.Unlock()
+	if err := checkPublicKeyLine(line); err != nil {
+		slog.Warn("ssh server: its stored public key line is not LectureFlow's; no authorize command is shown", "device", s.devID)
+		return PublicKey{}, err
+	}
+	// Every command starts a new line before the key (SEC7 L8): behind a
+	// last line without a line feed the key would end up in that line's
+	// comment and never be authorized. The empty line this leaves in a file
+	// that ended properly is ignored by sshd.
 	return PublicKey{Line: line, Fingerprint: PublicFingerprint(line),
-		Command: "mkdir -p ~/.ssh && chmod 700 ~/.ssh && printf '%s\\n' " + shellQuote(line) +
+		Command: "mkdir -p ~/.ssh && chmod 700 ~/.ssh && printf '\\n%s\\n' " + shellQuote(line) +
 			" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys",
-		CommandWindowsAdmin: `Add-Content -Path "$env:ProgramData\ssh\administrators_authorized_keys" -Value '` + line + `'`}, nil
+		CommandWindows: `New-Item -ItemType Directory -Force "$env:USERPROFILE\.ssh" | Out-Null; ` +
+			`Add-Content -Path "$env:USERPROFILE\.ssh\authorized_keys" -Value '', '` + line + `'`,
+		CommandWindowsAdmin: `Add-Content -Path "$env:ProgramData\ssh\administrators_authorized_keys" -Value '', '` + line + `'`}, nil
 }
 
 // Remove deletes a server: with uninstall, "lf-agent uninstall" first
@@ -816,7 +1070,7 @@ func (m *Manager) Remove(ctx context.Context, id string, uninstall bool) error {
 	}
 	if uninstall && rec.HostKey != "" {
 		if err := s.uninstall(ctx); err != nil {
-			slog.Warn("ssh server: uninstalling lf-agent failed (its directories stay on the server)", "device", s.devID, "err", err)
+			slog.Warn("ssh server: uninstalling lf-agent failed (its directories stay on the server)", "device", s.devID, "code", ConnErrorCode(err), "class", ErrorClass(err))
 		}
 	}
 	s.close()

@@ -36,7 +36,15 @@ type Downloader interface {
 
 // DownloadRequest is one file to download.
 type DownloadRequest struct {
-	URLs     []string
+	URLs []string
+	// UserURLs are those of URLs that come from the user's own update
+	// sources (the settings' extra sources: a {url} template or a
+	// directory), which may be a mirror on this computer or the local
+	// network. The others (GitHub, update.json's URL and its mirror rules)
+	// are public addresses: a downloader that judges where it connects
+	// (internal/fetch's guard proxy) lets the hosts of UserURLs alone be on
+	// this computer or the local network.
+	UserURLs []string
 	Path     string
 	Size     int64
 	SHA256   string // hex; aria2c may check it too (--checksum)

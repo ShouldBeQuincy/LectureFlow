@@ -7,11 +7,12 @@ package hwdetect
 
 import (
 	"context"
-	"os/exec"
 	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
+
+	"lectureflow/internal/procutil"
 )
 
 const createNoWindow = 0x08000000
@@ -27,9 +28,10 @@ func platformOptions() Options {
 }
 
 // runHidden runs a probe without flashing a console window (the desktop
-// app's service has no console).
+// app's service has no console), in the probe's own directory, not the
+// service's current one (procutil.CommandInExeDir; SEC52 info-7).
 func runHidden(ctx context.Context, name string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := procutil.CommandInExeDir(ctx, name, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
 	cmd.WaitDelay = time.Second
 	return cmd.Output()

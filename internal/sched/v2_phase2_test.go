@@ -196,23 +196,44 @@ func TestSummaryDoneQueuesTitle(t *testing.T) {
 
 // ---------- P13.3.2 filename_rule trigger ----------
 
+// fnSettled waits until the course's filename-rule request was evaluated
+// and dropped by a scan (a request kept for a running rule never settles).
+func (e *env) fnSettled(courseID string) {
+	e.t.Helper()
+	e.waitFor("the filename-rule request evaluated", 5*time.Second, func() bool {
+		e.s.mu.Lock()
+		defer e.s.mu.Unlock()
+		return e.s.fnReq[courseID] == nil
+	})
+}
+
 func TestRequestFilenameRuleDebounced(t *testing.T) {
-	e := newEnvOpts(t, nil, func(o *Options) { o.FilenameRuleDebounce = 80 * time.Millisecond })
+	// The debounce runs on the scheduler's clock, which only moves when the
+	// test moves it: real 15 ms sleeps between the requests could add up to
+	// more than the debounce on a loaded machine.
+	clk := &gpuTestClock{t: time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)}
+	e := newEnvOpts(t, nil, func(o *Options) { o.FilenameRuleDebounce = 80 * time.Millisecond; o.Now = clk.Now })
 	e.configureOrganizer()
 	e.namedLecture("CSC1003_2026-09-30_1000.mp4")
 	e.namedLecture("CSC1003_2026-10-07_1000.mp4")
 	e.start()
 	for range 3 { // one batch upload
 		e.s.RequestFilenameRule(e.course.ID)
-		time.Sleep(15 * time.Millisecond)
+		clk.Advance(15 * time.Millisecond)
+		time.Sleep(15 * time.Millisecond) // several scans
 	}
+	clk.Advance(64 * time.Millisecond) // 79 ms after the last request
+	time.Sleep(15 * time.Millisecond)
 	if e.hasJob(model.ScopeCourse, e.course.ID, model.StageFilenameRule) {
 		t.Fatal("queued before the debounce elapsed")
 	}
+	clk.Advance(time.Millisecond) // 80 ms: due
 	e.waitFor("filename_rule job", 5*time.Second, func() bool {
 		return e.hasJob(model.ScopeCourse, e.course.ID, model.StageFilenameRule)
 	})
 	first := e.job(model.ScopeCourse, e.course.ID, model.StageFilenameRule)
+	e.fnSettled(e.course.ID)
+	clk.Advance(200 * time.Millisecond)
 	time.Sleep(200 * time.Millisecond)
 	if j := e.job(model.ScopeCourse, e.course.ID, model.StageFilenameRule); j.ID != first.ID {
 		t.Fatal("one batch must queue one run")
@@ -225,9 +246,11 @@ func TestRequestFilenameRuleDebounced(t *testing.T) {
 
 func TestRequestFilenameRuleConditions(t *testing.T) {
 	debounce := func(o *Options) { o.FilenameRuleDebounce = 20 * time.Millisecond }
+	// Wait for a scan to evaluate the request, not a fixed 150 ms (too short
+	// on a loaded machine for the job to be queued in time).
 	settle := func(e *env) {
 		e.s.RequestFilenameRule(e.course.ID)
-		time.Sleep(150 * time.Millisecond)
+		e.fnSettled(e.course.ID)
 	}
 	// 3.1.0 "只转写": without a model the task still runs, with the
 	// built-in Panopto pattern only (internal/stages filename_fallback.go).
@@ -272,7 +295,7 @@ func TestRequestFilenameRuleConditions(t *testing.T) {
 		e.configureOrganizer()
 		e.start()
 		e.s.RequestFilenameRule("no-such-course")
-		time.Sleep(100 * time.Millisecond) // nothing to check but that nothing breaks
+		e.fnSettled("no-such-course") // nothing to check but that nothing breaks
 	})
 }
 

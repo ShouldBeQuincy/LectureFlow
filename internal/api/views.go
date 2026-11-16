@@ -80,6 +80,12 @@ func (s *Server) loadJobs(ctx context.Context) (jobIndex, error) {
 		return nil, err
 	}
 	ix := jobIndex{}
+	ix.add(jobs)
+	return ix, nil
+}
+
+// add files jobs under their scope (aux tasks apart), keeping their order.
+func (ix jobIndex) add(jobs []model.Job) {
 	for _, j := range jobs {
 		k := j.Scope + "/" + j.ScopeID
 		if model.IsAuxStage(j.Stage) {
@@ -87,7 +93,6 @@ func (s *Server) loadJobs(ctx context.Context) (jobIndex, error) {
 		}
 		ix[k] = append(ix[k], j)
 	}
-	return ix, nil
 }
 
 func (ix jobIndex) of(scope, id string) []model.Job  { return ix[scope+"/"+id] }
@@ -241,7 +246,9 @@ func (s *Server) stageModel(stage, raw string) *StageModel {
 		}
 		name := s.providerName(snap.ProviderID, snap.ProviderName)
 		p := snap.Params
-		return &StageModel{Label: llmLabel(name, snap.Model, p), ProviderID: snap.ProviderID, ProviderName: name, Model: snap.Model, Params: &p}
+		// Source (v3.2.x P1-b): "manual" for a model named for one retry.
+		return &StageModel{Label: llmLabel(name, snap.Model, p), ProviderID: snap.ProviderID, ProviderName: name, Model: snap.Model, Params: &p,
+			Source: snap.Source}
 	case model.StageASR:
 		a, ok := model.ParseASRSnapshot(raw)
 		if !ok {
@@ -388,7 +395,7 @@ func (s *Server) stageViews(scope string, jobs []model.Job, mediaDeleted bool, t
 			AllowedActions: actions[j.Stage],
 			StartedAt:      strOrNil(j.StartedAt),
 			FinishedAt:     strOrNil(j.FinishedAt),
-			Stats:          s.usageOf(j),
+			Stats:          s.stageUsage(j), // the same as the job events' stats
 			DisplayStatus:  display[j.Stage],
 			Model:          s.stageModel(j.Stage, j.ConfigSnapshot),
 		}
@@ -460,10 +467,6 @@ func (s *Server) stageViews(scope string, jobs []model.Job, mediaDeleted bool, t
 			add("Colab 远端转写没有完成，已转回本机排队",
 				model.ErrorInfo{Code: sched.CodeRemoteBackToLocal, Params: map[string]any{"cause": j.Stats.RemoteFallback.Code}})
 		}
-		if j.Stage == model.StageASR && j.Status == model.StatusRunning && j.Stats.Remote != nil {
-			rs := *j.Stats.Remote
-			v.Stats.Remote = &rs
-		}
 		if j.Status == model.StatusRunning {
 			switch j.Stats.Status {
 			case model.ASRStatusDownloadingModel:
@@ -512,6 +515,7 @@ func (s *Server) stageViews(scope string, jobs []model.Job, mediaDeleted bool, t
 			tm := *j.Stats.ASRTiming
 			v.ASRTiming = &tm
 		}
+		withRequestStats(&v, j) // v3.2.x P1-c
 		out = append(out, v)
 	}
 	return out
@@ -896,6 +900,7 @@ func (s *Server) auxView(j model.Job) StageView {
 			v.DurationMS = &d
 		}
 	}
+	withRequestStats(&v, j) // v3.2.x P1-c (title, chapters)
 	return v
 }
 
@@ -973,7 +978,17 @@ func (s *Server) lectureViews(ctx context.Context, c model.Course) ([]Lecture, e
 	if err != nil {
 		return nil, err
 	}
-	ix, err := s.loadJobs(ctx)
+	// the jobs of this course's lectures and bound materials only
+	// (course_reads.go), not every current job of the library
+	binds, err := s.st.ListMaterialBindings(ctx, c.ID)
+	if err != nil {
+		return nil, err
+	}
+	bound := make([]string, 0, len(binds))
+	for mid := range binds {
+		bound = append(bound, mid)
+	}
+	ix, err := s.scopeJobsOf(ctx, nil, bound, lecs)
 	if err != nil {
 		return nil, err
 	}
@@ -1042,12 +1057,17 @@ func fileExists(p string) bool {
 
 // courseView is GET /api/courses/{id}: glossary_seed stage, materials with
 // their stages, counts (SPEC §8.1), the v1.1 aggregates and the v2 janitor.
+// It reads the jobs of this course only (courseJobs).
 func (s *Server) courseView(ctx context.Context, c model.Course) (Course, error) {
-	ix, err := s.loadJobs(ctx)
+	rd, err := s.readCourses(ctx, []string{c.ID}, true)
 	if err != nil {
 		return Course{}, err
 	}
-	return s.courseViewJobs(ctx, c, ix, s.janitorConfigured(ctx))
+	ix, err := s.courseJobs(ctx, c, rd)
+	if err != nil {
+		return Course{}, err
+	}
+	return s.courseViewJobs(ctx, c, ix, s.janitorConfigured(ctx), rd)
 }
 
 // courseAgg are the lecture-derived aggregates of a course (Course and CourseCard).
@@ -1056,9 +1076,18 @@ type courseAgg struct {
 	drafts         int
 	stale          int
 	running        int
+	failed         int // launched lectures with a failed stage (failedLecture)
 	patchesPending int
 	lastActivity   string
 	anyExportDone  bool
+}
+
+// failedLecture reports whether a lecture counts as failed (v3.2.x r7,
+// T24 S2): launched (a draft is not on the dashboard either) and some
+// current stage failed for good — the dashboard's failures, without their
+// 24-hour window. Cancelled stages are not failures.
+func failedLecture(l model.Lecture, jobs []model.Job) bool {
+	return !state.IsDraft(l) && anyStatus(jobs, model.StatusFailed)
 }
 
 func maxTime(cur string, ts ...*string) string {
@@ -1070,14 +1099,11 @@ func maxTime(cur string, ts ...*string) string {
 	return cur
 }
 
-// aggregate computes courseAgg over the course's lectures; pending[l.ID] is
-// the lecture's number of pending patches (filled here).
-func (s *Server) aggregate(ctx context.Context, c model.Course, lecs []model.Lecture, ix jobIndex, pending map[string]int) (courseAgg, error) {
+// aggregate computes courseAgg over the course's lectures; pend holds the
+// pending patch counts by lecture id (courseReads.pending, absent = 0) and
+// pending[l.ID] gets each lecture's count (filled here).
+func aggregate(c model.Course, lecs []model.Lecture, ix jobIndex, pend, pending map[string]int) courseAgg {
 	a := courseAgg{lectures: len(lecs), lastActivity: c.CreatedAt}
-	pend, err := s.pendingPatchCounts(ctx, lecs)
-	if err != nil {
-		return a, err
-	}
 	for _, l := range lecs {
 		jobs := ix.of(model.ScopeLecture, l.ID)
 		if state.IsDraft(l) {
@@ -1088,6 +1114,9 @@ func (s *Server) aggregate(ctx context.Context, c model.Course, lecs []model.Lec
 		}
 		if anyStatus(jobs, model.StatusQueued, model.StatusRunning) {
 			a.running++
+		}
+		if failedLecture(l, jobs) {
+			a.failed++
 		}
 		if e, ok := findJob(jobs, model.StageExport); ok && e.Status == model.StatusDone {
 			a.anyExportDone = true
@@ -1106,7 +1135,7 @@ func (s *Server) aggregate(ctx context.Context, c model.Course, lecs []model.Lec
 	for _, j := range ix.of(model.ScopeCourse, c.ID) {
 		a.lastActivity = maxTime(a.lastActivity, j.FinishedAt)
 	}
-	return a, nil
+	return a
 }
 
 func (a courseAgg) actions() []string {
@@ -1124,8 +1153,9 @@ func (a courseAgg) actions() []string {
 }
 
 // courseViewJobs builds a Course; janitor: state.JanitorConfigured, read
-// once per request (course lists).
-func (s *Server) courseViewJobs(ctx context.Context, c model.Course, ix jobIndex, janitor bool) (Course, error) {
+// once per request (course lists); rd: the course's reads (readCourses with
+// views, possibly for many courses).
+func (s *Server) courseViewJobs(ctx context.Context, c model.Course, ix jobIndex, janitor bool, rd *courseReads) (Course, error) {
 	v := Course{ID: c.ID, Name: c.Name, CreatedAt: c.CreatedAt, GlossaryVersion: c.GlossaryVersion, Stages: []StageView{},
 		Materials: []Material{}, Code: strOrNil(c.Code), Numbering: c.Numbering}
 	if !model.ValidNumbering(v.Numbering) {
@@ -1135,21 +1165,15 @@ func (s *Server) courseViewJobs(ctx context.Context, c model.Course, ix jobIndex
 	// glossary_seed is shown with a syllabus only (SPEC §8.1); the v2
 	// glossary_review whenever the course has that job (G3.1).
 	shown := make([]model.Job, 0, len(cjobs))
-	sy, err := s.st.GetSyllabus(ctx, c.ID)
-	switch {
-	case err == nil:
+	if sy, ok := rd.syllabi[c.ID]; ok {
 		chars := 0
 		if sy.Text != nil {
 			chars = utf8.RuneCountInString(*sy.Text)
 		}
 		v.Syllabus = &Syllabus{Filename: sy.Filename, Chars: chars, Formatted: fileExists(s.syllabusMDPath(c.ID))}
 		shown = cjobs
-	case !errors.Is(err, db.ErrNotFound):
-		return Course{}, err
-	default:
-		if j, ok := findJob(cjobs, model.StageGlossaryReview); ok {
-			shown = append(shown, j)
-		}
+	} else if j, ok := findJob(cjobs, model.StageGlossaryReview); ok {
+		shown = append(shown, j)
 	}
 	if len(shown) > 0 {
 		v.Stages = s.stageViews(model.ScopeCourse, shown, false, "")
@@ -1172,11 +1196,7 @@ func (s *Server) courseViewJobs(ctx context.Context, c model.Course, ix jobIndex
 			pending = true
 		}
 	}
-	mats, err := s.st.ListMaterials(ctx, c.ID)
-	if err != nil {
-		return Course{}, err
-	}
-	for _, m := range mats {
+	for _, m := range rd.materials[c.ID] {
 		jobs := ix.of(model.ScopeMaterial, m.ID)
 		v.Materials = append(v.Materials, s.materialViewJobs(m, jobs))
 		if mt, ok := findJob(jobs, model.StageMaterialTerms); termsWait && ok && mt.Status != model.StatusDone && mt.Status != model.StatusStale {
@@ -1184,25 +1204,15 @@ func (s *Server) courseViewJobs(ctx context.Context, c model.Course, ix jobIndex
 		}
 	}
 	v.GlossaryPending = pending
-	terms, err := s.termCounts(ctx, []string{c.ID})
-	if err != nil {
-		return Course{}, err
-	}
-	v.TermCount = terms[c.ID]
-	lecs, err := s.st.ListLectures(ctx, c.ID)
-	if err != nil {
-		return Course{}, err
-	}
-	a, err := s.aggregate(ctx, c, lecs, ix, nil)
-	if err != nil {
-		return Course{}, err
-	}
+	v.TermCount = rd.terms[c.ID]
+	a := aggregate(c, rd.lectures[c.ID], ix, rd.pending, nil)
 	v.LectureCount = a.lectures
 	v.DraftCount, v.StaleLectureCount, v.RunningCount, v.PatchesPending = a.drafts, a.stale, a.running, a.patchesPending
+	v.FailedCount = a.failed
 	v.LastActivityAt = a.lastActivity
 	v.CourseActions = a.actions()
-	v.Janitor = s.janitorStatus(ctx, c.ID, review, hasReview, janitor)
-	if err := s.courseCalendarFields(ctx, &v, c, ix); err != nil {
+	v.Janitor = s.janitorStatus(ctx, rd.kv, c.ID, review, hasReview, janitor)
+	if err := s.courseCalendarFields(ctx, rd.kv, &v, c, ix); err != nil {
 		return Course{}, err
 	}
 	return v, nil
@@ -1212,8 +1222,9 @@ func (s *Server) courseViewJobs(ctx context.Context, c model.Course, ix jobIndex
 // calendar, the file-name rule, whether a generated rule waits for the user
 // (P13.3.3 "已识别文件名中的录制时间格式"), whether an automatic apply can be
 // undone, the filename_rule task, and whether citations were exported
-// (P13.6). kv values "" count as absent.
-func (s *Server) courseCalendarFields(ctx context.Context, v *Course, c model.Course, ix jobIndex) error {
+// (P13.6). kv values "" count as absent. kv is the store the kv entries
+// are read from (courseReads.kv).
+func (s *Server) courseCalendarFields(ctx context.Context, kv db.Store, v *Course, c model.Course, ix jobIndex) error {
 	v.TermStart = strOrNil(c.TermStart)
 	v.SkipWeeks = c.SkipWeeks
 	if v.SkipWeeks == nil {
@@ -1221,20 +1232,20 @@ func (s *Server) courseCalendarFields(ctx context.Context, v *Course, c model.Co
 	}
 	v.FilenameRule = parseRule(c.FilenameRule)
 	var err error
-	if _, v.FilenameProposal, err = s.kvValue(ctx, model.KVFilenameProposal+c.ID); err != nil {
+	if _, v.FilenameProposal, err = kvValueIn(ctx, kv, model.KVFilenameProposal+c.ID); err != nil {
 		return err
 	}
-	if _, v.FilenameUndo, err = s.kvValue(ctx, model.KVFilenameUndo+c.ID); err != nil {
+	if _, v.FilenameUndo, err = kvValueIn(ctx, kv, model.KVFilenameUndo+c.ID); err != nil {
 		return err
 	}
 	if j, ok := findJob(ix.aux(model.ScopeCourse, c.ID), model.StageFilenameRule); ok {
 		t := s.auxView(j)
 		v.FilenameTask = &t
 	}
-	if v.CiteExported, err = s.citeExported(ctx, c.ID); err != nil {
+	if v.CiteExported, err = citeExportedIn(ctx, kv, c.ID); err != nil {
 		return err
 	}
-	notices, err := stages.RenumberNotices(ctx, s.st, c.ID)
+	notices, err := stages.RenumberNotices(ctx, kv, c.ID)
 	if len(notices) > 0 {
 		v.RenumberNotices = notices
 	}

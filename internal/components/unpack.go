@@ -113,11 +113,14 @@ func entryRel(dst, name string, lay layout) (string, string, error) {
 	return filepath.Join(dst, filepath.FromSlash(rel)), rel, nil
 }
 
-type deferredLink struct{ target, at string }
+type deferredLink struct{ target, at, rel string }
 
 // linkTarget checks a symbolic link's target: relative, and inside the
 // destination when resolved from the entry's place (rel: the entry's path
-// relative to the destination, after strip).
+// relative to the destination, after strip). ".." may only lead the target:
+// after a name ("d/../x") it is resolved from wherever that name leads,
+// another link's target when the name is a link (security review SEC13
+// low-3).
 func linkTarget(rel, entry, linkname string) (string, error) {
 	linkname = strings.ReplaceAll(linkname, `\`, "/")
 	target := path.Join(path.Dir(rel), linkname)
@@ -125,7 +128,86 @@ func linkTarget(rel, entry, linkname string) (string, error) {
 		target == ".." || strings.HasPrefix(target, "../") || target == "." {
 		return "", fmt.Errorf("unsafe link %q -> %q", entry, linkname)
 	}
+	named := false
+	for _, c := range strings.Split(linkname, "/") {
+		switch c {
+		case "", ".":
+		case "..":
+			if named {
+				return "", fmt.Errorf("unsafe link %q -> %q", entry, linkname)
+			}
+		default:
+			named = true
+		}
+	}
 	return filepath.FromSlash(linkname), nil
+}
+
+// linkSet collects an archive's symbolic links, which are made after all
+// its files, and refuses link chains (security review SEC13 low-3): an
+// entry below a symbolic link entry, whichever comes first in the archive,
+// would be written wherever that link leads, and a link there would be
+// resolved from that place rather than from the one linkTarget checked.
+// Names are compared case-insensitively, as Windows and macOS file systems
+// do; makeLinks checks the directories on disk as well.
+type linkSet struct {
+	links []deferredLink
+	link  map[string]string // folded rel -> rel of each symbolic link entry
+	dir   map[string]bool   // folded rels used as directories
+}
+
+func newLinkSet() *linkSet {
+	return &linkSet{link: map[string]string{}, dir: map[string]bool{}}
+}
+
+// entry records a file or a directory at rel: refused below a link.
+func (s *linkSet) entry(name, rel string, isDir bool) error {
+	d := rel
+	if !isDir {
+		d = path.Dir(rel)
+	}
+	for ; d != "."; d = path.Dir(d) {
+		k := strings.ToLower(d)
+		if l, ok := s.link[k]; ok {
+			return fmt.Errorf("unsafe archive entry %q: below the link %q", name, l)
+		}
+		s.dir[k] = true
+	}
+	return nil
+}
+
+// hardLink records a hard link at rel to src (relative to the destination
+// too): refused below a link, and to a link or a path below one. Within
+// one archive the last two would also fail later, as no symbolic link
+// exists yet when a hard link is made; these checks say why, and do not
+// depend on links being made last.
+func (s *linkSet) hardLink(name, rel, src string) error {
+	if err := s.entry(name, rel, false); err != nil {
+		return err
+	}
+	if _, ok := s.link[strings.ToLower(src)]; ok {
+		return fmt.Errorf("unsafe hard link %q -> %q", name, src)
+	}
+	if err := s.entry(name, src, false); err != nil {
+		return fmt.Errorf("unsafe hard link %q -> %q", name, src)
+	}
+	return nil
+}
+
+// symlink records a symbolic link at rel (target checked by linkTarget, at
+// its place in dst): refused below another link, and where an entry used
+// rel as a directory.
+func (s *linkSet) symlink(name, rel, target, at string) error {
+	if err := s.entry(name, rel, false); err != nil {
+		return err
+	}
+	k := strings.ToLower(rel)
+	if s.dir[k] {
+		return fmt.Errorf("unsafe link %q: the archive has entries below it", name)
+	}
+	s.link[k] = rel
+	s.links = append(s.links, deferredLink{target: target, at: at, rel: rel})
+	return nil
 }
 
 func untarGz(ctx context.Context, archive string, lay layout, dst string) error {
@@ -140,7 +222,7 @@ func untarGz(ctx context.Context, archive string, lay layout, dst string) error 
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
-	var links []deferredLink
+	links := newLinkSet()
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -161,10 +243,16 @@ func untarGz(ctx context.Context, archive string, lay layout, dst string) error 
 		}
 		switch h.Typeflag {
 		case tar.TypeDir:
+			if err := links.entry(h.Name, rel, true); err != nil {
+				return err
+			}
 			if err := os.MkdirAll(p, 0o755); err != nil {
 				return err
 			}
 		case tar.TypeReg, tar.TypeRegA:
+			if err := links.entry(h.Name, rel, false); err != nil {
+				return err
+			}
 			if err := writeEntry(p, tr, h.FileInfo().Mode()); err != nil {
 				return err
 			}
@@ -174,7 +262,9 @@ func untarGz(ctx context.Context, archive string, lay layout, dst string) error 
 			if err != nil {
 				return err
 			}
-			links = append(links, deferredLink{target: target, at: p})
+			if err := links.symlink(h.Name, rel, target, p); err != nil {
+				return err
+			}
 		case tar.TypeLink:
 			src, srcRel, err := entryRel(dst, h.Linkname, layout{Strip: lay.Strip})
 			if err != nil || src == "" {
@@ -182,6 +272,9 @@ func untarGz(ctx context.Context, archive string, lay layout, dst string) error 
 			}
 			if lay.excluded(srcRel) {
 				continue // its file was left out
+			}
+			if err := links.hardLink(h.Name, rel, srcRel); err != nil {
+				return err
 			}
 			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 				return err
@@ -193,14 +286,21 @@ func untarGz(ctx context.Context, archive string, lay layout, dst string) error 
 			// devices, fifos: not part of a runtime archive
 		}
 	}
-	return makeLinks(links)
+	return makeLinks(dst, links.links)
 }
 
 // makeLinks creates symbolic links after the files exist; where the system
 // refuses symlinks (Windows without the privilege) the target file is
-// copied, a link to a directory or to nothing is left out.
-func makeLinks(links []deferredLink) error {
+// copied, a link to a directory or to nothing is left out. A link is made
+// only where the directories on the way from dst are plain directories: one
+// that is a link or a junction (a link entry under its short 8.3 name or
+// with a trailing dot, something left in dst) would put it elsewhere.
+func makeLinks(dst string, links []deferredLink) error {
+	plain := map[string]bool{}
 	for _, l := range links {
+		if err := plainDirs(dst, l.rel, plain); err != nil {
+			return err
+		}
 		if err := os.MkdirAll(filepath.Dir(l.at), 0o755); err != nil {
 			return err
 		}
@@ -224,6 +324,46 @@ func makeLinks(links []deferredLink) error {
 		if err := linkOrCopy(src, l.at); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// plainDirs checks the directories from dst to rel's parent that exist (dst
+// itself not included): each must be a directory, not a symbolic link or a
+// junction (since Go 1.23 neither reports as a directory on Lstat; a cloud
+// files directory still does); MkdirAll makes the missing ones plain. plain
+// caches the ones found.
+//
+// Only links are checked, not the files and directories written before
+// them, which assumes dst holds no link or junction an entry could be
+// written through. installPython and installTool empty dst first
+// (removeAllRetry). installFiles does not: staging/<sub> is kept across a
+// pause and shared by the archives of one build. It then holds only what
+// earlier archives of this install unpacked through these same checks
+// (unpacking never makes a junction), so each link in it resolves inside
+// dst, a file written through one stays inside, and a link made through
+// one is refused here.
+func plainDirs(dst, rel string, plain map[string]bool) error {
+	cur := dst
+	for _, c := range strings.Split(path.Dir(rel), "/") {
+		if c == "." {
+			break
+		}
+		cur = filepath.Join(cur, c)
+		if plain[cur] {
+			continue
+		}
+		fi, err := os.Lstat(cur)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("unsafe link %q: %q on its way is a link, a junction or a file, not a directory", rel, c)
+		}
+		plain[cur] = true
 	}
 	return nil
 }
@@ -256,7 +396,7 @@ func unzipAll(ctx context.Context, archive string, lay layout, dst string) error
 		return err
 	}
 	defer zr.Close()
-	var links []deferredLink
+	links := newLinkSet()
 	for _, zf := range zr.File {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -277,14 +417,19 @@ func unzipAll(ctx context.Context, archive string, lay layout, dst string) error
 			if err != nil {
 				return err
 			}
-			links = append(links, deferredLink{target: t, at: p})
+			if err := links.symlink(zf.Name, rel, t, p); err != nil {
+				return err
+			}
 			continue
+		}
+		if err := links.entry(zf.Name, rel, zf.FileInfo().IsDir()); err != nil {
+			return err
 		}
 		if err := writeZipEntry(zf, p); err != nil {
 			return err
 		}
 	}
-	return makeLinks(links)
+	return makeLinks(dst, links.links)
 }
 
 // readZipLink reads the target of a symbolic link entry.

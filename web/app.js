@@ -7,7 +7,7 @@
 // end; nothing here changes state locally.
 
 import { api, setHandlers, connectEvents, MOCK, MOCK_SCENARIO, DEV } from './api.js';
-import { h, clear, toast, actionsDialog, installMenuCloser, preventStrayDrops, preserveFocus } from './dom.js';
+import { h, clear, toast, actionsDialog, installMenuCloser, preventStrayDrops, preserveFocus, closeDialogsOnRoute, everySecond } from './dom.js';
 import { icon } from './icons.js';
 import { mountInspector } from './resources.js';
 import { mountDashboard } from './view_dashboard.js';
@@ -18,6 +18,7 @@ import { mountSystem } from './view_system.js';
 import { mountSettings } from './view_settings.js';
 import { setUploadGuard } from './uploads.js';
 import { setCourseLookup } from './actions.js';
+import { mergeJobEvent } from './pipeline.js';
 import { openWizard } from './wizard.js';
 import { closeMenu, menuButton } from './menu.js';
 import * as U from './util.js';
@@ -25,11 +26,14 @@ import { t, setLocale, setDevMode, getLocale } from './i18n.js';
 import { initialLocale, refreshLocale, chooseLocale, localeChoices, localeName, langAttr, savedZhDisplay } from './language.js';
 import { prepareZh, syncZh } from './zh_display.js';
 import { mountPlayer } from './view_player.js';
+import { coursePart } from './view_transcript.js';
 import { loadKinds } from './kinds.js';
 import { pauseDevice } from './asr_devices.js';
 import { mountOnboarding } from './onboarding.js';
 import { mountPrivacy } from './onboarding_privacy.js';
 import { obApi } from './onboarding_api.js';
+import { loadServers } from './settings_remote.js';
+import { downloadsApi } from './downloads.js';
 
 const listeners = new Set();
 
@@ -44,6 +48,7 @@ const state = {
   view: null,
   route: null,
   connected: true,
+  guide: null, // the setup guide's state (GET /api/onboarding) where read, else null (WD-04)
 };
 
 const ctx = {
@@ -67,7 +72,27 @@ const ctx = {
     state.currentCourse = id;
     renderNav();
   },
+  // round 8 WD-04: the setup guide's state as last read, or null when not
+  // known (the workbench's "continue the guide"; U.guideLeft judges it)
+  guide: () => state.guide,
 };
+
+// The guide's state is read where the page asks anyway (the first launch on
+// the workbench, when the guide is not done and the library has courses)
+// and once more when the guide's page is left ("leave setup" lands on the
+// workbench, or it was done); never by a view (round 8 WD-04).
+function setGuide(g) {
+  state.guide = g || null;
+  if (state.view && state.view.onGuideChanged) state.view.onGuideChanged();
+}
+
+function rereadGuide() {
+  setGuide(null); // what was read before the guide was open is out of date
+  obApi
+    .onboarding({ quiet: true })
+    .then(setGuide)
+    .catch(() => {});
+}
 
 setCourseLookup((id) => state.courses.find((c) => c.id === id) || null);
 
@@ -156,13 +181,16 @@ function setResources(r) {
 // The power-aware policy's notices (power management: policy.notices of the
 // resources snapshot, "已切换 / 已挂起 / 已恢复：电源感知 - …"): each id is
 // announced once, like completions — a toast while the page is looked at,
-// else a system notification.
+// else a system notification. Round 8 WD-06 (as T23 一般 1 for the
+// failures): only what happens while this page is open; a notice of before
+// (its at, sched.PowerNotice, before the page opened: a new browser with its
+// own list of the announced, a list cleared) is remembered without a word.
 function announcePower(r) {
   for (const n of (r.policy && r.policy.notices) || []) {
     const body = n && n.id && n.info ? U.codedText('notes', n.info, '') : '';
     if (!body) continue;
     const hash = n.lecture_id ? `#/lecture/${encodeURIComponent(n.lecture_id)}` : '#/';
-    notify(`power:${n.id}`, t('nav.notify.power_title'), body, hash, n.info.code === 'power.suspended' ? 'warn' : 'info', body);
+    announce(`power:${n.id}`, n.at, t('nav.notify.power_title'), body, hash, n.info.code === 'power.suspended' ? 'warn' : 'info', body);
   }
 }
 
@@ -235,7 +263,16 @@ const inspector = mountInspector(inspEl, {
   onRetry: refreshResources,
   system: () => state.system,
   subscribe: ctx.subscribe, // stream-parallel: background playback files in the system area
+  // R76 L-5: a Colab shutdown in flight or answered: the views (the
+  // workbench's warning) see its busy state and the status it brought
+  onRemoteBusy: () => {
+    const r = inspector.get();
+    if (r) setResources(r);
+  },
 });
+// the workbench's "立即关机" is the panel's (one busy state, R76 L-5)
+ctx.colabShutdown = (mode) => inspector.shutdownColab(mode);
+ctx.colabBusy = () => !!inspector.colabBusy();
 
 // The overlay inspector (narrow windows) closes on Esc or a click outside it.
 document.addEventListener('pointerdown', (e) => {
@@ -288,12 +325,24 @@ async function toggleDevice(card) {
 // ---- nav (A12.1: narrow, Dashboard / courses / settings; diagnostics and notifications at the bottom) ----
 
 // The course link's tooltip: name, then what is going on in the course.
+// T24 S2: and its failed lectures (failed_count, absent from an older server).
 function courseTitle(c, busy, attention) {
   const lines = [`${c.code ? c.code + ' ' : ''}${c.name}`];
   if (busy) lines.push(t('nav.course.running', { n: c.running_count }));
+  if (c.failed_count > 0) lines.push(t('nav.course.failed', { n: c.failed_count }));
   if (c.draft_count) lines.push(t('nav.course.drafts', { n: c.draft_count }));
   if (attention) lines.push(t('nav.course.stale', { n: c.stale_lecture_count }));
   return lines.join('\n');
+}
+
+// The course link's dot: busy, else something to look at (failures, stale
+// lectures); its name says every one of them (T24 S2: a screen reader reads
+// the link as code, name and this).
+function courseDot(c, busy, attention) {
+  const failed = c.failed_count > 0;
+  if (!busy && !failed && !attention) return null;
+  const said = [busy ? t('nav.course.busy') : '', failed ? t('nav.course.failed', { n: c.failed_count }) : '', attention ? t('nav.course.attention') : ''].filter(Boolean);
+  return h('span', { class: busy ? 'nav-dot is-busy' : 'nav-dot is-attn', 'aria-label': U.clauseJoin(said) });
 }
 
 function navItem(href, ic, label, active, extra = null) {
@@ -311,6 +360,7 @@ let navKey = '';
 // Rebuilt only when something it shows changed (no element is replaced
 // under the pointer because of an unrelated refresh).
 function renderNav() {
+  syncTitle(); // the route, the course list or the language changed
   const r = state.route || { name: '' };
   const sys = state.system;
   const hasError = !!sys && sys.checks.some((c) => c.status === 'error');
@@ -322,7 +372,7 @@ function renderNav() {
     notifyEnabled(),
     'Notification' in window ? Notification.permission : '',
     getLocale(),
-    state.courses.map((c) => [c.id, c.code, c.name, c.running_count, c.draft_count, c.stale_lecture_count]),
+    state.courses.map((c) => [c.id, c.code, c.name, c.running_count, c.draft_count, c.stale_lecture_count, c.failed_count || 0]),
   ]);
   if (key === navKey) return;
   navKey = key;
@@ -361,7 +411,7 @@ function renderNav() {
                 },
                 h('span', { class: 'nav-course-code' }, c.code || abbr(c.name)),
                 h('span', { class: 'nav-course-name' }, c.name),
-                busy ? h('span', { class: 'nav-dot is-busy', 'aria-label': t('nav.course.busy') }) : attention ? h('span', { class: 'nav-dot is-attn', 'aria-label': t('nav.course.attention') }) : null,
+                courseDot(c, busy, attention),
               ),
             );
           }),
@@ -379,6 +429,58 @@ function renderNav() {
     );
   });
 }
+
+// ---- page title (T23 general 15) ----
+
+// The browser tab, its history and the task bar name the page: "讲座名 ·
+// 课程 — LectureFlow", "设置 — LectureFlow". From what the page already has
+// (the route, the course list, the view's own heading), with no request of
+// its own; a view's heading comes with its data, so the main area is
+// watched for it.
+const FIXED_TITLES = { dashboard: 'nav.dashboard', courses: 'nav.courses', settings: 'nav.settings', system: 'nav.system', privacy: 'privacy.title', notfound: 'nav.notfound.title' };
+
+function pageTitle() {
+  const r = state.route;
+  if (!r) return '';
+  if (FIXED_TITLES[r.name]) return t(FIXED_TITLES[r.name]);
+  const text = (sel) => {
+    const e = main.querySelector(sel);
+    return e ? e.textContent.trim() : '';
+  };
+  const courseName = (id) => {
+    const c = id ? state.courses.find((x) => x.id === id) : null;
+    return c ? c.name : '';
+  };
+  const both = (page, course) => (page && course ? t('nav.doc_title_in', { page, course }) : page || course);
+  if (r.name === 'course') return courseName(r.id) || text('h1.page-title');
+  if (r.name === 'lecture') return both(text('h1.page-title'), courseName(state.currentCourse));
+  // T28 suggestion 8 (r9 WD-08): the player names the course as the lecture
+  // page does (its name, the lecture's course kept from there); without it
+  // (opened from the workbench, the course list not loaded) the player's
+  // own course code. R88 L1: only when the course kept is this lecture's,
+  // which the player's code tells (the code it shows is its lecture's
+  // course's, coursePart): another course's page opened from the player and
+  // left with "back" keeps that other course
+  if (r.name === 'play') {
+    const code = text('span.pl-course');
+    const kept = state.currentCourse ? state.courses.find((x) => x.id === state.currentCourse) : null;
+    return both(text('span.pl-name'), (kept && code && coursePart(kept) === code ? kept.name : '') || code);
+  }
+  if (r.name === 'onboarding') return text('h1.ob-title');
+  return '';
+}
+
+function syncTitle() {
+  const page = pageTitle();
+  // R76 I-2 (round 8 WD-13): the guide's heading that names the app itself
+  // ("欢迎使用 LectureFlow") is the title alone, not followed by
+  // " — LectureFlow" again (a lecture's title is the user's: as it is)
+  const own = !!state.route && state.route.name === 'onboarding' && page.includes('LectureFlow');
+  const want = !page ? 'LectureFlow' : own ? page : t('nav.doc_title', { page });
+  if (document.title !== want) document.title = want;
+}
+
+new MutationObserver(syncTitle).observe(main, { childList: true, subtree: true, characterData: true });
 
 // Course code fallback: initials of the name (A11.3 rule, display only).
 function abbr(name) {
@@ -431,6 +533,11 @@ function notifyToggle() {
       class: 'nav-item nav-toggle' + (on ? '' : ' is-off'),
       role: 'switch',
       'aria-checked': on ? 'true' : 'false',
+      // round 8 WD-05: named by its label in both layouts (the rail hides
+      // the label and the "开 / 关" text, which left only the title); on or
+      // off is aria-checked, what it does or why it cannot (unsupported,
+      // denied) the title, its description
+      'aria-label': t('nav.notify.label'),
       title,
       disabled: !supported,
       dataset: { fkey: 'nav:notify' },
@@ -491,13 +598,14 @@ function rememberNotified(key) {
 // system notification is for when they are elsewhere. If it cannot be shown
 // (switched off, denied, unsupported) the toast is still there on return.
 // toastText replaces "{title}：{body}" in the toast (a body that names its
-// cause itself, e.g. the power-aware notices).
-async function notify(key, title, body, hash, kind, toastText) {
+// cause itself, e.g. the power-aware notices); toastOpts are the toast's
+// (dom.js toast: sticky).
+async function notify(key, title, body, hash, kind, toastText, toastOpts) {
   if (notified.has(key)) return;
   rememberNotified(key);
   const looking = document.visibilityState === 'visible' && document.hasFocus();
   if (!looking && (await systemNotification(key, title, body, hash))) return;
-  toast(toastText || t('nav.notify.toast', { title, body }), kind);
+  toast(toastText || t('nav.notify.toast', { title, body }), kind, toastOpts);
 }
 
 async function systemNotification(key, title, body, hash) {
@@ -523,6 +631,28 @@ async function systemNotification(key, title, body, hash) {
   }
 }
 
+// T23 一般 1: only what ends while this page is open is announced. An end
+// of before (an event sent again when the stream connects, a new browser
+// with its own list of the announced) is remembered without a toast — an
+// error toast stays until closed, and the workbench lists those failures.
+// NEW_SLACK_MS allows for a clock of the server a little ahead or behind.
+const PAGE_OPENED = Date.now();
+const NEW_SLACK_MS = 60000;
+
+function endedNow(iso) {
+  const ms = Date.parse(iso || '');
+  return !Number.isFinite(ms) || ms >= PAGE_OPENED - NEW_SLACK_MS;
+}
+
+// notify() for an end at endedAt: remembered only when it is of before.
+function announce(key, endedAt, ...args) {
+  if (!endedNow(endedAt)) {
+    if (!notified.has(key)) rememberNotified(key);
+    return;
+  }
+  notify(key, ...args);
+}
+
 async function checkNotify(ev) {
   try {
     if (ev.scope === 'lecture') {
@@ -535,11 +665,11 @@ async function checkNotify(ev) {
         const pending = lec.counts.patches_pending;
         const warn = U.warningHint(lec.stages); // done with warnings is still done, not a failure
         const body = pending ? t('nav.notify.done_pending', { title: lec.title, n: pending }) : lec.title;
-        notify(`done:${lec.id}:${st.finished_at}`, t('nav.notify.done_title'), warn ? U.clauseJoin([body, warn]) : body, hash, 'success');
+        announce(`done:${lec.id}:${st.finished_at}`, st.finished_at, t('nav.notify.done_title'), warn ? U.clauseJoin([body, warn]) : body, hash, 'success');
       } else if (ev.status === 'failed') {
         const st = lec.stages.find((s) => s.stage === ev.stage);
         if (st && U.isFinalFailure(st)) {
-          notify(`fail:${lec.id}:${st.stage}:${st.attempt}:${st.finished_at}`, t('nav.notify.failed_title', { stage: U.stageName(st.stage) }), t('nav.notify.failed_body', { name: lec.title, error: U.excerpt(U.stageErrorText(st), 120) }), hash, 'error');
+          announce(`fail:${lec.id}:${st.stage}:${st.attempt}:${st.finished_at}`, st.finished_at, t('nav.notify.failed_title', { stage: U.stageName(st.stage) }), t('nav.notify.failed_body', { name: lec.title, error: U.excerpt(U.stageErrorText(st), 120) }), hash, 'error');
         }
       }
     } else if (ev.status === 'failed') {
@@ -548,8 +678,9 @@ async function checkNotify(ev) {
       if (!st || !U.isFinalFailure(st)) return;
       const course = (courses || []).find((c) => c.id === ev.scope_id || (c.materials || []).some((m) => m.id === ev.scope_id));
       if (!course) return;
-      notify(
+      announce(
         `fail:${ev.scope_id}:${st.stage}:${st.attempt}:${st.finished_at}`,
+        st.finished_at,
         t('nav.notify.failed_title', { stage: U.stageName(st.stage) }),
         t('nav.notify.failed_body', { name: course.name, error: U.excerpt(U.stageErrorText(st), 120) }),
         `#/course/${encodeURIComponent(course.id)}`,
@@ -558,6 +689,71 @@ async function checkNotify(ev) {
     }
   } catch {
     // shown by the API layer
+  }
+}
+
+// T26 G2: a recording the browser extension sent that failed or needs a
+// refresh is announced like a lecture's failure (the same switch and the
+// same once-only list): the user closed the extension's window and the app
+// is in the tray. A failure that a retry can fix keeps its credentials for
+// FAILED_CREDENTIAL_MINUTES only (internal/fetch DefaultFailedCredentialTTL),
+// so its text says how long a retry goes on from where it stopped. Read on
+// the SSE "changed downloads" (throttled) and when the stream comes back.
+// The back end gives that time with no failed task: the two constants are
+// held together by r8_dashboard_test.go (TestR8FailedCredentialMinutes).
+const FAILED_CREDENTIAL_MINUTES = 30;
+
+// At most one checkDownloads() per DOWNLOADS_MS while the events keep
+// coming (R76 M-2: a debounce never ran while other recordings were
+// fetching, each sending an event every 500 ms, so a failure waited for all
+// of them to stop); a request while it runs runs it once more afterwards.
+// The same as downloads.js's throttle, which that module does not export.
+const DOWNLOADS_MS = 500;
+const downloadsCheck = (() => {
+  let timer = null;
+  let running = false;
+  let again = false;
+  async function run() {
+    timer = null;
+    running = true;
+    try {
+      await checkDownloads();
+    } finally {
+      running = false;
+      if (again) {
+        again = false;
+        request();
+      }
+    }
+  }
+  function request() {
+    if (timer) return;
+    if (running) {
+      again = true;
+      return;
+    }
+    timer = setTimeout(run, DOWNLOADS_MS);
+  }
+  return request;
+})();
+
+async function checkDownloads() {
+  let res;
+  try {
+    res = await downloadsApi.list('');
+  } catch {
+    return; // the workbench's line and the course page say it
+  }
+  for (const d of (res && Array.isArray(res.items) ? res.items : [])) {
+    if (!d || (d.state !== 'failed' && d.state !== 'needs_refresh')) continue;
+    const name = d.title || t('downloads.untitled');
+    const why = U.errorInfoText(d.error, '') || (d.state === 'failed' ? t('downloads.failed_unknown') : t('downloads.needs_refresh.hint'));
+    const retry = d.state === 'failed' && (d.allowed_actions || []).includes('retry');
+    const body = t('nav.notify.failed_body', { name, error: retry ? U.sentenceJoin([why, t('nav.notify.download_retry_window', { minutes: FAILED_CREDENTIAL_MINUTES })]) : why });
+    const hash = d.course_id ? `#/course/${encodeURIComponent(d.course_id)}` : '#/';
+    // R76 L-2 (round 8 WD-08): long, and a thing to do (in the time a retry
+    // goes on, or in the browser): the toast stays until closed
+    announce(`dl:${d.id}:${d.state}:${d.updated_at}`, d.updated_at, t(d.state === 'failed' ? 'nav.notify.download_failed_title' : 'nav.notify.download_refresh_title'), body, hash, 'warn', undefined, { sticky: true });
   }
 }
 
@@ -571,11 +767,33 @@ function debounce(name, fn, ms) {
   timers[name] = setTimeout(() => fn().catch(() => {}), ms);
 }
 
+// T24 G6, T25 G4: "reconnecting in 3 seconds" for ever read as if the page
+// still worked. After LONG_DOWN_MS without the service the banner says that
+// LectureFlow may have quit and should be opened again (the desktop app's
+// window: that its service does not answer); data-i18n follows, so a
+// language switch keeps those words. Checked once a second while down.
+const LONG_DOWN_MS = 30000;
+let downAt = 0;
+
+function setBanner(key) {
+  if (banner.dataset.i18n === key && banner.textContent === t(key)) return;
+  banner.dataset.i18n = key;
+  banner.textContent = t(key);
+}
+
+function bannerKey() {
+  if (Date.now() - downAt < LONG_DOWN_MS) return 'nav.conn_lost';
+  const desktop = !!window.lectureflow && typeof window.lectureflow === 'object';
+  return desktop ? 'nav.conn_lost_long_desktop' : 'nav.conn_lost_long';
+}
+
 function startEvents() {
   connectEvents({
     onUp(reconnected) {
       state.connected = true;
       banner.hidden = true;
+      setBanner('nav.conn_lost');
+      inspector.setOffline(false);
       if (reconnected) {
         fullRefresh();
         for (const fn of listeners) fn('reconnected', null);
@@ -583,9 +801,21 @@ function startEvents() {
     },
     onDown() {
       state.connected = false;
+      downAt = Date.now();
+      setBanner('nav.conn_lost');
       banner.hidden = false;
+      // the resource panel no longer shows the readings of before
+      inspector.setOffline(true);
+      everySecond(banner, () => {
+        if (state.connected) return false;
+        setBanner(bannerKey());
+        return true;
+      });
     },
     onJob(ev) {
+      // v3.2.x P1-c: an event's stats, llm and last_activity_at go into the
+      // stage cards drawn for its lecture (no reload); then the view as before
+      mergeJobEvent(ev);
       if (state.view && state.view.onJob) state.view.onJob(ev);
       for (const fn of listeners) fn('job', ev);
       // running counts, glossary_pending: refetch the course list on status changes
@@ -601,10 +831,12 @@ function startEvents() {
       }
       if (ev.kind === 'course' || ev.kind === 'lecture') debounce('courses', refreshCourses, 300);
       if (ev.kind === 'kinds') debounce('kinds', loadKinds, 200); // the lecture kind catalog (lecture kinds)
+      if (ev.kind === 'downloads') downloadsCheck(); // T26 G2 (throttled, R76 M-2)
       if (ev.kind === 'devices') {
         // SPEC-v2 I6-I10: a device row, a pause, a test or the power state
         debounce('system', refreshSystem, 300);
         debounce('resources', refreshResources, 300);
+        debounce('servers', loadServers, 300); // ssh-1b: a remote server's state
       }
       if (state.view && state.view.onChanged) state.view.onChanged(ev);
       for (const fn of listeners) fn('changed', ev);
@@ -619,6 +851,8 @@ function fullRefresh() {
   refreshCourses().catch(() => {});
   refreshGeneral().catch(() => {});
   refreshResources();
+  loadServers(); // ssh-1b
+  checkDownloads(); // T26 G2: a download that failed while the stream was down
   if (state.view && state.view.refresh) state.view.refresh();
 }
 
@@ -643,6 +877,7 @@ async function firstLaunch() {
       if (!info || info.onboarding_done !== false) return false;
       if ((courses || []).length === 0) return true;
       const st = await obApi.onboarding({ quiet: true }).catch(() => null);
+      if (st) setGuide(st); // the workbench's "continue the guide" (WD-04), also after the 2.5 s
       return !!st && !!st.data && st.data.imported === true;
     },
     () => false,
@@ -686,10 +921,17 @@ export function parseRoute(hash) {
 
 function onRoute() {
   closeMenu({ focus: false });
+  // G3: the dialogs of the page left close (the back and forward buttons
+  // reach here with a modal open)
+  const left = closeDialogsOnRoute();
   const route = parseRoute(location.hash);
   if (state.view && state.view.update && state.view.update(route)) {
     state.route = route;
     renderNav();
+    // the same view: a focus left on the page's body goes back to the
+    // dialog's opener (found again when redrawn), else to the view; one the
+    // view placed itself stays (R62 N3)
+    left.restore(main);
     return;
   }
   if (state.view && state.view.destroy) state.view.destroy();
@@ -723,6 +965,8 @@ function onRoute() {
       ),
     );
   }
+  // the guide's page left (or done): its state as it was left (WD-04)
+  if (prevName === 'onboarding' && route.name !== 'onboarding') rereadGuide();
   main.focus({ preventScroll: true });
 }
 
@@ -833,16 +1077,13 @@ async function boot() {
     if (file.size > 4 * GB) return t('common.upload.too_large');
     const freeMB = state.system && state.system.disk ? state.system.disk.free_mb : 0;
     if (freeMB > 0 && freeMB * 1024 * 1024 - file.size < 2 * GB) {
-      return t('common.upload.no_space', { free: U.fmtMB(freeMB) });
+      // R86 L3 (r9 WD-09, round 9 convention C3): disk sizes in decimal
+      // units, as the upload list shows the files' sizes (U.fmtBytes)
+      return t('common.upload.no_space', { free: U.fmtBytes(freeMB * 1048576) });
     }
     return null;
   });
-  setHandlers({
-    onError(err) {
-      if (err.status === 0 && !state.connected) return; // the banner already says so
-      toast(err.message, err.status >= 500 || err.status === 0 ? 'error' : 'warn');
-    },
-  });
+  setHandlers({ onError: onRequestError });
   renderNav();
   // ?quiet=1 suppresses the mock notice (screenshots).
   if (MOCK && !new URLSearchParams(location.search).has('quiet') && !sessionStorageFlag('lectureflow.mockToast')) toast(t('nav.mock_toast', { scenario: MOCK_SCENARIO }), 'info');
@@ -858,7 +1099,25 @@ async function boot() {
   refreshSystem().catch(() => {});
   if (!state.coursesLoaded) refreshCourses().catch(() => {});
   refreshGeneral().catch(() => {});
+  loadServers(); // ssh-1b: the SSH servers (nothing shows while the back end has them off)
   startEvents();
+}
+
+// The page's handler of failed requests that are not quiet (api.js onError).
+// T24 G6: an action that fails while the "connection lost" banner shows:
+// the banner says the connection is gone, this says that the action did not
+// happen (a short toast, once however many such requests fail). Round 8
+// WD-09 (R76 L-3): a read is not an action ("没有完成…再试一次" does not fit
+// it), and its page says "could not load" itself (another page opened
+// while cut off): no toast. The request's method is err.method (api.js
+// ApiError); an error without it is told, as before. dom.js tellFailure
+// has the same rule for a dialog's requests (round 8 WH-06).
+export function onRequestError(err) {
+  if (err.status === 0 && !state.connected) {
+    if (err.method !== 'GET' && err.method !== 'HEAD') toast(t('nav.conn_lost_action'), 'warn');
+    return;
+  }
+  toast(err.message, err.status >= 500 || err.status === 0 ? 'error' : 'warn');
 }
 
 // true when the flag was already set in this tab (the mock notice once per tab)

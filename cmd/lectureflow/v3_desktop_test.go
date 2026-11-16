@@ -145,7 +145,7 @@ func TestWithLimitExitsOnTimeout(t *testing.T) {
 		time.Sleep(300 * time.Millisecond)
 		close(release)
 	}()
-	withLimit(100*time.Millisecond, exitRestart, exit, func(deadline time.Time) {
+	withLimit(100*time.Millisecond, exitRestart, exit, nil, func(deadline time.Time) {
 		if d := time.Until(deadline); d <= 0 || d > 100*time.Millisecond {
 			t.Errorf("deadline in %v", d)
 		}
@@ -160,7 +160,7 @@ func TestWithLimitExitsOnTimeout(t *testing.T) {
 		t.Fatal("returned too early")
 	}
 	got = nil
-	withLimit(time.Second, exitOK, exit, func(time.Time) {})
+	withLimit(time.Second, exitOK, exit, nil, func(time.Time) {})
 	time.Sleep(10 * time.Millisecond)
 	if len(got) != 0 {
 		t.Fatalf("exit called after a stop within the limit: %v", got)

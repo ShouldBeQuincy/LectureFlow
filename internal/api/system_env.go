@@ -277,7 +277,7 @@ func (s *Server) checkCUDNN(ctx context.Context) SystemCheck {
 		return c
 	}
 	script := filepath.Join(s.cfg.WorkerDir, "asr.py")
-	out, errOut, err := s.pyCmd(ctx, cmdTimeout, python.path, script, "--check-cudnn")
+	out, errOut, err := s.pyScript(ctx, cmdTimeout, python.path, script, "--check-cudnn")
 	m := cudnnRe.FindStringSubmatch(out)
 	if err != nil || m == nil {
 		if err == nil {
@@ -331,7 +331,7 @@ func (s *Server) checkMLXSelftest(ctx context.Context) SystemCheck {
 		return c
 	}
 	script := filepath.Join(s.cfg.WorkerDir, "asr_mlx.py")
-	out, errOut, err := s.pyCmd(ctx, selftestTimeout, python.path, script, "--selftest", "--model", dir)
+	out, errOut, err := s.pyScript(ctx, selftestTimeout, python.path, script, "--selftest", "--model", dir)
 	if err != nil {
 		c.Status = s.backendFail(model.BackendMLX)
 		c.setDetail("check.selftest_failed", map[string]any{"error": workerErr(errOut, err)})
@@ -396,7 +396,7 @@ func (s *Server) checkCPUSelftest(ctx context.Context) SystemCheck {
 			return c
 		}
 		script := filepath.Join(s.cfg.WorkerDir, "asr_openvino.py")
-		out, errOut, err := s.pyCmd(ctx, selftestTimeout, ov.path, script, "--selftest", "--device", "CPU", "--model", dir)
+		out, errOut, err := s.pyScript(ctx, selftestTimeout, ov.path, script, "--selftest", "--device", "CPU", "--model", dir)
 		if err != nil {
 			c.Status = s.backendFail(model.BackendOpenVINO)
 			c.setDetail("check.selftest_failed", map[string]any{"error": workerErr(errOut, err)})
@@ -408,7 +408,7 @@ func (s *Server) checkCPUSelftest(ctx context.Context) SystemCheck {
 	}
 	if fw := s.installedInterp(model.BackendFasterWhisper); fw.ok {
 		script := filepath.Join(s.cfg.WorkerDir, "asr.py")
-		out, errOut, err := s.pyCmd(ctx, selftestTimeout, fw.path, script, "--selftest",
+		out, errOut, err := s.pyScript(ctx, selftestTimeout, fw.path, script, "--selftest",
 			"--device", "cpu", "--compute-type", config.ResolveComputeType(model.PrecisionAuto, "cpu", 0))
 		if err != nil {
 			c.Status = s.backendFail(model.BackendFasterWhisper)

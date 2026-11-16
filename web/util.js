@@ -59,9 +59,92 @@ export function listJoin(items) {
   return (items || []).join(t('common.list_sep'));
 }
 
+/** A name (a slide file's, say) in the current language's quotation marks (settings.quote), as written. */
+export function quoteName(name) {
+  return t('settings.quote', { name: String(name) });
+}
+
 /** Clauses joined with the current language's clause separator (compound notes, several stale reasons). */
 export function clauseJoin(items) {
   return (items || []).join(t('common.clause_sep'));
+}
+
+// UI languages written with letter case, where a sentence starts with a
+// capital (en-XA, the pseudo-locale, is English)
+const CASED_LOCALE = /^(en|ru)(-|$)/;
+
+/**
+ * The parts of a compound note (codedText's params.extra), each a sentence
+ * of its own. In English and Russian a part that starts with a capital
+ * follows as a new sentence ("… upload the complete file again. The
+ * recording is very quiet …"), not after the clause separator ("…; The
+ * recording …", T8); the catalog's notes end without a full stop, and so
+ * does the last part. Parts that start in lower case, and every part in
+ * the languages without letter case (zh, yue, hi), keep the clause
+ * separator; no letter's case is changed.
+ * Not to be confused with joinSentences: that one takes texts that are
+ * already complete sentences (each with its own end mark) and only puts
+ * the space between them; sentenceJoin is for parts without a full stop.
+ */
+export function sentenceJoin(items) {
+  const parts = items || [];
+  let cased = false;
+  try {
+    cased = CASED_LOCALE.test(getLocale() || '');
+  } catch {
+    cased = false;
+  }
+  if (!cased) return clauseJoin(parts);
+  const sep = t('common.clause_sep');
+  let out = '';
+  parts.forEach((p, i) => {
+    const s = String(p);
+    if (i === 0) out = s;
+    else if (/^\p{Lu}/u.test(s)) out += (/[.!?…]$/u.test(out) ? ' ' : '. ') + s;
+    else out += sep + s;
+  });
+  return out;
+}
+
+// A full-width sentence end (。！？), possibly inside closing quotes or a
+// closing bracket (。” 。」 。）): Chinese and Cantonese go on without a
+// space. Written with escapes: a CJK literal in code is a hard-coded text
+// to TestI18nNoHardcodedText.
+const FULL_WIDTH_STOP = /[\u3002\uff01\uff1f][\u201d\u2019\u300d\u300f\uff09]*$/u;
+
+/**
+ * Complete sentences (each a catalog text with its own end mark) as one
+ * text: nothing after a full-width sentence end (。！？), one space after
+ * anything else (". ", "। ", or a text without a mark). Empty parts are
+ * left out. Unlike sentenceJoin, no mark or separator is added: the parts
+ * already are sentences. Use this one for catalog texts that end in their
+ * own full stop (rate-limit notes, VRAM hints); use sentenceJoin for the
+ * parts of a compound note, which end without one and are joined by the
+ * clause separator (or as new sentences in en / ru).
+ */
+export function joinSentences(parts) {
+  return (parts || [])
+    .filter((p) => p != null && p !== false && String(p) !== '')
+    .map(String)
+    .reduce((a, b) => (a === '' ? b : a + (FULL_WIDTH_STOP.test(a) ? '' : ' ') + b), '');
+}
+
+/**
+ * The text with its first letter in upper case, in the UI language's rules
+ * ("пекинское время · …" → "Пекинское время · …"); scripts without letter
+ * case are unchanged.
+ */
+export function upperFirst(s) {
+  const text = String(s || '');
+  if (!text) return '';
+  const first = String.fromCodePoint(text.codePointAt(0));
+  let up;
+  try {
+    up = first.toLocaleUpperCase(getLocale() || undefined);
+  } catch {
+    up = first.toUpperCase();
+  }
+  return up + text.slice(first.length);
 }
 
 // Stage names: stage.{id} (lecture, course and material stages; v2 G3.1
@@ -118,6 +201,159 @@ export function displayStatus(st) {
   return st.display_status || st.status;
 }
 
+// Error codes of a failure that a retry cannot fix (test-media I6): the
+// stored media file itself is damaged, so the stage's retry (still among
+// its allowed_actions, SPEC §4) runs the same file again. Retry is then no
+// primary action, and the stage card explains what to do instead.
+const FUTILE_RETRY_CODES = new Set(['media.corrupt']);
+
+/** Whether a failed stage (or a dashboard failure) has an error that a retry cannot fix. */
+export function retryFutile(st) {
+  return !!(st && st.error_info && FUTILE_RETRY_CODES.has(st.error_info.code));
+}
+
+// Error codes of a failure that the same request cannot get past, and that
+// is billed again when retried as it is (T24 B1): the model refused
+// (llm.refusal), or the answer was still coming at the total time limit
+// (llm.time_limit). The way out is another model: where such a failure is
+// shown, "retry with another model…" is the action offered first, not a
+// plain retry. Shared by the lecture page, the stage cards, the dashboard
+// and the lecture rows: codes may be added here, the names stay.
+export const MODEL_RETRY_CODES = new Set(['llm.refusal', 'llm.time_limit']);
+
+/** Whether a failed stage (or a dashboard failure) needs another model rather than a plain retry. */
+export function retryNeedsModel(st) {
+  return !!(st && st.error_info && MODEL_RETRY_CODES.has(st.error_info.code));
+}
+
+// Whether the first-run guide (GET /api/onboarding) was left unfinished and
+// can be continued: started and not done. A state never started (the welcome
+// step with no answers, e.g. an install from before the guide) asks for
+// nothing. The settings page's rule, shared (round 8 interface F3) so every
+// "continue the guide" entry judges the same.
+export function guideLeft(guide) {
+  return !!guide && !guide.done && (guide.step !== 'welcome' || (!!guide.data && Object.keys(guide.data).length > 0));
+}
+
+// Error codes of a failure whose way out is in Settings (T24 S3, T22 G7),
+// by the block of the settings page that fixes it: a provider's key, a
+// provider the config names but does not set up, a request rejected or
+// failed for the key, base_url or the model name (the providers); a role
+// without a model, or whose provider was deleted (the roles).
+const SETTINGS_FIX_BLOCKS = {
+  'llm.no_api_key': 'providers',
+  'llm.provider_not_configured': 'providers',
+  'llm.rejected': 'providers',
+  'llm.request_failed': 'providers',
+  'llm.no_model': 'roles',
+  'llm.provider_deleted': 'roles',
+  'settings.role_not_configured': 'roles',
+  'settings.role_provider_deleted': 'roles',
+};
+
+/**
+ * Whether a failed LLM request got the answer an unknown model gets: HTTP
+ * 404 (llm.request_failed), or 400 (llm.rejected; DeepSeek's "Model Not
+ * Exist"); never a key refused (401, 403). Only then is the model looked up
+ * in its provider's list (unlistedModel), and the page reads the settings.
+ */
+export function mayBeUnlisted(st) {
+  const info = st && st.error_info;
+  const status = Number(info && info.params && info.params.status);
+  return !!info && ((info.code === 'llm.request_failed' && status === 404) || (info.code === 'llm.rejected' && status === 400));
+}
+
+/**
+ * The model of a failed LLM request (mayBeUnlisted) that its provider's
+ * last probe does not list (T24 S3, T22 G8: the "oldmodel" case), as
+ * {model, provider (its name)}; null otherwise. providers: the settings'
+ * providers (GET /api/settings, each with its probed `models`); the
+ * snapshot's provider is found by id (st.model), else by the error's
+ * provider name. Without the settings, or a provider never probed (no
+ * list), nothing is known: null.
+ */
+export function unlistedModel(st, providers) {
+  if (!mayBeUnlisted(st) || !Array.isArray(providers)) return null;
+  const p = st.error_info.params || {};
+  const m = st.model || {};
+  const prov = (m.provider_id && providers.find((x) => x && x.id === m.provider_id)) || (p.provider && providers.find((x) => x && x.name === p.provider)) || null;
+  const model = m.model || p.model;
+  if (!prov || !model || !Array.isArray(prov.models) || !prov.models.length || modelListed(model, prov.models)) return null;
+  return { model, provider: prov.name || prov.id };
+}
+
+// The date that dated model ids append to an alias ("…-20250929").
+const DATED_SUFFIX = /^[0-9]{6,8}$/;
+
+/**
+ * Whether a model name is in a provider's model list, by the back end's
+ * rule (internal/api/role_models.go modelListed, the diagnostics' and the
+ * settings page's; R72 M2): the same id ignoring case and the spaces
+ * around it, or an alias of a dated id in the list — "claude-sonnet-4-5"
+ * (or "claude-sonnet-4-5-latest") for "claude-sonnet-4-5-20250929":
+ * providers answer such aliases while their lists show the dated ids.
+ */
+export function modelListed(name, list) {
+  if (!Array.isArray(list)) return false;
+  const m = String(name == null ? '' : name).trim().toLowerCase();
+  const base = m.endsWith('-latest') ? m.slice(0, -'-latest'.length) : m;
+  return list.some((x) => {
+    const id = String(x).toLowerCase();
+    return id === m || (id.startsWith(base + '-') && DATED_SUFFIX.test(id.slice(base.length + 1)));
+  });
+}
+
+// The stages whose retry may name another model ("retry with another
+// model…"): pipeline.js MODEL_RETRY_STAGES, which util.js cannot import
+// (pipeline.js imports util.js); r8_shared_test.go pins the two together.
+const MODEL_RETRY_STAGE_SET = new Set(['summary', 'repair', 'translate']);
+
+/**
+ * Where in Settings a failed stage's way out is (T24 S3, T22 G7, G8): {href
+ * (#/settings/{block}; a provider's row #/settings/providers/{id} when the
+ * failure tells which, failedProviderId), unlisted (unlistedModel, or
+ * null)}; null when Settings does not fix it. A model its provider no
+ * longer lists is changed in the roles. providers as for unlistedModel
+ * (null: not known).
+ * A refusal or the time limit (MODEL_RETRY_CODES) of a stage that has no
+ * "retry with another model…" (the course's term extraction and glossary
+ * cleanup, the slides' terms, a lecture's title task: no snapshot to retry
+ * another model with) is fixed in the roles: a plain retry would fail, and
+ * be billed, again (T24 B1; the stage card then puts "open settings" first).
+ */
+export function settingsFix(st, providers) {
+  const code = st && st.error_info && st.error_info.code;
+  const block = code && Object.prototype.hasOwnProperty.call(SETTINGS_FIX_BLOCKS, code) ? SETTINGS_FIX_BLOCKS[code] : '';
+  if (!block) return code && MODEL_RETRY_CODES.has(code) && !MODEL_RETRY_STAGE_SET.has(st.stage) ? { href: '#/settings/roles', unlisted: null } : null;
+  const unlisted = unlistedModel(st, providers);
+  if (unlisted) return { href: '#/settings/roles', unlisted };
+  // a provider's key or address: its row (#/settings/providers/{id}, round
+  // 8 convention F4) when the failure tells which one, else the section
+  const id = block === 'providers' ? failedProviderId(st, providers) : '';
+  return { href: id ? `#/settings/providers/${encodeURIComponent(id)}` : `#/settings/${block}`, unlisted: null };
+}
+
+/**
+ * The id of the provider a failed request names, or ''. The back end names
+ * it by its name (error_info.params.provider: llm.no_api_key, llm.rejected,
+ * llm.request_failed); an id it may give (params.provider_id) is taken as
+ * it is. The name is looked up in the providers the page read: one of that
+ * name, its id; several, the one the stage's snapshot names (st.model); not
+ * found, ''. The providers not read (a key failure reads none): the
+ * snapshot's provider when it has that name (a lecture stage's request
+ * goes to its snapshot's provider, whose current name the view gives).
+ */
+function failedProviderId(st, providers) {
+  const p = (st.error_info && st.error_info.params) || {};
+  if (typeof p.provider_id === 'string' && p.provider_id) return p.provider_id;
+  if (!p.provider) return '';
+  const m = st.model || {};
+  if (!Array.isArray(providers)) return m.provider_id && m.provider_name === p.provider ? m.provider_id : '';
+  const named = providers.filter((x) => x && x.id && x.name === p.provider);
+  if (named.length === 1) return named[0].id;
+  return named.length > 1 && m.provider_id && named.some((x) => x.id === m.provider_id) ? m.provider_id : '';
+}
+
 // A done stage that still carries an error text finished with a warning
 // (e.g. repair chunks that could not be repaired, NOTES.md Gate B 4). It is
 // not a failure: no failure styling, no failure notification.
@@ -128,11 +364,32 @@ export function hasWarning(st) {
 // "Running 42%" for running stages, "Queued · 39% done (checkpoint)" for a
 // queued stage that keeps its checkpoint, the plain status name otherwise.
 export function stageStatusText(st) {
-  if (st.status === 'running') return t('common.status.running_pct', { pct: pct(st.progress) });
+  if (st.status === 'running') return Number(st.progress) > 0 ? t('common.status.running_pct', { pct: pct(st.progress) }) : startingText(st);
   const ck = checkpointProgress(st);
   if (ck != null) return t('common.status.queued_checkpoint', { pct: pct(ck) });
   if (hasWarning(st)) return t('common.status.done_warning');
   return statusName(displayStatus(st));
+}
+
+// A run that has reported no progress yet (T25 G1, G2): not "运行中 0%". A
+// transcription on this computer first loads its model and finds the
+// speech; run again (a retry, the restart after the app was closed) it may
+// go on from its checkpoint — said without a promise (R79 M3: another
+// device, model or snapshot starts over, asr.go discardForeignCheckpoint).
+// A remote transcription never continues the local checkpoint, and a
+// translation retried with another model starts over: they, and anything
+// else, are getting ready.
+function startingText(st) {
+  if (st.stage !== 'asr' || remoteASR(st)) return t('common.status.running_preparing');
+  return st.attempt > 0 ? t('common.status.running_resuming') : t('common.status.running_preparing_asr');
+}
+
+/** Whether an asr stage runs (or is bound to run) away from this computer: Colab, an SSH server. */
+export function remoteASR(st) {
+  if (!st || st.stage !== 'asr') return false;
+  if (st.stats && st.stats.remote) return true;
+  const d = st.model && st.model.asr ? st.model.asr.device_id : '';
+  return typeof d === 'string' && (d === 'colab:remote' || d.startsWith('ssh:'));
 }
 
 // Short hint for the stages that finished with a warning ("Repair has warnings").
@@ -164,7 +421,7 @@ export const JANITOR_ACTION_NAMES = nameTable('glossary.janitor_action.', ['enfo
 const CHECK_PRODUCTS = { ffmpeg: 'ffmpeg', python: 'Python', 'faster-whisper': 'faster-whisper', pypdf: 'pypdf', gpu: 'GPU', openvino: 'OpenVINO', mlx: 'MLX' };
 // SPEC-v2 I10 added openvino_venv, openvino_devices and npu_driver; 3.1.0
 // (mac-opti M3) mlx_python and mlx_model
-const CHECK_KEYS = new Set(['data_dir', 'credentials', 'data_dir_location', 'cuda', 'disk', 'openvino_venv', 'openvino_devices', 'npu_driver', 'mlx_python', 'mlx_model']);
+const CHECK_KEYS = new Set(['data_dir', 'credentials', 'data_dir_location', 'install_dir', 'cuda', 'disk', 'openvino_venv', 'openvino_devices', 'npu_driver', 'mlx_python', 'mlx_model']);
 
 export function checkName(name) {
   if (CHECK_KEYS.has(name)) return t(`common.check.${name}`);
@@ -368,6 +625,12 @@ export function waitingForText(w, sys, res) {
   if (w === 'remote_busy') return t('waiting.remote_busy');
   if (w === 'remote_fallback') return t('waiting.remote_fallback');
   if (w === 'remote_held') return t('waiting.remote_held');
+  // ssh-mvp / ssh-1b: the user's own SSH servers — not reachable now, the
+  // environment not installed (or installing), handed back with no local
+  // device to take it (the lecture menu offers "改用“服务器”处理")
+  if (w === 'remote_offline') return t('waiting.remote_offline');
+  if (w === 'remote_setup') return t('waiting.remote_setup');
+  if (w === 'remote_fallback_ssh') return t('waiting.remote_fallback_ssh');
   if (w === 'memory') return t('waiting.memory');
   if (w === 'no_asr_device') return t('waiting.no_asr_device');
   if (w === 'gpu_slot' && withDevices) return t('waiting.device_slot');
@@ -396,6 +659,36 @@ export function waitingForText(w, sys, res) {
   // v2 P12.6: offpeak:{local HH:MM} — the provider only takes requests off-peak
   if (w.startsWith(WAIT_OFFPEAK)) return t('waiting.offpeak', { time: w.slice(WAIT_OFFPEAK.length) });
   return w;
+}
+
+// The power-aware waits that hold a transcription until the computer is
+// plugged in ("挂起：电源感知 - …"; on_battery before power management).
+const POWER_SUSPENDED = new Set(['power_wait_ac', 'power_no_saver_device', 'power_no_device', 'on_battery']);
+
+/** Whether a waiting_for holds the transcription until the computer is plugged in (T24 S4). */
+export function powerSuspended(w) {
+  return typeof w === 'string' && POWER_SUSPENDED.has(w);
+}
+
+/**
+ * Whether the resources list an Intel GPU or NPU that is present but turned
+ * off (T24 S4): turned on in Settings, it could take a transcription the
+ * power policy holds on battery. false without a snapshot.
+ */
+export function saverDeviceOff(res) {
+  return !!res && Array.isArray(res.devices) && res.devices.some((d) => !!d && (d.kind === 'igpu' || d.kind === 'npu') && !!d.present && !d.enabled);
+}
+
+/**
+ * Whether plugging in gives a transcription a device (the policy's AC
+ * chain, internal/devices/policy.go: the first usable NVIDIA GPU, else the
+ * first usable Intel GPU; the NPU and the CPU are not in it): a cuda or
+ * igpu device that is turned on and present. true without a snapshot (not
+ * known: the notice says what holds as a rule).
+ */
+export function acDeviceUsable(res) {
+  if (!res || !Array.isArray(res.devices)) return true;
+  return res.devices.some((d) => !!d && (d.kind === 'cuda' || d.kind === 'igpu') && !!d.present && !!d.enabled);
 }
 
 // ---- the retry countdown (3.2.0 L12) ----
@@ -459,6 +752,12 @@ function paramValue(ns, name, v, code) {
   if (name === 'status' && typeof v === 'string') return statusName(v);
   if (name === 'stream_status' && typeof v === 'string') return named('common.stream_status.', v);
   if (typeof v === 'number' && isFinite(v)) {
+    // a size the back end could not tell is sent as -1 (components.disk_full
+    // when a copy hit a full disk, internal/components/importfile.go;
+    // remote.no_space without the agent's figures, internal/remote
+    // protocol.go): "unknown", as the components page says it
+    // (components_ui.js), not "-1 MB"
+    if ((name.endsWith('_bytes') || name.endsWith('_mb')) && v < 0) return t('compui.unknown_size');
     if (name.endsWith('_bytes')) return fmtBytes(v);
     if (name.endsWith('_mb')) return fmtMB(v);
     // decimals with the language's decimal sign (qa.length_ratio {ratio} 0.38, {min} 0.5)
@@ -486,7 +785,7 @@ export function codedText(ns, info, fallback = '') {
   for (const [k, v] of Object.entries(raw)) if (k !== 'extra') params[k] = paramValue(ns, k, v, info.code);
   const main = t(key, params);
   const extra = Array.isArray(raw.extra) ? raw.extra.map((x) => codedText(ns, x, '')).filter(Boolean) : [];
-  return extra.length ? clauseJoin([main, ...extra]) : main;
+  return extra.length ? sentenceJoin([main, ...extra]) : main;
 }
 
 /** A coded error (HTTP error body, job error, batch item, balance, provider test). */
@@ -494,12 +793,45 @@ export function errorInfoText(info, fallback = '') {
   return codedText('errors', info, fallback);
 }
 
-/** A stage's error: its coded warning (done with a warning) or error, else the text. */
+/**
+ * A stage's error: its coded warning (done with a warning) or error, else
+ * the text. While the stage is retried (retryPending: the countdown, then
+ * queued for a slot and running the next attempt — the back end keeps the
+ * last error until the retry succeeds), an error whose text tells the user
+ * to click "重试" (there is no button then, the retry comes by itself) is
+ * said without that (T24 G5, R72 M3): common.retrying.{code}, the same
+ * sentence up to the advice.
+ * A refusal or the time limit (MODEL_RETRY_CODES) of a lecture's summary,
+ * correction or translation (MODEL_RETRY_STAGE_SET) is said with only the
+ * way out these stages have, "retry with another model…"
+ * (common.lecture_error.{code}, T28 suggestion 2): errors.{code} also says
+ * where the other tasks change the model (Settings → Roles), which the
+ * lecture page's banner and stage cards do not need. A catalog without the
+ * key: errors.{code}, as before. Course-level stages and the other callers
+ * of errorInfoText are unchanged.
+ */
 export function stageErrorText(st) {
   if (!st) return '';
   if (hasWarning(st) && st.warning_info) return codedText('warnings', st.warning_info, st.error || '');
-  if (st.error_info) return codedText('errors', st.error_info, st.error || '');
+  if (st.error_info) {
+    const code = st.error_info.code;
+    if (retryPending(st) && code && has(`common.retrying.${code}`)) return codedText('common.retrying', st.error_info, st.error || '');
+    if (MODEL_RETRY_CODES.has(code) && MODEL_RETRY_STAGE_SET.has(st.stage) && has(`common.lecture_error.${code}`)) return codedText('common.lecture_error', st.error_info, st.error || '');
+    return codedText('errors', st.error_info, st.error || '');
+  }
   return st.error || '';
+}
+
+/**
+ * Whether a stage's error is a past attempt's, the stage being retried: it
+ * is queued or running again (an automatic retry, a retry the user started,
+ * the restart after the app was closed), or it failed and still waits for
+ * its automatic retry (waiting_for retry_backoff:{s}). Not a final failure.
+ */
+export function retryPending(st) {
+  if (!st) return false;
+  if (st.status === 'queued' || st.status === 'running') return true;
+  return typeof st.waiting_for === 'string' && st.waiting_for.startsWith(WAIT_RETRY_BACKOFF);
 }
 
 /** A stage's note (job.stats.note_info, else the note text). */
@@ -508,12 +840,11 @@ export function noteText(st) {
   return st.note_info ? codedText('notes', st.note_info, st.note || '') : st.note || '';
 }
 
-/**
- * One stale reason {code, params} (model.StaleCode*), like the back end's
- * state.StaleReasonText: a glossary reason without a recorded "from" shows
- * the current version only; a legacy reason shows its original text.
- */
-export function staleReasonText(r) {
+// One stale reason's text; keep(s) is what stands in it for a text the
+// reason carries as written (a file name, a list of them, a text recorded
+// before v2, an unknown code's string param): s itself, or a mark
+// (staleReasonInline).
+function staleReason(r, keep) {
   if (!r || !r.code) return t('stale.reason.input_changed');
   const p = r.params || {};
   switch (r.code) {
@@ -523,21 +854,65 @@ export function staleReasonText(r) {
       if (p.from == null) return t(`stale.reason.${r.code}_now`, { to: p.to });
       return t(`stale.reason.${r.code}`, { from: p.from, to: p.to });
     case 'material_changed':
-      return p.filename ? t('stale.reason.material_changed', { filename: p.filename }) : t('stale.reason.material_changed_plain');
+      // one slide file, quoted as the lists' names are (R94, R95)
+      return p.filename ? t('stale.reason.material_changed', { filename: keep(quoteName(p.filename)) }) : t('stale.reason.material_changed_plain');
     case 'materials_changed': {
       // lecture kinds: the slides a lecture uses (its own, its week's,
-      // course-wide) changed; added / removed are file-name lists
-      const added = Array.isArray(p.added) && p.added.length ? listJoin(p.added.map(String)) : '';
-      const removed = Array.isArray(p.removed) && p.removed.length ? listJoin(p.removed.map(String)) : '';
+      // course-wide) changed; added / removed are file-name lists, each
+      // name in the language's quotation marks (round 10 C190: a name may
+      // hold the list separator, a capital, quotes of its own)
+      const names = (v) => (Array.isArray(v) && v.length ? keep(listJoin(v.map((x) => quoteName(x)))) : '');
+      const added = names(p.added);
+      const removed = names(p.removed);
       if (added && removed) return t('stale.reason.materials_changed', { added, removed });
       if (added) return t('stale.reason.materials_changed_added', { added });
       if (removed) return t('stale.reason.materials_changed_removed', { removed });
       return t('stale.reason.materials_changed_plain');
     }
     case 'legacy':
-      return p.text != null && String(p.text).trim() ? t('stale.reason.legacy', { text: String(p.text) }) : t('stale.reason.input_changed');
+      return p.text != null && String(p.text).trim() ? t('stale.reason.legacy', { text: keep(String(p.text)) }) : t('stale.reason.input_changed');
   }
-  return has(`stale.reason.${r.code}`) ? t(`stale.reason.${r.code}`, p) : t('stale.reason.input_changed');
+  if (!has(`stale.reason.${r.code}`)) return t('stale.reason.input_changed');
+  const params = {};
+  for (const [k, v] of Object.entries(p)) params[k] = typeof v === 'string' ? keep(v) : v;
+  return t(`stale.reason.${r.code}`, params);
+}
+
+/**
+ * One stale reason {code, params} (model.StaleCode*), like the back end's
+ * state.StaleReasonText: a glossary reason without a recorded "from" shows
+ * the current version only; a legacy reason shows its original text. As
+ * it reads at the start of a sentence (or alone).
+ */
+export function staleReasonText(r) {
+  return staleReason(r, (s) => s);
+}
+
+// Private-use marks (U+E000, U+E001) around the index of a kept text while
+// the mid-sentence form is made: {reason:lc} sees the marks and a number,
+// no letter.
+const KEEP_OPEN = String.fromCharCode(0xe000);
+const KEEP_CLOSE = String.fromCharCode(0xe001);
+const KEEP_MARK = new RegExp(`${KEEP_OPEN}([0-9]+)${KEEP_CLOSE}`, 'g');
+
+/**
+ * One stale reason in mid-sentence (round 10 C190): after the clause
+ * separator when several are joined (staleSummaryText), after the label of
+ * the update dialog (update_confirm.js). stale.reason_inline: {reason:lc}
+ * in Russian lowers the first letter of the reason's own words ("Почему
+ * нужно обновить: изменились слайды…"), {reason} elsewhere leaves it as
+ * staleReasonText.
+ * The texts the reason carries (file names, a recorded text) are kept out
+ * of the modifier and come back as written (in one pass: a kept text that
+ * holds such marks itself is not read again).
+ */
+export function staleReasonInline(r) {
+  const kept = [];
+  const text = staleReason(r, (s) => {
+    kept.push(s);
+    return `${KEEP_OPEN}${kept.length - 1}${KEEP_CLOSE}`;
+  });
+  return t('stale.reason_inline', { reason: text }).replace(KEEP_MARK, (m, i) => (Number(i) < kept.length ? kept[Number(i)] : m));
 }
 
 /** A stale stage's reason: stale_info, else the transitional stale_reason text. */
@@ -549,11 +924,21 @@ export function stageStaleText(st) {
 
 /**
  * Lecture.stale {reasons, stages} as the row text of v1.1 A2.2
- * ("{reasons}, needs updating: {stages}"); "" when nothing is stale.
+ * ("{reasons}, needs updating: {stages}"); "" when nothing is stale. The
+ * first reason starts the sentence; the next ones, after the clause
+ * separator, are in mid-sentence (staleReasonInline). A reason said twice
+ * is said once.
  */
 export function staleSummaryText(stale) {
   if (!stale || !(stale.stages || []).length) return '';
-  const reasons = [...new Set((stale.reasons || []).map(staleReasonText))];
+  const seen = new Set();
+  const reasons = [];
+  for (const r of stale.reasons || []) {
+    const text = staleReasonText(r);
+    if (seen.has(text)) continue;
+    seen.add(text);
+    reasons.push(reasons.length ? staleReasonInline(r) : text);
+  }
   if (!reasons.length) reasons.push(t('stale.reason.input_changed'));
   return t('stale.need_update', { reasons: clauseJoin(reasons), stages: listJoin(stale.stages.map(stageName)) });
 }
@@ -894,12 +1279,28 @@ function unitFormat(n, unit, digits) {
   return numberFormat(n, { style: 'unit', unit, unitDisplay: 'short', maximumFractionDigits: digits });
 }
 
+// A file size in the units their names say (T25 B3): 1 kB = 1000 bytes,
+// as CLDR defines the kilobyte that Intl writes (kB, кБ, …); 82,440 bytes
+// were 80.5 "kB" counted by 1024. Every language gets its unit names from
+// Intl, which has no KiB. Below 1000 the catalog's words (common.size_bytes,
+// plural forms): "714 bytes", "1 byte", "714字节". Intl's long name of the
+// byte was English in Traditional Chinese ("714 byte", T28 G7); a catalog
+// without the key falls back along its chain as any text does. A value that
+// rounds to 1000 is written in the next unit ("1 MB", not "1,000 kB").
+const BYTE_UNITS = [
+  ['kilobyte', 1e3, 1],
+  ['megabyte', 1e6, 1],
+  ['gigabyte', 1e9, 2],
+];
+
 export function fmtBytes(n) {
   n = Number(n) || 0;
-  if (n < 1024) return unitFormat(n, 'byte', 0);
-  if (n < 1024 * 1024) return unitFormat(n / 1024, 'kilobyte', 1);
-  if (n < 1024 * 1024 * 1024) return unitFormat(n / 1024 / 1024, 'megabyte', 1);
-  return unitFormat(n / 1024 / 1024 / 1024, 'gigabyte', 2);
+  if (Math.round(n) < 1000) return t('common.size_bytes', { n: count(Math.round(n)) });
+  for (let i = 0; ; i++) {
+    const [unit, size, digits] = BYTE_UNITS[i];
+    const v = n / size;
+    if (i === BYTE_UNITS.length - 1 || Math.round(v * 10 ** digits) / 10 ** digits < 1000) return unitFormat(v, unit, digits);
+  }
 }
 
 export function fmtMB(mb) {
