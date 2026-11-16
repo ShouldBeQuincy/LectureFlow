@@ -113,8 +113,8 @@ func TestMacPlatformReadings(t *testing.T) {
 	}
 }
 
-// ioreg on this Mac gives the GPU's readings. A virtual machine (the
-// macos-14 CI runners) has a paravirtual GPU whose IOAccelerator reports
+// ioreg on this Mac gives the GPU's readings. A virtual machine (GitHub's
+// hosted macOS CI runners) has a paravirtual GPU whose IOAccelerator reports
 // the memory but no "Device Utilization %"; the card then leaves the usage
 // tile out (TestAppleGPUCardUnreadable). Real Apple silicon gives both.
 func TestMacIOReg(t *testing.T) {

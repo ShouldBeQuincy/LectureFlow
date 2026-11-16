@@ -6,7 +6,7 @@
 # (desktop/packaging/third-party.json: aria2c.darwin-arm64 url, sha256,
 # configure; macos.minimum_system_version, the app's minimum macOS, as the
 # deployment target). aria2 publishes no macOS binary of 1.37.0.
-# Run on macOS (CI: macos-14). Output:
+# Run on macOS (CI: macos-15). Output:
 #   desktop/.cache/aria2c-macos-<version>/
 #     bin/aria2c                 the program (ad-hoc signed)
 #     COPYING, LICENSE.OpenSSL, AUTHORS

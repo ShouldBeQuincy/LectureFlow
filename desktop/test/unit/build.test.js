@@ -904,7 +904,7 @@ test('release workflow: source attachments next to the installers, macOS ffmpeg 
     assert.ok(text.includes(`key: ${key}`), `${name}: the ffmpeg-macos cache key`);
     assert.ok(text.includes('path: desktop/.cache/ffmpeg-macos-*'), `${name}: the ffmpeg-macos cache path`);
   }
-  assert.match(ci, /\n {2}ffmpeg-macos:\n {4}runs-on: macos-14\n/);
+  assert.match(ci, /\n {2}ffmpeg-macos:\n {4}runs-on: macos-15\n/);
 });
 
 test('update summary: the electron-updater feed and whether the in-app update key is built in (keys.go)', () => {

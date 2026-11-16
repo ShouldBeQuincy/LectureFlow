@@ -24,10 +24,17 @@
 # tests that need a real ffmpeg against that build.
 #
 # aria2c for macOS (the browser extension's download tool; aria2 publishes
-# no macOS binary) is built from its pinned source on macos-14
+# no macOS binary) is built from its pinned source on macos-15
 # (packaging/aria2c/build-aria2c-macos.sh), cached by the hash of the script
 # and of desktop/packaging/third-party.json; release.yml reads the same cache.
 # ffmpeg for macOS likewise (desktop/scripts/build-ffmpeg-macos.sh).
+#
+# macOS runner: macos-15 (Apple silicon). GitHub retired the macos-14 images
+# on 2026-11-02. The key does not name the runner: both builds compile for
+# the fixed deployment target third-party.json macos.minimum_system_version
+# and check the minos of what they built, so a build from another image is
+# the same program for the same minimum macOS. Change ci.yml and release.yml
+# together.
 name: CI
 
 on:
@@ -81,7 +88,7 @@ jobs:
   # result itself: AppleTLS, only system libraries (otool -L), the minimum
   # macOS version, aria2c --version.
   aria2c-macos:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -104,7 +111,7 @@ jobs:
   # are linked, the minimum macOS of ffmpeg, ffprobe and libdav1d.a
   # (third-party.json macos), arm64 and the libdav1d decoder.
   ffmpeg-macos:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -127,7 +134,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-14]
+        os: [windows-latest, macos-15]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -238,7 +245,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-14]
+        os: [windows-latest, macos-15]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -265,7 +272,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-14]
+        os: [windows-latest, macos-15]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:

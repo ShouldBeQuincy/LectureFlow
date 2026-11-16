@@ -4,7 +4,7 @@
 #
 # Builds the LGPL ffmpeg/ffprobe for macOS arm64 from the pinned source
 # (packaging/third-party.json: url, sha256, configure). Run on macOS (CI:
-# macos-14, cached). Output: desktop/.cache/ffmpeg-macos-<version>/
+# macos-15, cached). Output: desktop/.cache/ffmpeg-macos-<version>/
 #   bin/{ffmpeg,ffprobe}
 #   COPYING.LGPLv2.1, LICENSE.md, thirdparty/ (dav1d's COPYING and PATENTS)
 #   BUILDINFO.txt   source, deployment target, compiler, SDK, configure line, otool -L

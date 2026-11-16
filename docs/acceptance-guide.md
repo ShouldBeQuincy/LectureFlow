@@ -27,17 +27,17 @@
    |---|---|---|
    | `ffmpeg-windows` | 在 Linux 上交叉编译 Windows 用的 LGPL ffmpeg（第一次较慢，之后命中缓存） | 首次 20–40 分钟 |
    | `test (windows-latest)` | Go vet、Go 测试、Python worker 测试、桌面外壳单元测试、许可证审计 | 10–20 分钟 |
-   | `test (macos-14)` | Go vet、Go 测试、`GOOS=darwin` 构建、Python 测试、桌面外壳单元测试 | 10–20 分钟 |
+   | `test (macos-15)` | Go vet、Go 测试、`GOOS=darwin` 构建、Python 测试、桌面外壳单元测试 | 10–20 分钟 |
 
 3. 打开 **License audit**，作业 `audit` 应为绿色（依赖许可证审计 + SPDX 文件头两步）。
 
-**哪些失败要回报**：任何一个红色作业都要回报。在回报里写作业名、失败的步骤名（例如 `Go tests`、`Python worker tests`、`Desktop unit tests`），并附上该步骤日志里**第一处**报错前后约 30 行（复制文本即可，不要整份日志）。`test (macos-14)` 的结果最重要：macOS 版的 ffmpeg 构建在 3.1.0 加入了 dav1d。
+**哪些失败要回报**：任何一个红色作业都要回报。在回报里写作业名、失败的步骤名（例如 `Go tests`、`Python worker tests`、`Desktop unit tests`），并附上该步骤日志里**第一处**报错前后约 30 行（复制文本即可，不要整份日志）。`test (macos-15)` 的结果最重要：macOS 版的 ffmpeg 构建在 3.1.0 加入了 dav1d。
 
 ### 打 tag 后（生成草稿 Release）
 
 1. tag 必须与应用版本一致：当前是 **`v3.2.0`**（见 `desktop/package.json` 的 `version`）。只推送这一个 tag：`git push origin v3.2.0`。
    **不要用 `git push --tags`**：仓库里已有 `v2`、`v3` 等旧 tag，它们也会触发发布流程，并在 “Tag matches the app version” 一步失败（这种失败可以忽略，但会造成干扰）。
-2. Actions 中应该出现工作流 **Release**，作业：`ffmpeg-windows` → `build (windows-latest)`、`build (macos-14)`，与之并行的 `sources`（收集对应源码），最后 `draft-release`，全部为绿色。
+2. Actions 中应该出现工作流 **Release**，作业：`ffmpeg-windows` → `build (windows-latest)`、`build (macos-15)`，与之并行的 `sources`（收集对应源码），最后 `draft-release`，全部为绿色。
    `build` 作业里有一步 “Smoke test the packaged app”，它启动打包好的应用做冒烟测试，失败要回报。
 3. 打开仓库的 **Releases** 页面，应该看到一个标为 **Draft** 的 `LectureFlow 3.2.0`（草稿只有有写权限的人能看到，不会自动发布）。附件应包括：
    - `LectureFlow-Setup-3.2.0-x64.exe`、`LectureFlow-3.2.0-x64-portable.exe`
@@ -78,15 +78,15 @@
 2. **CI** has three jobs, all green:
    - `ffmpeg-windows`: cross-builds the LGPL ffmpeg for Windows on Linux (slow the first time, 20–40 min; cached afterwards);
    - `test (windows-latest)`: Go vet, Go tests, Python worker tests, desktop unit tests, licence audit;
-   - `test (macos-14)`: Go vet, Go tests, a `GOOS=darwin` build, Python tests, desktop unit tests.
+   - `test (macos-15)`: Go vet, Go tests, a `GOOS=darwin` build, Python tests, desktop unit tests.
 3. **License audit**: job `audit` is green (dependency licences and SPDX headers).
 
-**Report any red job**: the job name, the failing step name, and about 30 lines around the **first** error in that step's log (text, not the whole log). `test (macos-14)` matters most: the macOS parts have never run on a Mac or in CI before.
+**Report any red job**: the job name, the failing step name, and about 30 lines around the **first** error in that step's log (text, not the whole log). `test (macos-15)` matters most: the macOS parts have never run on a Mac or in CI before.
 
 **After a tag** (draft release)
 
 1. The tag must match the app version: **`v3.2.0`** (`version` in `desktop/package.json`). Push only that tag: `git push origin v3.2.0`. **Do not use `git push --tags`**: older tags such as `v2` and `v3` would also start the release workflow and fail at "Tag matches the app version" (harmless, but noisy).
-2. Workflow **Release** runs `ffmpeg-windows` → `build (windows-latest)` and `build (macos-14)`, with `sources` (collects the corresponding source) beside them, then `draft-release`, all green. Report a failure of the step "Smoke test the packaged app".
+2. Workflow **Release** runs `ffmpeg-windows` → `build (windows-latest)` and `build (macos-15)`, with `sources` (collects the corresponding source) beside them, then `draft-release`, all green. Report a failure of the step "Smoke test the packaged app".
 3. **Releases** shows a **Draft** `LectureFlow 3.2.0` (visible only to people with write access; nothing is published automatically) with the Windows installer and portable `.exe`, `LectureFlow-3.2.0-arm64.dmg` plus `LectureFlow-3.2.0-arm64-mac.zip`, `.blockmap` files, `size-report-Windows.*` / `size-report-macOS.*`, the **unsigned** in-app update manifest `update.json` (the maintainer uploads `update.json.minisig` after signing it, see "In-app update" below, so a fresh draft does not have it yet), and the four corresponding-source archives (GPL / LGPL) `LectureFlow-3.2.0-source-ffmpeg-windows-x64.tar`, `…-source-ffmpeg-darwin-arm64.tar`, `…-source-aria2c-windows-x64.tar` and `…-source-aria2c-darwin-arm64.tar`. The release text is the two size reports followed by a section on the source archives. Installers should be **250 MB or less**; if not, copy the "largest items" part of the size report into your report.
 4. Do not click "Publish release"; the maintainer decides.
 
@@ -276,10 +276,10 @@ Copy, fill in, and send to the maintainer. Write "not done" for skipped steps in
 |---|---|---|---|
 | 1-CI / ffmpeg-windows | | | |
 | 1-CI / test (windows-latest) | | | |
-| 1-CI / test (macos-14) | | | |
+| 1-CI / test (macos-15) | | | |
 | 1-License audit | | | |
 | 1-Release / build (windows-latest) | | | |
-| 1-Release / build (macos-14) | | | |
+| 1-Release / build (macos-15) | | | |
 | 1-Release / draft-release | | | |
 | 2-1 … 2-18 | | | |
 | 3-1 … 3-13 | | | |

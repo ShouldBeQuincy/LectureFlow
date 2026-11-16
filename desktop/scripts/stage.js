@@ -464,7 +464,7 @@ async function stageAria2c(platform, key, version = APP_VERSION) {
     extractOnce(archive, dir);
     root = path.join(dir, spec.root);
   } else {
-    // No upstream macOS binary: built from the pinned source (CI: macos-14, cached).
+    // No upstream macOS binary: built from the pinned source (CI: macos-15, cached).
     root = path.join(CACHE, `aria2c-macos-${a.version}`);
     if (!reuseCachedBuild(root, spec.bin, 'aria2c', key)) {
       if (process.platform !== 'darwin') throw new Error('the macOS aria2c is built on macOS (packaging/aria2c/build-aria2c-macos.sh)');
