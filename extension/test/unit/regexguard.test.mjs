@@ -6,8 +6,9 @@
 // is recorded; the records stop the profile later (local at once, bundled
 // after several trips), name the rule and the time, never the page; and no
 // code runs a profile regex around the guard. Slow matches are simulated
-// with an injected clock; one test runs a really slow pattern once, on a
-// short input (about 2 s), to show the second call returns at once.
+// with an injected clock; one test runs a really slow pattern for real, on
+// an input it lengthens until the first match is slow on this machine, to
+// show that match trips the guard and the second call returns at once.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,7 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { guardedRegex, setRegexGuard, resetRegexGuard, resetRegexBudget, regexTrip, SLOW_MS, BUDGET_MS, PAGE_WINDOW_MS } from '../../src/lib/regexguard.js';
-import { regexComplexity } from '../../src/lib/regexcost.js';
+import { regexComplexity, MAX_REGEX_INPUT } from '../../src/lib/regexcost.js';
 import { HEALTH_KEY, BUNDLED_TRIPS, BUNDLED_SEVERE_MS, MAX_RECORDS, healthKey, isStopped, tripEntry, nextRecord, withRecord, cleanTrip, recordable, fromExtensionPage, recordRemoved } from '../../src/lib/health.js';
 import { applyProfile, profileRegexes, MAX_TESTS_PER_RULE, downloadPolicyFor, profileStopped } from '../../src/lib/profile.js';
 import { profileKey } from '../../src/lib/observe.js';
@@ -133,16 +134,45 @@ test('applyProfile: a slow rule stops the profile for the rest of the call; at m
 });
 
 test('a really slow pattern (SEC18d) runs once, then returns at once', { timeout: 60000 }, () => {
-  fresh(null);
+  // The pattern backtracks on a run of "x" longer than LOOK, the more the
+  // longer the run: about 8.5 ms a character over LOOK at first, then
+  // somewhat more (a Windows desktop, 2026-11: 254 ms at 330 characters,
+  // 2.9 s at 540; a CI runner took 175 ms at 330). A fixed input is slow
+  // enough on one machine and not on the next, so the input grows until the
+  // first match, on a fresh guard each time, takes over ENOUGH: by a quarter
+  // of its excess over LOOK at a time, at least one character. The try
+  // before took at most ENOUGH, so the last takes about 1.3 times that (at
+  // most twice, over the first few characters) and all of them about five
+  // times that: 1.5 s here. A try that took SLOW_MS or less must not trip
+  // the guard. No try over ENOUGH by MAX_REGEX_INPUT characters (14 s here),
+  // or SEARCH_MS of tries, fails the test: the guard would not run a longer
+  // input, and the timeout keeps room for one more try after SEARCH_MS.
+  const LOOK = 300;
+  const ENOUGH = SLOW_MS * 1.2; // room for the microseconds of the call the guard does not time
+  const SEARCH_MS = 20000;
   const br = (look) => `(?:${['x', '[xb]', '[xc]', '[xd]', '[xe]', '[xf]', '[xg]', '[xh]'].map((c) => c + look).join('|')})`;
-  const G = br('(?=.{300})');
-  const re = guardedRegex(`${G}.*${G}.?.?z`, { owner: 'evil:1' });
-  const input = 'x'.repeat(330); // about 1-3 s once; 1024 characters take far longer
-  const t0 = performance.now();
-  assert.equal(re.test(input), false);
-  const first = performance.now() - t0;
+  const G = br(`(?=.{${LOOK}})`);
+  const source = `${G}.*${G}.?.?z`;
+  const started = performance.now();
+  let re = null;
+  let input = '';
+  let first = 0;
+  let trips = [];
+  for (let excess = 0; first <= ENOUGH; ) {
+    assert.ok(LOOK + excess < MAX_REGEX_INPUT, `no input up to ${MAX_REGEX_INPUT} characters took over ${ENOUGH} ms (the last: ${first.toFixed(1)} ms)`);
+    assert.ok(performance.now() - started < SEARCH_MS, `${SEARCH_MS} ms of tries, none over ${ENOUGH} ms (the last: ${input.length} characters, ${first.toFixed(1)} ms)`);
+    excess = Math.min(MAX_REGEX_INPUT - LOOK, Math.max(excess + 1, Math.ceil(excess * 1.25)));
+    trips = fresh(null);
+    re = guardedRegex(source, { owner: 'evil:1' });
+    input = 'x'.repeat(LOOK + excess);
+    const t0 = performance.now();
+    assert.equal(re.test(input), false);
+    first = performance.now() - t0;
+    if (first <= SLOW_MS) assert.equal(regexTrip('evil:1', ''), null, `${first} ms on ${input.length} characters is not slow`);
+  }
   assert.ok(first > SLOW_MS, `the first match took ${first} ms`);
   assert.ok(regexTrip('evil:1', ''));
+  assert.deepEqual(trips.map((t) => t.reason), ['slow'], `${input.length} characters`);
   const t1 = performance.now();
   assert.equal(re.test(input), false);
   assert.ok(performance.now() - t1 < 5, 'the second call returns at once');

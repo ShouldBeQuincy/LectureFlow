@@ -49,11 +49,22 @@ func selfTestWorkNames() []string {
 // (as the diagnostics count: len(data_dir) + depth).
 func relDepth(t *testing.T, dataDir, p string) int {
 	t.Helper()
-	rel, err := filepath.Rel(dataDir, p)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		t.Fatalf("%s is not inside the data directory %s", p, dataDir)
+	// The worker reports its own working directory (os.Getwd), which names
+	// the directory with symbolic links resolved: on macOS t.TempDir is
+	// /var/folders/..., a link to /private/var/folders/... (v3.3.0 CI, the
+	// first run on macOS). Both spellings name the same data directory.
+	roots := []string{dataDir}
+	if resolved, err := filepath.EvalSymlinks(dataDir); err == nil && resolved != dataDir {
+		roots = append(roots, resolved)
 	}
-	return components.PathLen(rel) + 1
+	for _, root := range roots {
+		rel, err := filepath.Rel(root, p)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return components.PathLen(rel) + 1
+		}
+	}
+	t.Fatalf("%s is not inside the data directory %s", p, dataDir)
+	return 0
 }
 
 // Every component of the shipped manifest that has a self-test (all
