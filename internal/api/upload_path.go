@@ -39,9 +39,12 @@ func isJSONBody(r *http.Request) bool {
 	return ct == "application/json"
 }
 
-// nativeUpload reports whether r is a desktop-mode path upload.
+// nativeUpload reports whether r is a desktop-mode path upload. A request
+// through the web-access listener (webaccess.go) comes from a browser on
+// another device: it uploads like web mode (multipart) and never names a
+// path on this computer.
 func (s *Server) nativeUpload(r *http.Request) bool {
-	return s.desktop != nil && isJSONBody(r)
+	return s.desktop != nil && !isWebAccess(r.Context()) && isJSONBody(r)
 }
 
 // pathRequest is the decoded body of a path upload.

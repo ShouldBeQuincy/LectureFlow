@@ -66,6 +66,10 @@
     "zh": "请求的主机名不被允许",
     "params": []
   },
+  "auth.login_required": {
+    "zh": "需要先登录网页访问才能继续，请前往登录页面输入访问密钥",
+    "params": []
+  },
   "auth.token_required": {
     "zh": "缺少或错误的访问令牌，请从 LectureFlow 应用中打开这个页面",
     "params": []
@@ -2082,6 +2086,10 @@
     "params": [
       "max_bytes"
     ]
+  },
+  "web_access.not_available": {
+    "zh": "此操作只能在运行 LectureFlow 的电脑上完成，不能通过网页访问执行",
+    "params": []
   },
   "week_override.kind_invalid": {
     "zh": "未知的归属方式：{kind}（应为 supplement 或 makeup）",

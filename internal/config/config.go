@@ -8,10 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/BurntSushi/toml"
 
@@ -95,10 +98,23 @@ type Config struct {
 	// config.toml.
 	devPython map[string]string
 
-	ASR     ASR     `toml:"asr"`
-	LLM     LLM     `toml:"llm"`
-	Storage Storage `toml:"storage"`
+	ASR       ASR       `toml:"asr"`
+	LLM       LLM       `toml:"llm"`
+	Storage   Storage   `toml:"storage"`
+	WebAccess WebAccess `toml:"web_access"`
 }
+
+// WebAccess configures the optional second loopback listener that lets a
+// browser on another device (through a reverse proxy such as `tailscale serve`)
+// open the desktop app's UI with an access-key cookie instead of the Electron
+// token. Off unless Listen is set; desktop mode only.
+type WebAccess struct {
+	Listen string   `toml:"listen"`
+	Hosts  []string `toml:"hosts"`
+}
+
+// Enabled reports whether the opt-in web-access listener is configured.
+func (w WebAccess) Enabled() bool { return w.Listen != "" }
 
 type ASR struct {
 	Model         string `toml:"model"`
@@ -555,10 +571,66 @@ func (c *Config) validate() error {
 	if !strings.HasPrefix(c.Listen, "127.0.0.1:") && !strings.HasPrefix(c.Listen, "localhost:") {
 		errs = append(errs, "listen must be on 127.0.0.1 (SPEC §0)")
 	}
+	if c.WebAccess.Listen != "" {
+		errs = append(errs, validateWebAccess(c.WebAccess, c.Listen)...)
+	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+func validateWebAccess(w WebAccess, mainListen string) []string {
+	var errs []string
+	if !strings.HasPrefix(w.Listen, "127.0.0.1:") && !strings.HasPrefix(w.Listen, "localhost:") {
+		errs = append(errs, "web_access.listen must be on 127.0.0.1 or localhost (SPEC §0)")
+	} else {
+		_, portStr, err := net.SplitHostPort(w.Listen)
+		port, perr := strconv.Atoi(portStr)
+		if err != nil || perr != nil || port < 1 || port > 65535 {
+			errs = append(errs, "web_access.listen must have a valid non-zero port")
+		} else if sameLoopbackAddr(w.Listen, mainListen, port) {
+			errs = append(errs, "web_access.listen must differ from listen")
+		}
+	}
+	if len(w.Hosts) == 0 {
+		errs = append(errs, "web_access.hosts must be non-empty when web_access.listen is set")
+	}
+	for _, h := range w.Hosts {
+		if !validWebAccessHost(h) {
+			errs = append(errs, fmt.Sprintf("web_access.hosts: invalid host %q", h))
+		}
+	}
+	return errs
+}
+
+func sameLoopbackAddr(waListen, mainListen string, waPort int) bool {
+	if strings.EqualFold(waListen, mainListen) {
+		return true
+	}
+	_, mainPortStr, err := net.SplitHostPort(mainListen)
+	if err != nil {
+		return false
+	}
+	mainPort, err := strconv.Atoi(mainPortStr)
+	return err == nil && mainPort != 0 && mainPort == waPort
+}
+
+func validWebAccessHost(h string) bool {
+	if h == "" || strings.IndexFunc(h, unicode.IsSpace) >= 0 {
+		return false
+	}
+	if strings.Contains(h, "://") || strings.ContainsAny(h, "/?#\\@") {
+		return false
+	}
+	if host, port, err := net.SplitHostPort(h); err == nil {
+		if host == "" {
+			return false
+		}
+		p, err := strconv.Atoi(port)
+		return err == nil && p >= 1 && p <= 65535
+	}
+	return !strings.Contains(h, ":")
 }
 
 // ResolveComputeType applies SPEC §17.2 to a configured compute type:

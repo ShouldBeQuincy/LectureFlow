@@ -594,18 +594,18 @@ const shutdownReserve = 2 * time.Second
 // release the power request;
 // wait for the pending invalidations; cancel the startup checks and wait
 // for them; stop the resource watcher; close the
-// SSE hub, then the HTTP server srv (nil: none), which waits for the
-// handlers in progress and so for their database transactions; close the
+// SSE hub, then the HTTP servers srvs (nil entries skipped), which waits for
+// the handlers in progress and so for their database transactions; close the
 // database (which waits for the statements in progress). deadline (zero:
 // none) bounds the waits for the scheduler and HTTP; the caller's
 // watchdog bounds the whole. Interrupted jobs stay running in the
 // database: startup recovery (§4.7) handles them on the next start.
 // Only the first call does anything.
-func (a *App) Shutdown(deadline time.Time, srv *http.Server) {
-	a.closeOnce.Do(func() { a.shutdown(deadline, srv) })
+func (a *App) Shutdown(deadline time.Time, srvs ...*http.Server) {
+	a.closeOnce.Do(func() { a.shutdown(deadline, srvs) })
 }
 
-func (a *App) shutdown(deadline time.Time, srv *http.Server) {
+func (a *App) shutdown(deadline time.Time, srvs []*http.Server) {
 	remain := func(reserve time.Duration) time.Duration {
 		if deadline.IsZero() {
 			return 24 * time.Hour
@@ -684,12 +684,26 @@ func (a *App) shutdown(deadline time.Time, srv *http.Server) {
 	}
 	a.Resources.Stop()
 	a.Hub.Close() // ends SSE streams so the HTTP shutdown does not wait for them
-	if srv != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), remain(0))
-		if err := srv.Shutdown(ctx); err != nil {
-			slog.Warn("graceful stop: HTTP requests still in progress; closing", "err", err)
-			srv.Close()
+	var active []*http.Server
+	for _, srv := range srvs {
+		if srv != nil {
+			active = append(active, srv)
 		}
+	}
+	if len(active) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), remain(0))
+		var wg sync.WaitGroup
+		for _, srv := range active {
+			wg.Add(1)
+			go func(s *http.Server) {
+				defer wg.Done()
+				if err := s.Shutdown(ctx); err != nil {
+					slog.Warn("graceful stop: HTTP requests still in progress; closing", "err", err)
+					s.Close()
+				}
+			}(srv)
+		}
+		wg.Wait()
 		cancel()
 	}
 	a.Store.Close()

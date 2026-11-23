@@ -133,7 +133,14 @@ func slowRouteRecorder(mux http.Handler) http.Handler {
 // log outermost, the security checks and the grants' scope, and the
 // recorder of the matched route next to the router.
 func (s *Server) handlerChain(routes http.Handler, threshold time.Duration, log *slog.Logger, now func() time.Time) http.Handler {
-	return slowRequestLogClock(s.secure(s.grantScope(slowRouteRecorder(routes))), threshold, log, now)
+	return s.handlerChainWith(s.secure, routes, threshold, log, now)
+}
+
+// handlerChainWith builds the same middleware chain as handlerChain with a
+// custom security gate (s.secure for the primary listener, s.webAccess for the
+// opt-in web-access listener).
+func (s *Server) handlerChainWith(gate func(http.Handler) http.Handler, routes http.Handler, threshold time.Duration, log *slog.Logger, now func() time.Time) http.Handler {
+	return slowRequestLogClock(gate(s.grantScope(slowRouteRecorder(routes))), threshold, log, now)
 }
 
 // slowLogIDRoutes are the routes whose {id} is a lecture's or a course's
