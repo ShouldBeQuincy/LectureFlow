@@ -274,6 +274,14 @@ func (s *Server) Handler() http.Handler {
 	return s.handlerChain(s.routes(), slowRequestThreshold, nil, time.Now)
 }
 
+// WebAccessHandler returns the same routes as Handler behind the opt-in
+// web-access gate (webaccess.go): Host allowlist, cross-site protection,
+// signed session cookie (replacing the desktop access token), and a deny list
+// for host-machine-only actions.
+func (s *Server) WebAccessHandler(opts WebAccessOptions) http.Handler {
+	return s.handlerChainWith(s.webAccess(opts), s.routes(), slowRequestThreshold, nil, time.Now)
+}
+
 // routes is the router of Handler without the middleware.
 func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()

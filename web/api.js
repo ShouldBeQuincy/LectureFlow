@@ -55,6 +55,19 @@ function report(err) {
   return err;
 }
 
+// Web access: a 401 with code auth.login_required means the session cookie is
+// missing or expired; navigate to the login page (only this code — desktop
+// auth.token_required keeps its existing error path).
+let loginRedirecting = false;
+function redirectIfLoginRequired(err) {
+  if (err.status !== 401 || err.code !== 'auth.login_required') return false;
+  if (!loginRedirecting && typeof location !== 'undefined' && typeof location.assign === 'function' && location.pathname !== '/web-access/login') {
+    loginRedirecting = true;
+    location.assign('/web-access/login');
+  }
+  return true;
+}
+
 function parseBody(text) {
   try {
     return JSON.parse(text);
@@ -147,7 +160,9 @@ async function request(method, path, body, opts = {}) {
   if (opts.signal && opts.signal.aborted) throw opts.signal.reason ?? new DOMException('Aborted', 'AbortError');
   if (!res.ok) {
     const b = parseBody(text);
-    throw fail(new ApiError(res.status, errorText(res.status, b), b));
+    const err = new ApiError(res.status, errorText(res.status, b), b);
+    if (redirectIfLoginRequired(err)) throw err;
+    throw fail(err);
   }
   if (res.status === 204 || !text) return null;
   const v = parseBody(text);
@@ -497,7 +512,9 @@ function copyUpload(path, fields, file, onProgress, method, opts) {
     if (ctrl.signal.aborted) throw cancelled();
     if (!res.ok) {
       const b = parseBody(text);
-      throw fail(new ApiError(res.status, errorText(res.status, b), b));
+      const err = new ApiError(res.status, errorText(res.status, b), b);
+      if (redirectIfLoginRequired(err)) throw err;
+      throw fail(err);
     }
     const v = text ? parseBody(text) : null;
     if (text && v === null) throw fail(new ApiError(res.status, t('common.net.bad_response')));
@@ -530,7 +547,9 @@ function upload(path, fields, file, onProgress, method = 'POST', opts = {}) {
         else resolve(v);
       } else {
         const b = parseBody(xhr.responseText);
-        reject(fail(new ApiError(xhr.status, errorText(xhr.status, b), b)));
+        const err = new ApiError(xhr.status, errorText(xhr.status, b), b);
+        if (redirectIfLoginRequired(err)) reject(err);
+        else reject(fail(err));
       }
     };
     xhr.onerror = () => reject(fail(new ApiError(0, t('common.net.upload_interrupted'))));

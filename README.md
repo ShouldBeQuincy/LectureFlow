@@ -108,6 +108,7 @@ If you have ever felt anxious after missing a class, or kept dragging a progress
 - Saved API keys and your Colab authorization are stored encrypted, protected by your system account (DPAPI on Windows, the Keychain on macOS). If you move the data folder to another computer or user account, you enter them again.
 - LectureFlow collects no usage data. No telemetry, no accounts.
 - Web mode (running the server program directly and opening it in a browser, without the desktop app) has no access token, so other accounts and programs on this computer can reach it (it listens only on this computer's own address, so other computers on your network cannot). On a shared computer, use the desktop app.
+- If you want to open the desktop app's interface from another device (such as a phone) over your own Tailscale tailnet or VPN, see [docs/web-access.md](docs/web-access.md) for the opt-in web access listener.
 - The browser extension talks only to LectureFlow on your computer, and reads the recording site's cookies only when you send a lecture: see its [privacy policy](docs/extension/privacy.md).
 
 ## Transcription backends

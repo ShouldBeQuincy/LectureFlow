@@ -57,3 +57,11 @@ translate = { provider = "deepseek", model = "deepseek-flash", window = 3 }
 # output = 0.0
 # [llm]
 # daily_budget = 0
+
+# Optional second loopback listener for opening the desktop app UI from another
+# device's browser through a reverse proxy such as `tailscale serve`.
+# Off unless listen is set; desktop mode only. See docs/web-access.md.
+# [web_access]
+# listen = "127.0.0.1:8421"
+# # Host headers the proxy forwards (exact, case-insensitive; include :port unless 443/80).
+# hosts = ["mymac.example-tailnet.ts.net:8443"]

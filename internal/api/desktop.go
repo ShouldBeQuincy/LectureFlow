@@ -172,6 +172,10 @@ func crossSiteFetch(r *http.Request) bool {
 // request that changes something, must name this server; desktop mode
 // needs no fallback, its token stays inside LectureFlow's own pages.
 func (s *Server) crossOrigin(r *http.Request) bool {
+	return crossOriginCheck(r, s.desktop != nil)
+}
+
+func crossOriginCheck(r *http.Request, allowDesktopShortcut bool) bool {
 	switch site := r.Header.Get("Sec-Fetch-Site"); site {
 	case "same-origin", "none":
 		return false
@@ -179,7 +183,7 @@ func (s *Server) crossOrigin(r *http.Request) bool {
 	default: // cross-site, same-site
 		return true
 	}
-	if s.desktop != nil {
+	if allowDesktopShortcut {
 		return false
 	}
 	origin := r.Header.Get("Origin")
@@ -228,7 +232,8 @@ func (s *Server) getHealth(w http.ResponseWriter, r *http.Request) {
 // AppInfo is GET /api/app.
 type AppInfo struct {
 	Version        string `json:"version"`
-	Mode           string `json:"mode"`     // desktop | web
+	Mode           string `json:"mode"` // desktop | web
+	WebAccess      bool   `json:"web_access,omitempty"`
 	Platform       string `json:"platform"` // windows | darwin | linux (runtime.GOOS)
 	Arch           string `json:"arch"`     // runtime.GOARCH
 	DataDir        string `json:"data_dir"`
@@ -248,7 +253,10 @@ func (s *Server) getApp(w http.ResponseWriter, r *http.Request) {
 	}
 	info := AppInfo{Version: s.appVersion(), Mode: s.mode(), Platform: runtime.GOOS, Arch: runtime.GOARCH,
 		DataDir: dir, OnboardingDone: ob.Done}
-	if s.desktop != nil {
+	if isWebAccess(r.Context()) {
+		info.Mode = "web"
+		info.WebAccess = true
+	} else if s.desktop != nil {
 		info.ResourcesDir = s.desktop.ResourcesDir
 	}
 	writeJSON(w, http.StatusOK, info)

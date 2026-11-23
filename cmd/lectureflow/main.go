@@ -396,6 +396,37 @@ func runMain(env runEnv) int {
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
+	var (
+		waLn  net.Listener
+		waKey string
+	)
+	if cfg.WebAccess.Enabled() {
+		if !opts.Desktop {
+			slog.Warn("web access is only available in desktop mode; ignoring [web_access] configuration", "listen", cfg.WebAccess.Listen)
+		} else {
+			waLn, err = listenTCP(cfg.WebAccess.Listen)
+			if err != nil {
+				ln.Close()
+				return fail(fmt.Errorf("web access listen %s: %w", cfg.WebAccess.Listen, err))
+			}
+			var keyPath string
+			var keyCreated bool
+			waKey, keyPath, keyCreated, err = api.LoadOrCreateWebAccessKey(cfg.DataDir)
+			if err != nil {
+				waLn.Close()
+				ln.Close()
+				return fail(err)
+			}
+			slog.Info("web access key ready", "path", keyPath, "created", keyCreated)
+		}
+	}
+	closeListeners := func() {
+		ln.Close()
+		if waLn != nil {
+			waLn.Close()
+		}
+	}
+
 	appOpts := env.appOpts
 	appOpts.Version = opts.AppVersion
 	appOpts.Portable = opts.Portable
@@ -425,19 +456,19 @@ func runMain(env runEnv) int {
 	// A database from a newer LectureFlow is left untouched (upgrade.go,
 	// test-upgrade F2), the staged data of an import included.
 	if err := checkNotNewer(ctx, cfg.DataDir, prog); err != nil {
-		ln.Close()
+		closeListeners()
 		return fail(err)
 	}
 	// Before the database is opened: switch to the staged data of an
 	// "import existing data" (step 5, internal/relocate).
 	if err := runApplyStaged(ctx, cfg.DataDir); err != nil {
-		ln.Close()
+		closeListeners()
 		return fail(err)
 	}
 	// The backup before an upgrade, then the migrations (upgrade.go,
 	// test-upgrade F1).
 	if err := prepareDatabase(ctx, cfg.DataDir, opts.AppVersion, prog); err != nil {
-		ln.Close()
+		closeListeners()
 		return fail(err)
 	}
 	// The stored credentials' data key, then the one-time sealing of plain
@@ -445,18 +476,36 @@ func runMain(env runEnv) int {
 	setupSecretsWith(ctx, cfg.DataDir, shellKey, shellKeyUnavailable, prog)
 	app, err := buildApp(ctx, cfg, appOpts)
 	if err != nil {
-		ln.Close()
+		closeListeners()
 		return fail(err)
 	}
 	if err := app.Start(ctx); err != nil { // scheduler + first device detection
-		ln.Close()
+		closeListeners()
 		app.Close()
 		return fail(err)
 	}
 
 	srv := &http.Server{Handler: app.Server.Handler(), ReadHeaderTimeout: 10 * time.Second}
-	errc := make(chan error, 1)
+	errc := make(chan error, 2)
 	go func() { errc <- srv.Serve(ln) }()
+	var waSrv *http.Server
+	if waLn != nil {
+		waPort := waLn.Addr().(*net.TCPAddr).Port
+		waSrv = &http.Server{
+			Handler: app.Server.WebAccessHandler(api.WebAccessOptions{
+				Key:   waKey,
+				Port:  waPort,
+				Hosts: cfg.WebAccess.Hosts,
+			}),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			if err := waSrv.Serve(waLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errc <- fmt.Errorf("web access: %w", err)
+			}
+		}()
+		slog.Info("web access listening", "addr", waLn.Addr().String(), "hosts", cfg.WebAccess.Hosts)
+	}
 	url := fmt.Sprintf("http://127.0.0.1:%d", port)
 	// The browser extension's endpoint and registration (nmhost.go).
 	nm := startNM(app, nmOptions{Endpoint: opts.NMEndpoint, Launcher: absOrEmpty(opts.Launcher), LauncherBlocked: opts.LauncherBlocked, Portable: opts.Portable,
@@ -480,6 +529,10 @@ func runMain(env runEnv) int {
 	case code = <-stop.ch:
 	case err := <-errc:
 		if !errors.Is(err, http.ErrServerClosed) {
+			if waSrv != nil {
+				waSrv.Close()
+			}
+			srv.Close()
 			cancel()
 			app.Close()
 			return fail(fmt.Errorf("http: %w", err))
@@ -491,7 +544,7 @@ func runMain(env runEnv) int {
 	// (stopdump.go, T063).
 	withLimit(shutdownLimit, code, env.exit, logFile, func(deadline time.Time) {
 		nm.Close() // no new extension requests while the app stops
-		app.Shutdown(deadline, srv)
+		app.Shutdown(deadline, srv, waSrv)
 		cancel()
 	})
 	slog.Info("stopped", "exit_code", code)

@@ -69,7 +69,9 @@ var errorCatalog = map[string]errDef{
 
 	// desktop mode and the application endpoints (SPEC-v3 V1.2, V1.1, V4)
 	"auth.token_required":                 {"缺少或错误的访问令牌，请从 LectureFlow 应用中打开这个页面", nil},
+	"auth.login_required":                 {"需要先登录网页访问才能继续，请前往登录页面输入访问密钥", nil},
 	"auth.bad_host":                       {"请求的主机名不被允许", nil},
+	"web_access.not_available":            {"此操作只能在运行 LectureFlow 的电脑上完成，不能通过网页访问执行", nil},
 	"app_settings.close_behavior_invalid": {"关闭窗口时的行为“{value}”无效（ask、background 或 quit）", []string{"value"}},
 	"app_settings.update_channel_invalid": {"更新渠道“{value}”无效（stable 或 beta）", []string{"value"}},
 	"onboarding_state.invalid":            {"引导状态无效：{field}", []string{"field"}},
