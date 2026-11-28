@@ -60,7 +60,9 @@ type TestResult struct {
 // TestConnection sends one minimal request (max_tokens 1, user "ping") to
 // provider p with modelName ("" = the first model a role uses with p, else a
 // probed model) and reports latency or the error text (A5.3). It does not go
-// through the API pool and records no usage.
+// through the API pool and records no usage. To OpenAI's own API the limit
+// is max_completion_tokens 16; an HTTP 400 refusing the name of the limit is
+// answered once by the request with the other name (openai_compat.go).
 // OpenAI type: POST {base_url}/chat/completions; Anthropic: POST {base_url}/v1/messages.
 func TestConnection(ctx context.Context, p model.Provider, modelName string) TestResult {
 	return testConnection(ctx, p, modelName)

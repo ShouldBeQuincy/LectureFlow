@@ -145,7 +145,7 @@ Status notes: \* may also support doing transcription and translation fully on-d
 
 ## Getting started
 
-1. Download the installer for your system from [Releases](https://github.com/ShouldBeQuincy/LectureFlow/releases): `LectureFlow-Setup-3.3.0-x64.exe` (or the portable build) for Windows, `LectureFlow-3.3.0-arm64.dmg` for Apple Silicon Macs. What's new: [release notes](docs/release-notes/3.3.0.md).
+1. Download the installer for your system from [Releases](https://github.com/ShouldBeQuincy/LectureFlow/releases): `LectureFlow-Setup-3.3.1-x64.exe` (or the portable build) for Windows, `LectureFlow-3.3.1-arm64.dmg` for Apple Silicon Macs. What's new: [release notes](docs/release-notes/3.3.1.md).
 2. The installers are not code-signed yet, so your system will show a security warning. See [docs/install.md](docs/install.md) for how to continue.
 3. Open LectureFlow and follow the short setup guide: choose a language, check your computer, choose a plan, download components. You can skip any step and come back later.
 4. Add a course: give it a name and a start date, and optionally paste the course outline and upload slides (not required, but they noticeably improve accuracy on technical terms).

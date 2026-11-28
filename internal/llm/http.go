@@ -109,6 +109,12 @@ type HTTPClient struct {
 	// request without it (anthropic.go, structured output). Not persisted: a
 	// new process asks again.
 	noFormat sync.Map
+	// tokenFields: the name of the output limit an OpenAI-compatible
+	// provider and model took after an HTTP 400 refused the other one;
+	// noTemperature: the ones that refused a temperature (openai_compat.go,
+	// v3.3.1). Not persisted: a new process asks again.
+	tokenFields   sync.Map
+	noTemperature sync.Map
 	// limits: the account limits Anthropic answers reported, per provider
 	// and model (ratelimits.go, T-PERF-03). Not persisted.
 	limits rateLimitStore
@@ -371,8 +377,9 @@ type chatRequest struct {
 	Model    string        `json:"model"`
 	Messages []chatMessage `json:"messages"`
 	// Temperature is always sent, except with DeepSeek thinking on (ignored
-	// in thinking mode); the field order is unchanged, so a request without
-	// thinking is byte for byte what it was.
+	// in thinking mode) and to a model that refused it (openai_compat.go);
+	// the field order is unchanged, so a request without thinking is byte
+	// for byte what it was.
 	Temperature    *float64          `json:"temperature,omitempty"`
 	ResponseFormat map[string]string `json:"response_format,omitempty"`
 	Stream         bool              `json:"stream"`
@@ -380,6 +387,11 @@ type chatRequest struct {
 	MaxTokens      int               `json:"max_tokens,omitempty"` // 0 = not sent (openAIMaxTokens)
 	// ReasoningEffort is DeepSeek's thinking level (thinking.go); "" = not sent.
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// MaxCompletionTokens is the output limit under the name OpenAI's own
+	// API takes (openai_compat.go; 0 = not sent). A request carries this or
+	// MaxTokens, never both. Last, so a request with max_tokens is byte for
+	// byte what it was.
+	MaxCompletionTokens int `json:"max_completion_tokens,omitempty"`
 }
 
 type chatResponse struct {
@@ -437,6 +449,10 @@ type attemptErr struct {
 	// deadline: failTimeout because the attempt's own timeout ran out (not
 	// a connect or TLS handshake timeout before it; WithNoDeadlineRetry)
 	deadline bool
+	// errParam, errCode: error.param and error.code of an HTTP 400 to an
+	// OpenAI-compatible request, read from the whole body
+	// (openai_compat.go; "" when absent)
+	errParam, errCode string
 }
 
 // billed reports a failed attempt whose usage counts (Complete records it):
@@ -536,7 +552,7 @@ func (c *HTTPClient) resolveSettings(ctx context.Context, role string) (target, 
 		return target{}, sched.Permanent(model.Errorf(CodeNoAPIKey, map[string]any{"provider": p.Name},
 			fmt.Errorf("提供商「%s」没有设置 API key，请在设置页填写后点击重试", p.Name)))
 	}
-	deepseek := settings.IsDeepSeek(p.BaseURL, p.BalanceAPI)
+	deepseek := deepSeekRequests(p.BaseURL, p.BalanceAPI) // openai_compat.go
 	mt, batch := limitsOf(t.Params)
 	return target{
 		providerID: p.ID, providerName: p.Name, ptype: p.Type, baseURL: p.BaseURL, key: p.APIKey,
@@ -619,6 +635,12 @@ func (c *HTTPClient) Complete(ctx context.Context, role, system, user string, js
 			}
 		}
 	}
+	// OpenAI-compatible requests (openai_compat.go): field is the name the
+	// output limit goes by; sendTemp, whether the role's temperature may be
+	// sent; tempInBody, whether the body built last carries it. triedField,
+	// triedTemp: each refusal is answered once per call.
+	field, sendTemp, tempInBody := c.tokenField(tg), !c.temperatureRefused(tg), false
+	triedField, triedTemp := false, false
 	build := func() ([]byte, error) {
 		if tg.ptype == model.ProviderAnthropic {
 			return anthropicBody(tg, maxTokens, system, user, jsonMode, schema)
@@ -631,13 +653,18 @@ func (c *HTTPClient) Complete(ctx context.Context, role, system, user string, js
 				{Role: "user", Content: user},
 			},
 			Thinking:        thinking,
-			MaxTokens:       maxTokens,
 			ReasoningEffort: effort,
 		}
-		if effort == "" { // DeepSeek ignores temperature in thinking mode
+		if field == fieldMaxCompletionTokens {
+			req.MaxCompletionTokens = maxTokens
+		} else {
+			req.MaxTokens = maxTokens
+		}
+		if effort == "" && sendTemp { // DeepSeek ignores temperature in thinking mode
 			temp := tg.temperature
 			req.Temperature = &temp
 		}
+		tempInBody = req.Temperature != nil
 		if jsonMode {
 			req.ResponseFormat = map[string]string{"type": "json_object"}
 		}
@@ -782,6 +809,32 @@ func (c *HTTPClient) Complete(ctx context.Context, role, system, user string, js
 		}
 		if aerr.kind == failRefusal {
 			return giveUp(sched.Permanent(refusalError(call, aerr.category, attempt)))
+		}
+		if aerr.kind == failStatus && aerr.status == http.StatusBadRequest && !aerr.inStream && tg.ptype != model.ProviderAnthropic {
+			// An OpenAI-compatible model that does not take a parameter of the
+			// request as sent (openai_compat.go): the same request once more
+			// with the output limit's other name, or without the temperature;
+			// no backoff wait, the server is fine. Any other 400, or the same
+			// refusal again, is the call's error below.
+			again := ""
+			switch {
+			case maxTokens > 0 && !triedField && refusesField(aerr.errParam, aerr.errCode, field):
+				refused := field
+				field, triedField = otherTokenField(field), true
+				c.learnTokenField(tg, role, refused, field)
+				again = fmt.Sprintf("http 400: %s not supported, sent again with %s", refused, field)
+			case tempInBody && !triedTemp && refusesTemperature(aerr.errParam, aerr.errCode):
+				sendTemp, triedTemp = false, true
+				c.learnNoTemperature(tg, role)
+				again = "http 400: temperature not supported, sent again without it"
+			}
+			if again != "" {
+				if body, err = build(); err != nil {
+					return giveUp(sched.Permanent(err))
+				}
+				reason = again
+				continue
+			}
 		}
 		if aerr.kind == failStatus && aerr.status == http.StatusBadRequest && !aerr.inStream && len(schema) > 0 && !triedWithoutFormat {
 			// Structured output: a model that does not know the field refuses
@@ -1211,6 +1264,9 @@ func (c *HTTPClient) answer(ctx context.Context, call callInfo, out attemptOutco
 	if status != http.StatusOK {
 		ae := &attemptErr{kind: failStatus, status: status, body: redactSnippet(respBody, call.key)}
 		ae.retryAfter, ae.hasRA = parseRetryAfter(out.header.Get("Retry-After"))
+		if status == http.StatusBadRequest && call.api != model.ProviderAnthropic {
+			ae.errParam, ae.errCode = openAIErrorFields(respBody)
+		}
 		return Result{}, ae
 	}
 	if out.stream != nil {

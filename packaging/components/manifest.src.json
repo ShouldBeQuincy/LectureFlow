@@ -1,9 +1,9 @@
 {
   "_doc": "Source of components.json (go run ./packaging/components/gen). Everything except _doc, gen and models is copied as it is; gen blocks and models are expanded with SHA-256 and sizes fetched from python-build-standalone, PyPI and the Hugging Face API at the pinned revisions. See packaging/components/README.md.",
   "schema": 1,
-  "serial": 4,
-  "published": "2026-11-16",
-  "app_version": "3.3.0",
+  "serial": 5,
+  "published": "2026-11-28",
+  "app_version": "3.3.1",
   "compat": ">=3.0.0 <4.0.0",
   "update_url": "",
   "installed_factor": {
@@ -81,7 +81,7 @@
   "components": [
     {
       "id": "core",
-      "version": "3.3.0",
+      "version": "3.3.1",
       "upstream": "LectureFlow: Electron shell, Go service, web UI, ffmpeg (LGPL build), uv 0.13.1, aria2 1.37.0",
       "kind": "binary",
       "bundled": true,

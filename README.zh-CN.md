@@ -145,7 +145,7 @@ LectureFlow 是一个运行在你自己电脑上的讲座工具。把课程录�
 
 ## 开始使用
 
-1. 从 [Releases](https://github.com/ShouldBeQuincy/LectureFlow/releases) 下载对应系统的安装包：Windows 用 `LectureFlow-Setup-3.3.0-x64.exe`（或便携版），Apple Silicon Mac 用 `LectureFlow-3.3.0-arm64.dmg`。新版本的变化见[发布说明](docs/release-notes/3.3.0.md)。
+1. 从 [Releases](https://github.com/ShouldBeQuincy/LectureFlow/releases) 下载对应系统的安装包：Windows 用 `LectureFlow-Setup-3.3.1-x64.exe`（或便携版），Apple Silicon Mac 用 `LectureFlow-3.3.1-arm64.dmg`。新版本的变化见[发布说明](docs/release-notes/3.3.1.md)。
 2. 安装包目前没有代码签名，系统会弹出安全提示，放行方法见 [docs/install.md](docs/install.md)。
 3. 打开 LectureFlow，跟着引导走几步：选择语言、检测电脑、选择费用档位、下载组件。每一步都可以跳过，之后再回来。
 4. 添加一门课程：填写课程名称和开课日期，可以顺便粘贴课程大纲、上传课件（不是必须的，但能明显提高专业术语的准确度）。

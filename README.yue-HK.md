@@ -145,7 +145,7 @@ LectureFlow 係一個喺你自己部電腦度行嘅講課工具。將堂課嘅�
 
 ## 點樣開始
 
-1. 喺 [Releases](https://github.com/ShouldBeQuincy/LectureFlow/releases) 下載啱你系統嘅安裝檔：Windows 用 `LectureFlow-Setup-3.3.0-x64.exe`（或者免安裝版），Apple Silicon Mac 用 `LectureFlow-3.3.0-arm64.dmg`。新版有咩唔同，睇[發佈說明](docs/release-notes/3.3.0.md)。
+1. 喺 [Releases](https://github.com/ShouldBeQuincy/LectureFlow/releases) 下載啱你系統嘅安裝檔：Windows 用 `LectureFlow-Setup-3.3.1-x64.exe`（或者免安裝版），Apple Silicon Mac 用 `LectureFlow-3.3.1-arm64.dmg`。新版有咩唔同，睇[發佈說明](docs/release-notes/3.3.1.md)。
 2. 安裝檔暫時未有程式碼簽署，系統會彈出安全提示，點樣放行可以睇 [docs/install.md](docs/install.md)。
 3. 打開 LectureFlow，跟住導引行幾步：揀語言、檢查電腦、揀收費方案、下載組件。每一步都可以跳過，遲啲再返嚟。
 4. 加一科：填返科目名稱同開課日期，可以順手貼埋課程大綱、上載簡報（唔係必須，但會明顯令專業術語準啲）。

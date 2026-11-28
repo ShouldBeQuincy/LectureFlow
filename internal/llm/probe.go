@@ -21,7 +21,10 @@ import (
 )
 
 // "测试连接" and "探测模型" of the settings page (A5.3). Both talk to the
-// provider directly: no API pool, no usage, no retries.
+// provider directly: no API pool, no usage, no retries. One exception
+// (v3.3.1, openai_compat.go): an HTTP 400 to "测试连接" that refuses the
+// name of its output limit is answered once by the request with the other
+// name, as the roles' requests are.
 
 var (
 	// ProbeTimeout bounds one TestConnection or ProbeModels call.
@@ -52,24 +55,52 @@ func testConnection(ctx context.Context, p model.Provider, modelName string) Tes
 	}
 	var body []byte
 	var endpoint string
+	// again returns the request to send once more after the answer
+	// (status, resp) of the first (nil = none).
+	again := func(int, []byte) []byte { return nil }
 	switch p.Type {
 	case model.ProviderAnthropic:
 		body, _ = json.Marshal(anthropicRequest{Model: modelName, MaxTokens: 1, Messages: []anthropicMessage{{Role: "user", Content: "ping"}}})
 		endpoint = strings.TrimRight(p.BaseURL, "/") + "/v1/messages"
 	default:
-		req := map[string]any{
-			"model": modelName, "messages": []chatMessage{{Role: "user", Content: "ping"}}, "max_tokens": 1, "stream": false,
+		// The output limit goes by the name the roles' requests start with:
+		// max_completion_tokens to OpenAI's own API, max_tokens elsewhere
+		// (openai_compat.go).
+		field := defaultTokenField(p.BaseURL)
+		build := func() []byte {
+			req := map[string]any{
+				"model": modelName, "messages": []chatMessage{{Role: "user", Content: "ping"}}, field: probeTokenLimit(field), "stream": false,
+			}
+			// Same thinking switch as the roles' requests (appendix D2), so the
+			// test also shows whether the provider accepts it.
+			if th := thinkingDisabled(deepSeekRequests(p.BaseURL, p.BalanceAPI)); th != nil {
+				req["thinking"] = th
+			}
+			b, _ := json.Marshal(req)
+			return b
 		}
-		// Same thinking switch as the roles' requests (appendix D2), so the
-		// test also shows whether the provider accepts it.
-		if th := thinkingDisabled(settings.IsDeepSeek(p.BaseURL, p.BalanceAPI)); th != nil {
-			req["thinking"] = th
-		}
-		body, _ = json.Marshal(req)
+		body = build()
 		endpoint = strings.TrimRight(p.BaseURL, "/") + "/chat/completions"
+		again = func(status int, resp []byte) []byte {
+			if status != http.StatusBadRequest {
+				return nil
+			}
+			if param, code := openAIErrorFields(resp); !refusesField(param, code, field) {
+				return nil
+			}
+			field = otherTokenField(field)
+			return build()
+		}
 	}
 	start := time.Now()
 	status, resp, err := doProbe(ctx, http.MethodPost, endpoint, p, body)
+	if err == nil {
+		if body2 := again(status, resp); body2 != nil {
+			// The latency reported is the last round trip's.
+			start = time.Now()
+			status, resp, err = doProbe(ctx, http.MethodPost, endpoint, p, body2)
+		}
+	}
 	latency := time.Since(start)
 	// A round trip takes time, but a coarse clock (some Windows machines)
 	// can measure a fast local one as zero.
